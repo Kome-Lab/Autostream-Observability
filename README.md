@@ -50,5 +50,4 @@ go build ./...
 - Keep dangerous remediation actions manual unless a separate approval policy explicitly allows them.
 - Apply request size limits and rate limits to sensitive endpoints.
 
-See [docs/security.md](docs/security.md) for service-specific security notes.
-
+Detailed deployment and security documentation is maintained in the `autostream-docs` repository.

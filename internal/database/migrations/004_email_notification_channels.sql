@@ -1,0 +1,15 @@
+ALTER TABLE notification_channels
+  MODIFY channel_type ENUM('discord','slack','generic','email') NOT NULL,
+  MODIFY webhook_url_ciphertext TEXT NULL,
+  MODIFY webhook_url_nonce VARCHAR(64) NULL,
+  MODIFY masked_webhook_url VARCHAR(512) NULL,
+  ADD COLUMN email_recipients JSON NULL AFTER masked_webhook_url,
+  ADD COLUMN smtp_host VARCHAR(255) NULL AFTER email_recipients,
+  ADD COLUMN smtp_port INT NULL AFTER smtp_host,
+  ADD COLUMN smtp_tls BOOLEAN NOT NULL DEFAULT TRUE AFTER smtp_port,
+  ADD COLUMN smtp_from VARCHAR(255) NULL AFTER smtp_tls,
+  ADD COLUMN smtp_username VARCHAR(255) NULL AFTER smtp_from,
+  ADD COLUMN smtp_password_ciphertext TEXT NULL AFTER smtp_username,
+  ADD COLUMN smtp_password_nonce VARCHAR(64) NULL AFTER smtp_password_ciphertext,
+  ADD COLUMN smtp_password_configured BOOLEAN NOT NULL DEFAULT FALSE AFTER smtp_password_nonce,
+  ADD COLUMN masked_email_target VARCHAR(512) NULL AFTER smtp_password_configured;
