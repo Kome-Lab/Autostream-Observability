@@ -22,6 +22,7 @@ type Client struct {
 	ServicePublicURL string
 	Version          string
 	HeartbeatEvery   time.Duration
+	ConfigError      string
 	HTTP             *http.Client
 }
 
@@ -53,7 +54,7 @@ func FromEnv() Client {
 			timeout = time.Duration(seconds) * time.Second
 		}
 	}
-	return Client{
+	client := Client{
 		BaseURL:          strings.TrimSpace(os.Getenv("CONTROL_PANEL_URL")),
 		Token:            strings.TrimSpace(os.Getenv("CONTROL_PANEL_TOKEN")),
 		ServiceID:        envDefault("SERVICE_ID", "observability-01"),
@@ -63,13 +64,18 @@ func FromEnv() Client {
 		HeartbeatEvery:   envDuration("CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC", 30*time.Second),
 		HTTP:             noRedirectClient(timeout),
 	}
+	applyNodeConfigFromEnv(&client, "observability")
+	return client
 }
 
 func (c Client) Enabled() bool {
-	return strings.TrimSpace(c.BaseURL) != "" && strings.TrimSpace(c.Token) != ""
+	return strings.TrimSpace(c.ConfigError) == "" && strings.TrimSpace(c.BaseURL) != "" && strings.TrimSpace(c.Token) != ""
 }
 
 func (c Client) ExecuteRemediation(ctx context.Context, req RemediationRequest) error {
+	if strings.TrimSpace(c.ConfigError) != "" {
+		return errors.New(c.ConfigError)
+	}
 	if !c.Enabled() {
 		return errors.New("control panel dispatch is not configured")
 	}
@@ -110,6 +116,9 @@ func (c Client) ExecuteRemediation(ctx context.Context, req RemediationRequest) 
 }
 
 func (c Client) Register(ctx context.Context) error {
+	if strings.TrimSpace(c.ConfigError) != "" {
+		return errors.New(c.ConfigError)
+	}
 	if !c.Enabled() {
 		return errors.New("control panel registration is not configured")
 	}
@@ -135,6 +144,9 @@ func (c Client) Register(ctx context.Context) error {
 }
 
 func (c Client) Heartbeat(ctx context.Context) error {
+	if strings.TrimSpace(c.ConfigError) != "" {
+		return errors.New(c.ConfigError)
+	}
 	if !c.Enabled() {
 		return errors.New("control panel heartbeat is not configured")
 	}

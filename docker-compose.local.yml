@@ -1,12 +1,8 @@
 services:
   observability:
     environment:
-      SERVICE_ID: observability-local-01
-      SERVICE_NAME: Observability Local
-      SERVICE_PUBLIC_URL: http://host.docker.internal:8082
+      AUTOSTREAM_NODE_CONFIG: /etc/autostream-node/config.yml
       SERVICE_VERSION: 0.1.0-local
-      CONTROL_PANEL_URL: http://host.docker.internal:8080
-      CONTROL_PANEL_TOKEN: ${AUTOSTREAM_LOCAL_OBSERVABILITY_TOKEN:?AUTOSTREAM_LOCAL_OBSERVABILITY_TOKEN is required}
       CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC: 5
       OBSERVABILITY_INGEST_TOKEN_SHA256: 150552b133bbb536dffb9b939d97c760591707c8610ddd2e90d8c18e81e72387
       OBSERVABILITY_REQUIRE_INGEST_TOKEN_BINDINGS: "false"
@@ -22,3 +18,5 @@ services:
       TZ: Asia/Tokyo
     ports: !override
       - "8082:8080"
+    volumes: !override
+      - ./config/autostream-node.yml:/etc/autostream-node/config.yml:ro
