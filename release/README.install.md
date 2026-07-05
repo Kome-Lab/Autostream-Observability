@@ -12,8 +12,8 @@ This archive contains the Linux binary, systemd example, and placeholder environ
 ## Install
 
 ```bash
-sudo install -o root -g root -m 0755 bin/observability /usr/local/bin/observability
-sudo ln -sf /usr/local/bin/observability /usr/local/bin/autostream-observability
+sudo install -o root -g root -m 0755 bin/autostream-observability /usr/local/bin/autostream-observability
+sudo ln -sf /usr/local/bin/autostream-observability /usr/local/bin/observability
 sudo install -d -o autostream -g autostream /var/lib/autostream/observability
 sudo install -o root -g root -m 0644 systemd/autostream-observability.service.example /etc/systemd/system/autostream-observability.service
 sudo install -o root -g root -m 0640 .env.example /etc/autostream/observability.env
