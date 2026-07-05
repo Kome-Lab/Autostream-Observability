@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+const ServiceType = "observability"
+
 type Client struct {
 	BaseURL          string
 	Token            string
@@ -64,7 +66,7 @@ func FromEnv() Client {
 		HeartbeatEvery:   envDuration("CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC", 30*time.Second),
 		HTTP:             noRedirectClient(timeout),
 	}
-	applyNodeConfigFromEnv(&client, "observability")
+	applyNodeConfigFromEnv(&client, ServiceType)
 	return client
 }
 
@@ -127,7 +129,7 @@ func (c Client) Register(ctx context.Context) error {
 	}
 	return c.post(ctx, "/services/register", Registration{
 		ServiceID:   c.ServiceID,
-		ServiceType: "observability",
+		ServiceType: ServiceType,
 		ServiceName: c.ServiceName,
 		PublicURL:   c.ServicePublicURL,
 		Version:     c.Version,
