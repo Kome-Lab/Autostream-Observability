@@ -53,6 +53,7 @@ const maxJSONBodyBytes = 64 << 10
 
 const (
 	adminScopeRead                = "observability.read"
+	adminScopeIngest              = "observability.ingest"
 	adminScopeIncidentsUpdate     = "incidents.update"
 	adminScopeNotificationsRead   = "notifications.read"
 	adminScopeNotificationsManage = "notifications.manage"
@@ -171,8 +172,15 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 func (s *Server) ingestSignal(w http.ResponseWriter, r *http.Request) {
 	tokenSubject, ok := s.ingestAuth.VerifyRequestSubject(r)
 	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "invalid_service_token"})
-		return
+		authenticated, authorized := s.adminAuth.AuthorizeRequest(r, adminScopeIngest)
+		if !authenticated {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "invalid_service_token"})
+			return
+		}
+		if !authorized {
+			writeJSON(w, http.StatusForbidden, map[string]string{"code": "admin_scope_required"})
+			return
+		}
 	}
 	var signal store.Signal
 	if err := decodeJSONBody(w, r, &signal); err != nil {

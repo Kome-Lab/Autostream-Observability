@@ -88,6 +88,34 @@ func TestSignalIngestAcceptsBoundTokenServiceIdentity(t *testing.T) {
 	}
 }
 
+func TestSignalIngestAllowsAdminTokenWithIngestScope(t *testing.T) {
+	st := store.NewMemoryStore()
+	admin := auth.Verifier{
+		TokenHashes: []string{auth.HashToken("admin-token"), auth.HashToken("read-token")},
+		TokenScopes: map[string]map[string]bool{
+			auth.HashToken("admin-token"): {"observability.ingest": true, "observability.read": true},
+			auth.HashToken("read-token"):  {"observability.read": true},
+		},
+		ScopeBindingRequired: true,
+	}
+	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("legacy-ingest"), admin, nil, nil)
+	body := `{"type":"metric","name":"encoder.output_fps","service_id":"enc-01","service_type":"encoder_recorder","stream_id":"stream-01","value":60}`
+	deniedReq := httptest.NewRequest(http.MethodPost, "/signals", bytes.NewBufferString(body))
+	deniedReq.Header.Set("Authorization", "Bearer read-token")
+	deniedRes := httptest.NewRecorder()
+	handler.ServeHTTP(deniedRes, deniedReq)
+	if deniedRes.Code != http.StatusForbidden {
+		t.Fatalf("read-only admin token should be forbidden, got %d body = %s", deniedRes.Code, deniedRes.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodPost, "/signals", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer admin-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("admin ingest token should be accepted, got %d body = %s", res.Code, res.Body.String())
+	}
+}
+
 func TestSignalIngestDeduplicatesIncident(t *testing.T) {
 	st := store.NewMemoryStore()
 	handler := newTestServer(st)
