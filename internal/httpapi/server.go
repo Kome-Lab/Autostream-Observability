@@ -103,7 +103,7 @@ func NewServer(serviceType string) http.Handler {
 }
 
 func NewServerWithStore(serviceType string, st store.Store) http.Handler {
-	return NewServerWithStoreAuthz(serviceType, st, auth.IngestVerifierFromEnv(), auth.AdminVerifierFromEnv())
+	return NewServerWithStoreAuthz(serviceType, st, auth.Verifier{}, auth.Verifier{})
 }
 
 func NewServerWithStoreAndAuth(serviceType string, st store.Store, verifier auth.Verifier) http.Handler {

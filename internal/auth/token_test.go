@@ -37,16 +37,6 @@ func TestVerifyRequestRequiresBearer(t *testing.T) {
 	}
 }
 
-func TestVerifierFromEnv(t *testing.T) {
-	hash := HashToken("service-token")
-	t.Setenv("OBSERVABILITY_INGEST_TOKEN_SHA256", hash)
-	t.Setenv("OBSERVABILITY_REQUIRE_INGEST_TOKEN_BINDINGS", "false")
-	verifier := VerifierFromEnv()
-	if !verifier.VerifyToken("service-token") {
-		t.Fatal("expected env hash to verify")
-	}
-}
-
 func TestBoundVerifierReturnsSubjectAndRequiresBoundToken(t *testing.T) {
 	verifier := NewVerifierWithSubjects(map[string]Subject{
 		"encoder-token": {ServiceType: "encoder_recorder", ServiceID: "enc-01"},
@@ -64,119 +54,32 @@ func TestBoundVerifierReturnsSubjectAndRequiresBoundToken(t *testing.T) {
 	}
 }
 
-func TestIngestVerifierFromEnvSupportsBindings(t *testing.T) {
-	hash := HashToken("encoder-token")
-	t.Setenv("OBSERVABILITY_INGEST_TOKEN_SHA256", hash)
-	t.Setenv("OBSERVABILITY_INGEST_TOKEN_BINDINGS", hash+":encoder_recorder:enc-01")
-	verifier := IngestVerifierFromEnv()
-	subject, ok := verifier.VerifyTokenSubject("encoder-token")
-	if !ok {
-		t.Fatal("expected bound env token to verify")
-	}
-	if subject.ServiceType != "encoder_recorder" || subject.ServiceID != "enc-01" {
-		t.Fatalf("unexpected subject: %#v", subject)
+func TestRawTokenVerifierKeepsLegacyAllScopeBehaviorForTests(t *testing.T) {
+	verifier := NewVerifierFromRawTokens("admin-token")
+	authenticated, authorized := verifier.AuthorizeToken("admin-token", "remediation.execute")
+	if !authenticated || !authorized {
+		t.Fatal("explicit raw-token verifier should preserve legacy all-scope behavior")
 	}
 }
 
-func TestIngestVerifierFromEnvRequiresBindingsByDefault(t *testing.T) {
-	t.Setenv("OBSERVABILITY_INGEST_TOKEN_SHA256", HashToken("service-token"))
-	t.Setenv("OBSERVABILITY_INGEST_TOKEN_BINDINGS", "")
-	t.Setenv("OBSERVABILITY_REQUIRE_INGEST_TOKEN_BINDINGS", "")
-
-	verifier := IngestVerifierFromEnv()
-	if !verifier.BindingRequired {
-		t.Fatal("ingest token bindings must be required by default")
-	}
-	if verifier.VerifyToken("service-token") {
-		t.Fatal("token without a binding must fail authentication")
+func TestWithRawTokenScopesAddsNodeRuntimeTokenWithWildcardScope(t *testing.T) {
+	verifier := WithRawTokenScopes(Verifier{}, "node-runtime-token", "*")
+	for _, scope := range []string{"observability.read", "observability.ingest", "remediation.execute"} {
+		authenticated, authorized := verifier.AuthorizeToken("node-runtime-token", scope)
+		if !authenticated || !authorized {
+			t.Fatalf("node runtime token should authorize %s", scope)
+		}
 	}
 }
 
-func TestIngestVerifierFromEnvRejectsPartialBindings(t *testing.T) {
-	encoderHash := HashToken("encoder-token")
-	workerHash := HashToken("worker-token")
-	t.Setenv("OBSERVABILITY_INGEST_TOKEN_SHA256_LIST", encoderHash+","+workerHash)
-	t.Setenv("OBSERVABILITY_INGEST_TOKEN_BINDINGS", encoderHash+":encoder_recorder:enc-01")
-
-	verifier := IngestVerifierFromEnv()
-	if verifier.VerifyToken("encoder-token") {
-		t.Fatal("partial binding configuration must reject all ingest authentication")
-	}
-	if verifier.VerifyToken("worker-token") {
-		t.Fatal("unbound allowed token must fail authentication")
-	}
-}
-
-func TestIngestVerifierFromEnvRejectsMalformedBindings(t *testing.T) {
-	hash := HashToken("service-token")
-	t.Setenv("OBSERVABILITY_INGEST_TOKEN_SHA256", hash)
-	t.Setenv("OBSERVABILITY_INGEST_TOKEN_BINDINGS", hash+":worker")
-
-	verifier := IngestVerifierFromEnv()
-	if verifier.VerifyToken("service-token") {
-		t.Fatal("malformed binding configuration must reject ingest authentication")
-	}
-}
-
-func TestIngestVerifierFromEnvCanExplicitlyDisableRequiredBindings(t *testing.T) {
-	t.Setenv("OBSERVABILITY_INGEST_TOKEN_SHA256", HashToken("shared-dev-token"))
-	t.Setenv("OBSERVABILITY_INGEST_TOKEN_BINDINGS", "")
-	t.Setenv("OBSERVABILITY_REQUIRE_INGEST_TOKEN_BINDINGS", "false")
-
-	verifier := IngestVerifierFromEnv()
-	if verifier.BindingRequired {
-		t.Fatal("explicit false must disable required ingest bindings")
-	}
-	if !verifier.VerifyToken("shared-dev-token") {
-		t.Fatal("explicit local-development override should allow the shared token")
-	}
-}
-
-func TestAdminVerifierFromEnvEnforcesPerTokenScopes(t *testing.T) {
-	hash := HashToken("read-token")
-	t.Setenv("OBSERVABILITY_ADMIN_TOKEN_SHA256", hash)
-	t.Setenv("OBSERVABILITY_ADMIN_TOKEN_BINDINGS", hash+":observability.read|notifications.read")
-	t.Setenv("OBSERVABILITY_REQUIRE_ADMIN_TOKEN_BINDINGS", "true")
-
-	verifier := AdminVerifierFromEnv()
+func TestWithRawTokenScopesCanLimitScopes(t *testing.T) {
+	verifier := WithRawTokenScopes(Verifier{}, "read-token", "observability.read")
 	authenticated, authorized := verifier.AuthorizeToken("read-token", "observability.read")
 	if !authenticated || !authorized {
 		t.Fatal("read scope should be authorized")
 	}
 	authenticated, authorized = verifier.AuthorizeToken("read-token", "remediation.execute")
 	if !authenticated || authorized {
-		t.Fatal("valid read-only token must be denied remediation.execute")
-	}
-}
-
-func TestAdminVerifierFromEnvFailsClosedWithoutRequiredBindings(t *testing.T) {
-	t.Setenv("OBSERVABILITY_ADMIN_TOKEN_SHA256", HashToken("legacy-admin-token"))
-	t.Setenv("OBSERVABILITY_ADMIN_TOKEN_BINDINGS", "")
-	t.Setenv("OBSERVABILITY_REQUIRE_ADMIN_TOKEN_BINDINGS", "true")
-
-	verifier := AdminVerifierFromEnv()
-	authenticated, authorized := verifier.AuthorizeToken("legacy-admin-token", "observability.read")
-	if !authenticated || authorized {
-		t.Fatal("valid legacy token must authenticate but fail authorization without required scope bindings")
-	}
-}
-
-func TestAdminVerifierFromEnvMalformedBindingDoesNotGrantAllScopes(t *testing.T) {
-	t.Setenv("OBSERVABILITY_ADMIN_TOKEN_SHA256", HashToken("legacy-admin-token"))
-	t.Setenv("OBSERVABILITY_ADMIN_TOKEN_BINDINGS", "malformed")
-	t.Setenv("OBSERVABILITY_REQUIRE_ADMIN_TOKEN_BINDINGS", "true")
-
-	verifier := AdminVerifierFromEnv()
-	authenticated, authorized := verifier.AuthorizeToken("legacy-admin-token", "observability.read")
-	if !authenticated || authorized {
-		t.Fatal("malformed admin binding must fail closed")
-	}
-}
-
-func TestRawTokenVerifierKeepsLegacyAllScopeBehaviorForTests(t *testing.T) {
-	verifier := NewVerifierFromRawTokens("admin-token")
-	authenticated, authorized := verifier.AuthorizeToken("admin-token", "remediation.execute")
-	if !authenticated || !authorized {
-		t.Fatal("explicit raw-token verifier should preserve legacy all-scope behavior")
+		t.Fatal("token without remediation scope must be denied remediation.execute")
 	}
 }

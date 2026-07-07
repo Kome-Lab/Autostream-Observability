@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/example/autostream-observability/internal/auth"
 	"github.com/example/autostream-observability/internal/control"
 	"github.com/example/autostream-observability/internal/database"
 	"github.com/example/autostream-observability/internal/httpapi"
@@ -34,7 +35,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	addr := os.Getenv("AUTOSTREAM_BIND_ADDR")
+	addr := os.Getenv("OBSERVABILITY_BIND_ADDR")
 	if addr == "" {
 		addr = "127.0.0.1:8080"
 	}
@@ -66,10 +67,15 @@ func main() {
 			log.Printf("control panel heartbeat failed: %v", err)
 		})
 	}
+	ingestVerifier := auth.Verifier{}
+	adminVerifier := auth.Verifier{}
+	if nodeToken := control.NodeRuntimeTokenFromEnv(); nodeToken != "" {
+		adminVerifier = auth.WithRawTokenScopes(adminVerifier, nodeToken, "*")
+	}
 	log.Printf("autostream-observability listening on %s", addr)
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.NewServerWithStore("observability", st),
+		Handler:           httpapi.NewServerWithStoreAuthz("observability", st, ingestVerifier, adminVerifier),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
