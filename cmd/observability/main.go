@@ -57,23 +57,7 @@ func main() {
 		log.Fatalf("run migrations failed: %v", err)
 	}
 	st := store.MariaDBStore{DB: db, SecretKey: os.Getenv("AUTOSTREAM_SECRET_ENCRYPTION_KEY")}
-	controlClient := control.FromEnv()
-	if strings.TrimSpace(controlClient.ConfigError) != "" {
-		log.Fatalf("node config invalid: %v", controlClient.ConfigError)
-	}
-	if !controlClient.Enabled() {
-		log.Fatal("AUTOSTREAM_NODE_CONFIG is required and must include panel.url and auth.token")
-	}
-	if strings.TrimSpace(controlClient.ServicePublicURL) == "" {
-		log.Fatal("AUTOSTREAM_NODE_CONFIG is required and must include api.host and api.port")
-	}
-	if err := controlClient.Register(ctx); err != nil {
-		log.Fatalf("control panel registration failed: %v", err)
-	}
-	log.Printf("registered with control panel as %s", controlClient.ServiceID)
-	go controlClient.RunHeartbeatLoop(ctx, func(err error) {
-		log.Printf("control panel heartbeat failed: %v", err)
-	})
+	go runControlPanelRegistrationLoop(ctx)
 	ingestVerifier := auth.Verifier{}
 	adminVerifier := auth.Verifier{}
 	if nodeToken := control.NodeRuntimeTokenFromEnv(); nodeToken != "" {
@@ -99,6 +83,76 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+}
+
+func runControlPanelRegistrationLoop(ctx context.Context) {
+	lastState := ""
+	registeredServiceID := ""
+	for {
+		client := control.FromEnv()
+		wait := controlPanelRegistrationInterval(client)
+		state := ""
+		switch {
+		case strings.TrimSpace(client.ConfigError) != "":
+			state = "invalid:" + client.ConfigError
+			logRegistrationStateChange(&lastState, state, "node config invalid: %v", client.ConfigError)
+		case !client.Enabled():
+			if control.NodeConfigPendingFromEnv() {
+				state = "pending:" + control.NodeConfigPathFromEnv()
+				logRegistrationStateChange(&lastState, state, "node config pending: waiting for %s", control.NodeConfigPathFromEnv())
+			} else {
+				state = "disabled"
+				logRegistrationStateChange(&lastState, state, "control panel registration is not configured; waiting for AUTOSTREAM_NODE_CONFIG")
+			}
+			registeredServiceID = ""
+		case strings.TrimSpace(client.ServicePublicURL) == "":
+			state = "missing-public-url:" + client.ServiceID
+			logRegistrationStateChange(&lastState, state, "node config invalid: missing api.host or api.port")
+			registeredServiceID = ""
+		default:
+			if registeredServiceID != client.ServiceID {
+				if err := client.Register(ctx); err != nil {
+					state = "register-failed:" + err.Error()
+					logRegistrationStateChange(&lastState, state, "control panel registration failed: %v", err)
+					registeredServiceID = ""
+					break
+				}
+				registeredServiceID = client.ServiceID
+				state = "registered:" + client.ServiceID
+				logRegistrationStateChange(&lastState, state, "registered with control panel as %s", client.ServiceID)
+			}
+			if registeredServiceID == client.ServiceID {
+				if err := client.Heartbeat(ctx); err != nil {
+					state = "heartbeat-failed:" + err.Error()
+					logRegistrationStateChange(&lastState, state, "control panel heartbeat failed: %v", err)
+				} else {
+					lastState = "online:" + client.ServiceID
+				}
+			}
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func controlPanelRegistrationInterval(client control.Client) time.Duration {
+	if client.Enabled() && client.HeartbeatEvery > 0 {
+		return client.HeartbeatEvery
+	}
+	return 10 * time.Second
+}
+
+func logRegistrationStateChange(lastState *string, state, format string, args ...any) {
+	if state == *lastState {
+		return
+	}
+	log.Printf(format, args...)
+	*lastState = state
 }
 
 func openDatabaseWithRetry(parent context.Context, timeout, interval time.Duration) (*sql.DB, error) {

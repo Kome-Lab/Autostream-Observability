@@ -30,6 +30,26 @@ func TestFromEnvRejectsWrongNodeType(t *testing.T) {
 	}
 }
 
+func TestFromEnvTreatsMissingNodeConfigAsPending(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "config.yml")
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
+	t.Setenv("CONTROL_PANEL_URL", "")
+	t.Setenv("CONTROL_PANEL_TOKEN", "")
+	client := FromEnv()
+	if client.ConfigError != "" {
+		t.Fatalf("missing node config should not be fatal: %#v", client)
+	}
+	if client.Enabled() {
+		t.Fatalf("missing node config must not enable client: %#v", client)
+	}
+	if !NodeConfigPendingFromEnv() {
+		t.Fatal("missing node config should be reported as pending")
+	}
+	if got := NodeRuntimeTokenFromEnv(); got != "" {
+		t.Fatalf("runtime token = %q, want empty", got)
+	}
+}
+
 func writeNodeConfigForTest(t *testing.T, nodeType string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yml")

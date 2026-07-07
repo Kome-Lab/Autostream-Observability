@@ -7,6 +7,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -25,6 +27,29 @@ func TestSignalIngestRequiresAuthorization(t *testing.T) {
 	handler.ServeHTTP(res, req)
 	if res.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+}
+
+func TestAdminAuthReadsNodeRuntimeTokenAfterStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
+	handler := NewServerWithStoreAuthz("observability", store.NewMemoryStore(), auth.Verifier{}, auth.Verifier{})
+
+	req := httptest.NewRequest(http.MethodGet, "/signals", nil)
+	req.Header.Set("Authorization", "Bearer runtime-secret")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("runtime token should not verify before config exists, got %d body = %s", res.Code, res.Body.String())
+	}
+
+	writeNodeConfigForVerifierTest(t, path, "observability")
+	req = httptest.NewRequest(http.MethodGet, "/signals", nil)
+	req.Header.Set("Authorization", "Bearer runtime-secret")
+	res = httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("runtime token should verify after config is written, got %d body = %s", res.Code, res.Body.String())
 	}
 }
 
@@ -1561,4 +1586,25 @@ func (f *fakeControlExecutor) ExecuteRemediation(ctx context.Context, req contro
 	}
 	f.calls = append(f.calls, req)
 	return nil
+}
+
+func writeNodeConfigForVerifierTest(t *testing.T, path, nodeType string) {
+	t.Helper()
+	body := `panel:
+  url: "https://panel.example.jp"
+node:
+  id: "observability-01"
+  name: "Observability 01"
+  type: "` + nodeType + `"
+api:
+  host: "observability.example.jp"
+  port: 8443
+  ssl_enabled: true
+auth:
+  token_id: "token-id"
+  token: "runtime-secret"
+`
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -66,6 +66,12 @@ type controlExecutor interface {
 	ExecuteRemediation(ctx context.Context, req control.RemediationRequest) error
 }
 
+type envControlExecutor struct{}
+
+func (envControlExecutor) ExecuteRemediation(ctx context.Context, req control.RemediationRequest) error {
+	return control.FromEnv().ExecuteRemediation(ctx, req)
+}
+
 type IngestResponse struct {
 	Signal    store.Signal     `json:"signal"`
 	Incidents []store.Incident `json:"incidents"`
@@ -111,7 +117,7 @@ func NewServerWithStoreAndAuth(serviceType string, st store.Store, verifier auth
 }
 
 func NewServerWithStoreAuthAndNotifier(serviceType string, st store.Store, verifier auth.Verifier, notifier notifications.Notifier) http.Handler {
-	return NewServerWithStoreAuthNotifierAndExecutor(serviceType, st, verifier, notifier, control.FromEnv())
+	return NewServerWithStoreAuthNotifierAndExecutor(serviceType, st, verifier, notifier, envControlExecutor{})
 }
 
 func NewServerWithStoreAuthNotifierAndExecutor(serviceType string, st store.Store, verifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor) http.Handler {
@@ -119,7 +125,7 @@ func NewServerWithStoreAuthNotifierAndExecutor(serviceType string, st store.Stor
 }
 
 func NewServerWithStoreAuthz(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier) http.Handler {
-	return NewServerWithStoreAuthzNotifierAndExecutor(serviceType, st, ingestVerifier, adminVerifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: 5 * time.Second}, control.FromEnv())
+	return NewServerWithStoreAuthzNotifierAndExecutor(serviceType, st, ingestVerifier, adminVerifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: 5 * time.Second}, envControlExecutor{})
 }
 
 func NewServerWithStoreAuthzNotifierAndExecutor(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor) http.Handler {
@@ -173,6 +179,9 @@ func (s *Server) ingestSignal(w http.ResponseWriter, r *http.Request) {
 	tokenSubject, ok := s.ingestAuth.VerifyRequestSubject(r)
 	if !ok {
 		authenticated, authorized := s.adminAuth.AuthorizeRequest(r, adminScopeIngest)
+		if !authenticated {
+			authenticated, authorized = nodeRuntimeVerifier().AuthorizeRequest(r, adminScopeIngest)
+		}
 		if !authenticated {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "invalid_service_token"})
 			return
@@ -1161,6 +1170,9 @@ func parseLimit(r *http.Request, fallback int) int {
 func (s *Server) authorizeAdmin(w http.ResponseWriter, r *http.Request, scope string) bool {
 	authenticated, authorized := s.adminAuth.AuthorizeRequest(r, scope)
 	if !authenticated {
+		authenticated, authorized = nodeRuntimeVerifier().AuthorizeRequest(r, scope)
+	}
+	if !authenticated {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"code": "invalid_service_token"})
 		return false
 	}
@@ -1172,7 +1184,11 @@ func (s *Server) authorizeAdmin(w http.ResponseWriter, r *http.Request, scope st
 }
 
 func (s *Server) ingestAuthorized(r *http.Request) bool {
-	return s.ingestAuth.VerifyRequest(r)
+	return s.ingestAuth.VerifyRequest(r) || nodeRuntimeVerifier().VerifyRequest(r)
+}
+
+func nodeRuntimeVerifier() auth.Verifier {
+	return auth.WithRawTokenScopes(auth.Verifier{}, control.NodeRuntimeTokenFromEnv(), "*")
 }
 
 type rateLimiter struct {
