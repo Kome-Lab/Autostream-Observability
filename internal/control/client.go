@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/example/autostream-observability/internal/version"
 )
 
 const ServiceType = "observability"
@@ -47,6 +49,7 @@ type Registration struct {
 type Heartbeat struct {
 	ServiceID string `json:"service_id"`
 	Status    string `json:"status"`
+	Version   string `json:"version,omitempty"`
 }
 
 func FromEnv() Client {
@@ -62,7 +65,7 @@ func FromEnv() Client {
 		ServiceID:        envDefault("SERVICE_ID", "observability-01"),
 		ServiceName:      envDefault("SERVICE_NAME", "Observability"),
 		ServicePublicURL: strings.TrimSpace(os.Getenv("SERVICE_PUBLIC_URL")),
-		Version:          envDefault("SERVICE_VERSION", "dev"),
+		Version:          envDefault("SERVICE_VERSION", version.Current()),
 		HeartbeatEvery:   envDuration("CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC", 30*time.Second),
 		HTTP:             noRedirectClient(timeout),
 	}
@@ -152,7 +155,7 @@ func (c Client) Heartbeat(ctx context.Context) error {
 	if !c.Enabled() {
 		return errors.New("control panel heartbeat is not configured")
 	}
-	return c.post(ctx, "/services/heartbeat", Heartbeat{ServiceID: c.ServiceID, Status: "online"})
+	return c.post(ctx, "/services/heartbeat", Heartbeat{ServiceID: c.ServiceID, Status: "online", Version: c.Version})
 }
 
 func (c Client) RunHeartbeatLoop(ctx context.Context, onError func(error)) {

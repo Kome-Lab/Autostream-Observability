@@ -15,9 +15,14 @@ import (
 	"github.com/example/autostream-observability/internal/database"
 	"github.com/example/autostream-observability/internal/httpapi"
 	"github.com/example/autostream-observability/internal/store"
+	"github.com/example/autostream-observability/internal/version"
 )
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "version") {
+		fmt.Printf("autostream-observability %s\ncommit: %s\nbuild_date: %s\n", version.Current(), version.Commit, version.BuildDate)
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "configure" {
 		if err := control.RunConfigureCommand(os.Args[2:], control.ServiceType, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "configure failed: %v\n", err)
