@@ -13,7 +13,7 @@ Distributed observability service for AutoStream incidents, diagnostics, remedia
 ## Configuration
 
 ```text
-AUTOSTREAM_NODE_CONFIG=/etc/autostream-node/config.yml
+AUTOSTREAM_NODE_CONFIG=/etc/autostream-observability/config.yml
 
 DATABASE_URL=mysql://autostream_observability:<PASSWORD>@tcp(db.example.com:3306)/autostream_observability?parseTime=true
 AUTOSTREAM_SECRET_ENCRYPTION_KEY=<32_BYTE_BASE64_OR_HEX_ENCRYPTION_KEY>

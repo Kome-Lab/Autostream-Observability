@@ -11,6 +11,6 @@ RUN go build -o /out/autostream-observability -ldflags="-s -w -X github.com/exam
 FROM gcr.io/distroless/base-debian13
 COPY --from=build /out/autostream-observability /usr/local/bin/autostream-observability
 COPY --from=build /out/autostream-observability /usr/local/bin/observability
-ENV AUTOSTREAM_NODE_CONFIG=/etc/autostream-node/config.yml
+ENV AUTOSTREAM_NODE_CONFIG=/etc/autostream-observability/config.yml
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/autostream-observability"]
