@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,16 +58,22 @@ func main() {
 	}
 	st := store.MariaDBStore{DB: db, SecretKey: os.Getenv("AUTOSTREAM_SECRET_ENCRYPTION_KEY")}
 	controlClient := control.FromEnv()
-	if controlClient.Enabled() && controlClient.ServicePublicURL != "" {
-		if err := controlClient.Register(ctx); err != nil {
-			log.Printf("control panel registration failed: %v", err)
-		} else {
-			log.Printf("registered with control panel as %s", controlClient.ServiceID)
-		}
-		go controlClient.RunHeartbeatLoop(ctx, func(err error) {
-			log.Printf("control panel heartbeat failed: %v", err)
-		})
+	if strings.TrimSpace(controlClient.ConfigError) != "" {
+		log.Fatalf("node config invalid: %v", controlClient.ConfigError)
 	}
+	if !controlClient.Enabled() {
+		log.Fatal("AUTOSTREAM_NODE_CONFIG is required and must include panel.url and auth.token")
+	}
+	if strings.TrimSpace(controlClient.ServicePublicURL) == "" {
+		log.Fatal("AUTOSTREAM_NODE_CONFIG is required and must include api.host and api.port")
+	}
+	if err := controlClient.Register(ctx); err != nil {
+		log.Fatalf("control panel registration failed: %v", err)
+	}
+	log.Printf("registered with control panel as %s", controlClient.ServiceID)
+	go controlClient.RunHeartbeatLoop(ctx, func(err error) {
+		log.Printf("control panel heartbeat failed: %v", err)
+	})
 	ingestVerifier := auth.Verifier{}
 	adminVerifier := auth.Verifier{}
 	if nodeToken := control.NodeRuntimeTokenFromEnv(); nodeToken != "" {
