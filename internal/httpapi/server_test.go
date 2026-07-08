@@ -53,6 +53,81 @@ func TestAdminAuthReadsNodeRuntimeTokenAfterStartup(t *testing.T) {
 	}
 }
 
+func TestRootAndStatusUseNodeConfigServiceID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
+	body := `panel:
+  url: "https://panel.example.jp"
+node:
+  id: "o11y-lab-web-kagoya-01"
+  name: "Kome-Lab Web Observability"
+  type: "observability"
+api:
+  host: "ass-o11y.studio-kometubu.jp"
+  port: 443
+  ssl_enabled: true
+auth:
+  token_id: "token-id"
+  token: "runtime-secret"
+`
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServerWithStoreAuthz("observability", store.NewMemoryStore(), auth.Verifier{}, auth.Verifier{})
+
+	rootReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	rootRes := httptest.NewRecorder()
+	handler.ServeHTTP(rootRes, rootReq)
+	if rootRes.Code != http.StatusOK {
+		t.Fatalf("root status = %d body = %s", rootRes.Code, rootRes.Body.String())
+	}
+	if !strings.Contains(rootRes.Body.String(), `"service_id":"o11y-lab-web-kagoya-01"`) || !strings.Contains(rootRes.Body.String(), `"/metrics"`) || !strings.Contains(rootRes.Body.String(), `"auth_required":true`) {
+		t.Fatalf("root response should expose safe operator status and protected metrics endpoint: %s", rootRes.Body.String())
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/status", nil)
+	statusRes := httptest.NewRecorder()
+	handler.ServeHTTP(statusRes, statusReq)
+	if statusRes.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", statusRes.Code, statusRes.Body.String())
+	}
+	if !strings.Contains(statusRes.Body.String(), `"service_id":"o11y-lab-web-kagoya-01"`) {
+		t.Fatalf("status response should use node config service_id: %s", statusRes.Body.String())
+	}
+
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRes := httptest.NewRecorder()
+	handler.ServeHTTP(metricsRes, metricsReq)
+	if metricsRes.Code != http.StatusUnauthorized {
+		t.Fatalf("metrics should remain token protected, got %d body = %s", metricsRes.Code, metricsRes.Body.String())
+	}
+}
+
+func TestMetricsIncludesObservabilityRuntimeMetrics(t *testing.T) {
+	handler := newTestServer(store.NewMemoryStore())
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("Authorization", "Bearer service-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	var metrics []store.MetricSnapshot
+	if err := json.NewDecoder(res.Body).Decode(&metrics); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, metric := range metrics {
+		if metric.ServiceType == control.ServiceType && metric.Name == "observability.goroutines" && metric.Value != nil {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("observability runtime metrics were not returned: %#v", metrics)
+	}
+}
+
 func TestSignalIngestCreatesIncidentAndJapaneseDiagnostic(t *testing.T) {
 	st := store.NewMemoryStore()
 	handler := newTestServer(st)
@@ -769,6 +844,72 @@ func TestNotificationChannelCRUDDoesNotExposeWebhookURL(t *testing.T) {
 	handler.ServeHTTP(deleteRes, deleteReq)
 	if deleteRes.Code != http.StatusOK {
 		t.Fatalf("delete status = %d body = %s", deleteRes.Code, deleteRes.Body.String())
+	}
+}
+
+func TestSlackNotificationChannelCRUDDoesNotExposeWebhookURL(t *testing.T) {
+	handler := newTestServer(store.NewMemoryStore())
+	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"slack ops","type":"slack","enabled":true,"webhook_url":"https://hooks.slack.com/services/T000/B000/secret-token","severity_filter":["critical","error"],"event_type_filter":["incident.opened"]}`))
+	createReq.Header.Set("Authorization", "Bearer service-token")
+	createRes := httptest.NewRecorder()
+	handler.ServeHTTP(createRes, createReq)
+	if createRes.Code != http.StatusCreated {
+		t.Fatalf("create slack channel status=%d body=%s", createRes.Code, createRes.Body.String())
+	}
+	for _, leaked := range []string{"secret-token", "hooks.slack.com/services", `"webhook_url"`} {
+		if strings.Contains(createRes.Body.String(), leaked) {
+			t.Fatalf("slack webhook detail leaked in create response: %s", createRes.Body.String())
+		}
+	}
+	var created store.NotificationChannel
+	if err := json.NewDecoder(createRes.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Type != "slack" || created.MaskedWebhookURL != "https://hooks.slack.com/<WEBHOOK_PATH>" {
+		t.Fatalf("slack public channel markers missing: %#v", created)
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/notification-channels", nil)
+	listReq.Header.Set("Authorization", "Bearer service-token")
+	listRes := httptest.NewRecorder()
+	handler.ServeHTTP(listRes, listReq)
+	if listRes.Code != http.StatusOK {
+		t.Fatalf("list slack channels status=%d body=%s", listRes.Code, listRes.Body.String())
+	}
+	for _, leaked := range []string{"secret-token", "hooks.slack.com/services", `"webhook_url"`} {
+		if strings.Contains(listRes.Body.String(), leaked) {
+			t.Fatalf("slack webhook detail leaked in list response: %s", listRes.Body.String())
+		}
+	}
+	if !strings.Contains(listRes.Body.String(), `"masked_webhook_url":"https://hooks.slack.com/\u003cWEBHOOK_PATH\u003e"`) {
+		t.Fatalf("slack masked webhook URL was not preserved: %s", listRes.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/notification-channels/"+created.ID, nil)
+	getReq.Header.Set("Authorization", "Bearer service-token")
+	getRes := httptest.NewRecorder()
+	handler.ServeHTTP(getRes, getReq)
+	if getRes.Code != http.StatusOK {
+		t.Fatalf("get slack channel status=%d body=%s", getRes.Code, getRes.Body.String())
+	}
+	for _, leaked := range []string{"secret-token", "hooks.slack.com/services", `"webhook_url"`} {
+		if strings.Contains(getRes.Body.String(), leaked) {
+			t.Fatalf("slack webhook detail leaked in get response: %s", getRes.Body.String())
+		}
+	}
+}
+
+func TestSlackNotificationChannelRejectsNonSlackWebhookHost(t *testing.T) {
+	handler := newTestServer(store.NewMemoryStore())
+	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"slack wrong host","type":"slack","enabled":true,"webhook_url":"https://example.com/services/T000/B000/secret-token"}`))
+	createReq.Header.Set("Authorization", "Bearer service-token")
+	createRes := httptest.NewRecorder()
+	handler.ServeHTTP(createRes, createReq)
+	if createRes.Code != http.StatusBadRequest || !strings.Contains(createRes.Body.String(), "invalid_webhook_url") {
+		t.Fatalf("expected invalid_webhook_url, status=%d body=%s", createRes.Code, createRes.Body.String())
+	}
+	if strings.Contains(createRes.Body.String(), "secret-token") || strings.Contains(createRes.Body.String(), "example.com/services") {
+		t.Fatalf("slack webhook detail leaked in validation error: %s", createRes.Body.String())
 	}
 }
 

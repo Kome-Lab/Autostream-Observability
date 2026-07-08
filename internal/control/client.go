@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -44,13 +45,23 @@ type Registration struct {
 	PublicURL    string         `json:"public_url"`
 	Version      string         `json:"version"`
 	Capabilities map[string]any `json:"capabilities"`
+	Hostname     string         `json:"hostname,omitempty"`
+	OS           string         `json:"os,omitempty"`
+	Arch         string         `json:"arch,omitempty"`
 }
 
 type Heartbeat struct {
-	ServiceID string `json:"service_id"`
-	Status    string `json:"status"`
-	Version   string `json:"version,omitempty"`
+	ServiceID    string         `json:"service_id"`
+	Status       string         `json:"status"`
+	Version      string         `json:"version,omitempty"`
+	Capabilities map[string]any `json:"capabilities,omitempty"`
+	Hostname     string         `json:"hostname,omitempty"`
+	OS           string         `json:"os,omitempty"`
+	Arch         string         `json:"arch,omitempty"`
+	Metrics      map[string]any `json:"metrics,omitempty"`
 }
+
+var processStartedAt = time.Now()
 
 func FromEnv() Client {
 	timeout := 5 * time.Second
@@ -131,20 +142,15 @@ func (c Client) Register(ctx context.Context) error {
 		return err
 	}
 	return c.post(ctx, "/services/register", Registration{
-		ServiceID:   c.ServiceID,
-		ServiceType: ServiceType,
-		ServiceName: c.ServiceName,
-		PublicURL:   c.ServicePublicURL,
-		Version:     c.Version,
-		Capabilities: map[string]any{
-			"signal_ingest":           true,
-			"incident_detection":      true,
-			"diagnostics":             true,
-			"remediation":             true,
-			"notification_channels":   true,
-			"notification_deliveries": true,
-			"health_endpoint":         true,
-		},
+		ServiceID:    c.ServiceID,
+		ServiceType:  ServiceType,
+		ServiceName:  c.ServiceName,
+		PublicURL:    c.ServicePublicURL,
+		Version:      c.Version,
+		Capabilities: serviceCapabilities(),
+		Hostname:     reportHostname(),
+		OS:           runtime.GOOS,
+		Arch:         runtime.GOARCH,
 	})
 }
 
@@ -155,7 +161,16 @@ func (c Client) Heartbeat(ctx context.Context) error {
 	if !c.Enabled() {
 		return errors.New("control panel heartbeat is not configured")
 	}
-	return c.post(ctx, "/services/heartbeat", Heartbeat{ServiceID: c.ServiceID, Status: "online", Version: c.Version})
+	return c.post(ctx, "/services/heartbeat", Heartbeat{
+		ServiceID:    c.ServiceID,
+		Status:       "online",
+		Version:      c.Version,
+		Capabilities: serviceCapabilities(),
+		Hostname:     reportHostname(),
+		OS:           runtime.GOOS,
+		Arch:         runtime.GOARCH,
+		Metrics:      NodeRuntimeMetrics(),
+	})
 }
 
 func (c Client) RunHeartbeatLoop(ctx context.Context, onError func(error)) {
@@ -212,6 +227,38 @@ func noRedirectClient(timeout time.Duration) *http.Client {
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
+	}
+}
+
+func serviceCapabilities() map[string]any {
+	return map[string]any{
+		"signal_ingest":           true,
+		"incident_detection":      true,
+		"diagnostics":             true,
+		"remediation":             true,
+		"notification_channels":   true,
+		"notification_deliveries": true,
+		"health_endpoint":         true,
+	}
+}
+
+func reportHostname() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(hostname)
+}
+
+func NodeRuntimeMetrics() map[string]any {
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	return map[string]any{
+		"observability.goroutines":       runtime.NumGoroutine(),
+		"observability.heap_alloc_bytes": mem.HeapAlloc,
+		"observability.heap_sys_bytes":   mem.HeapSys,
+		"observability.heap_objects":     mem.HeapObjects,
+		"observability.uptime_seconds":   time.Since(processStartedAt).Seconds(),
 	}
 }
 

@@ -134,6 +134,7 @@ func NewServerWithStoreAuthzNotifierAndExecutor(serviceType string, st store.Sto
 	}
 	s := &Server{serviceType: serviceType, store: st, ingestAuth: ingestVerifier, adminAuth: adminVerifier, notifier: notifier, executor: executor, rateLimiter: rateLimiterFromEnv(st)}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", s.root)
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("GET /status", s.status)
 	mux.HandleFunc("POST /heartbeat", s.heartbeat)
@@ -159,12 +160,38 @@ func NewServerWithStoreAuthzNotifierAndExecutor(serviceType string, st store.Sto
 	return securityHeaders(s.rateLimitSensitive(mux))
 }
 
+func (s *Server) root(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"service_type": s.serviceType,
+		"service_id":   observabilityServiceID(),
+		"status":       "ready",
+		"checked_at":   time.Now().UTC(),
+		"endpoints": map[string]any{
+			"health":  map[string]any{"path": "/health", "auth_required": false},
+			"status":  map[string]any{"path": "/status", "auth_required": false},
+			"metrics": map[string]any{"path": "/metrics", "auth_required": true},
+		},
+	})
+}
+
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, Status{ServiceType: s.serviceType, ServiceID: os.Getenv("SERVICE_ID"), Status: "ready", CheckedAt: time.Now().UTC()})
+	writeJSON(w, http.StatusOK, Status{ServiceType: s.serviceType, ServiceID: observabilityServiceID(), Status: "ready", CheckedAt: time.Now().UTC()})
+}
+
+func observabilityServiceID() string {
+	id := strings.TrimSpace(control.FromEnv().ServiceID)
+	if id != "" {
+		return id
+	}
+	id = strings.TrimSpace(os.Getenv("SERVICE_ID"))
+	if id != "" {
+		return id
+	}
+	return "observability-01"
 }
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
@@ -247,7 +274,7 @@ func (s *Server) listMetrics(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "list_metrics_failed"})
 		return
 	}
-	writeJSON(w, http.StatusOK, metricSnapshots(signals))
+	writeJSON(w, http.StatusOK, appendSelfMetricSnapshots(metricSnapshots(signals)))
 }
 
 func (s *Server) listDiagnostics(w http.ResponseWriter, r *http.Request) {
@@ -1150,6 +1177,43 @@ func metricSnapshots(signals []store.Signal) []store.MetricSnapshot {
 		})
 	}
 	return out
+}
+
+func appendSelfMetricSnapshots(metrics []store.MetricSnapshot) []store.MetricSnapshot {
+	now := time.Now().UTC()
+	serviceID := strings.TrimSpace(control.FromEnv().ServiceID)
+	if serviceID == "" {
+		serviceID = "observability-01"
+	}
+	for name, raw := range control.NodeRuntimeMetrics() {
+		value, ok := numericMetricValue(raw)
+		if !ok {
+			continue
+		}
+		metrics = append(metrics, store.MetricSnapshot{
+			Name:        name,
+			ServiceID:   serviceID,
+			ServiceType: control.ServiceType,
+			Value:       &value,
+			UpdatedAt:   now,
+		})
+	}
+	return metrics
+}
+
+func numericMetricValue(raw any) (float64, bool) {
+	switch value := raw.(type) {
+	case int:
+		return float64(value), true
+	case int64:
+		return float64(value), true
+	case uint64:
+		return float64(value), true
+	case float64:
+		return value, true
+	default:
+		return 0, false
+	}
 }
 
 func parseLimit(r *http.Request, fallback int) int {

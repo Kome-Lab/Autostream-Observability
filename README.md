@@ -25,6 +25,14 @@ TZ=Asia/Tokyo
 
 Control Panel calls Observability with the Node Runtime Token stored in the Panel-generated `AUTOSTREAM_NODE_CONFIG`. Do not configure a separate Observability admin token or direct ingest token.
 
+The Observability service does not serve a browser UI. `GET /` and `GET /status` return safe operator status JSON, while API data such as `GET /metrics` is token protected and is normally read through the Control Panel `/observability/metrics` proxy. A browser request to `/metrics` without the Node Runtime Token should return an authorization error.
+
+## Platform and Metrics Reporting
+
+The `configure` subcommand reports the node version, hostname, OS, and arch to Control Panel when it consumes the Configure Token. After the service starts with `AUTOSTREAM_NODE_CONFIG`, heartbeat reports the same platform fields plus `observability.goroutines`, heap metrics, and `observability.uptime_seconds`.
+
+If the Node registration screen shows `OS未取得` / `Arch未取得` or no Metrics, verify that the latest `autostream-observability configure` command wrote the same path used by `AUTOSTREAM_NODE_CONFIG`, that the config is readable by the `autostream` user, and that heartbeat is succeeding in `journalctl -u autostream-observability`.
+
 Webhook URLs and SMTP passwords are stored encrypted with `AUTOSTREAM_SECRET_ENCRYPTION_KEY`. API responses and delivery history must expose only configured state, masked targets, fingerprints, status, and timestamps.
 
 ## Development

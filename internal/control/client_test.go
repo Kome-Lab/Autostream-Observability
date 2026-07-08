@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -106,6 +107,7 @@ func TestExecuteRemediationDoesNotFollowRedirectsWithBearerToken(t *testing.T) {
 func TestRegisterAndHeartbeat(t *testing.T) {
 	var paths []string
 	var registration Registration
+	var heartbeat Heartbeat
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		if r.Header.Get("Authorization") != "Bearer service-token" {
@@ -113,6 +115,11 @@ func TestRegisterAndHeartbeat(t *testing.T) {
 		}
 		if r.URL.Path == "/services/register" {
 			if err := json.NewDecoder(r.Body).Decode(&registration); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if r.URL.Path == "/services/heartbeat" {
+			if err := json.NewDecoder(r.Body).Decode(&heartbeat); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -141,6 +148,15 @@ func TestRegisterAndHeartbeat(t *testing.T) {
 	}
 	if registration.ServiceType != "observability" || registration.ServiceID != "observability-01" || registration.Capabilities["incident_detection"] != true {
 		t.Fatalf("unexpected registration: %#v", registration)
+	}
+	if registration.OS != runtime.GOOS || registration.Arch != runtime.GOARCH {
+		t.Fatalf("registration did not include runtime platform: %#v", registration)
+	}
+	if heartbeat.OS != runtime.GOOS || heartbeat.Arch != runtime.GOARCH || heartbeat.Capabilities["diagnostics"] != true {
+		t.Fatalf("heartbeat did not include platform/capabilities: %#v", heartbeat)
+	}
+	if heartbeat.Metrics["observability.goroutines"] == nil || heartbeat.Metrics["observability.uptime_seconds"] == nil {
+		t.Fatalf("heartbeat did not include observability metrics: %#v", heartbeat.Metrics)
 	}
 }
 
