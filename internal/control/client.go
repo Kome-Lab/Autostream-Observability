@@ -44,6 +44,8 @@ type Registration struct {
 	ServiceName  string         `json:"service_name"`
 	PublicURL    string         `json:"public_url"`
 	Version      string         `json:"version"`
+	Commit       string         `json:"commit,omitempty"`
+	BuildDate    string         `json:"build_date,omitempty"`
 	Capabilities map[string]any `json:"capabilities"`
 	Hostname     string         `json:"hostname,omitempty"`
 	OS           string         `json:"os,omitempty"`
@@ -54,6 +56,8 @@ type Heartbeat struct {
 	ServiceID    string         `json:"service_id"`
 	Status       string         `json:"status"`
 	Version      string         `json:"version,omitempty"`
+	Commit       string         `json:"commit,omitempty"`
+	BuildDate    string         `json:"build_date,omitempty"`
 	Capabilities map[string]any `json:"capabilities,omitempty"`
 	Hostname     string         `json:"hostname,omitempty"`
 	OS           string         `json:"os,omitempty"`
@@ -145,6 +149,8 @@ func (c Client) Register(ctx context.Context) error {
 		ServiceName:  c.ServiceName,
 		PublicURL:    c.ServicePublicURL,
 		Version:      c.Version,
+		Commit:       version.Commit,
+		BuildDate:    version.BuildDate,
 		Capabilities: serviceCapabilities(),
 		Hostname:     reportHostname(),
 		OS:           runtime.GOOS,
@@ -163,6 +169,8 @@ func (c Client) Heartbeat(ctx context.Context) error {
 		ServiceID:    c.ServiceID,
 		Status:       "online",
 		Version:      c.Version,
+		Commit:       version.Commit,
+		BuildDate:    version.BuildDate,
 		Capabilities: serviceCapabilities(),
 		Hostname:     reportHostname(),
 		OS:           runtime.GOOS,

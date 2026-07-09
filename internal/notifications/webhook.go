@@ -428,7 +428,7 @@ func formatIncidentText(eventType string, incident store.Incident) string {
 
 func normalizedEventType(value string) string {
 	switch strings.TrimSpace(value) {
-	case "incident.opened", "incident.updated", "incident.resolved", "diagnostic.created", "remediation.pending_approval", "remediation.executed":
+	case "incident.opened", "incident.updated", "incident.resolved", "diagnostic.created", "remediation.pending_approval", "remediation.executed", "admin.audit":
 		return strings.TrimSpace(value)
 	default:
 		return "incident.updated"

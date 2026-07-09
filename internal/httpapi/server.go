@@ -104,6 +104,18 @@ type notificationChannelRequest struct {
 	EventTypeFilter []string `json:"event_type_filter"`
 }
 
+type notificationEventRequest struct {
+	EventType     string `json:"event_type"`
+	Severity      string `json:"severity"`
+	Status        string `json:"status"`
+	Action        string `json:"action"`
+	ResourceType  string `json:"resource_type"`
+	ResourceID    string `json:"resource_id"`
+	ActorUsername string `json:"actor_username"`
+	Summary       string `json:"summary"`
+	Timestamp     string `json:"timestamp"`
+}
+
 func NewServer(serviceType string) http.Handler {
 	return NewServerWithStore(serviceType, store.NewMemoryStore())
 }
@@ -153,6 +165,7 @@ func NewServerWithStoreAuthzNotifierAndExecutor(serviceType string, st store.Sto
 	mux.HandleFunc("PUT /notification-channels/{id}", s.updateNotificationChannel)
 	mux.HandleFunc("DELETE /notification-channels/{id}", s.deleteNotificationChannel)
 	mux.HandleFunc("POST /notification-channels/{id}/test", s.testNotificationChannel)
+	mux.HandleFunc("POST /notification-events", s.createNotificationEvent)
 	mux.HandleFunc("GET /remediation-actions", s.listRemediationActions)
 	mux.HandleFunc("GET /remediation-actions/{id}/dispatch-context", s.getRemediationDispatchContext)
 	mux.HandleFunc("POST /remediation-actions/{id}/approve", s.approveRemediationAction)
@@ -519,6 +532,99 @@ func (s *Server) testNotificationChannel(w http.ResponseWriter, r *http.Request)
 		results[i].Target = notificationChannelTarget(channel)
 	}
 	writeJSON(w, http.StatusAccepted, results)
+}
+
+func (s *Server) createNotificationEvent(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeAdmin(w, r, adminScopeNotificationsManage) {
+		return
+	}
+	var body notificationEventRequest
+	if err := decodeJSONBody(w, r, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "bad_request"})
+		return
+	}
+	eventType := strings.TrimSpace(body.EventType)
+	if eventType == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "event_type_required"})
+		return
+	}
+	incident, err := notificationIncidentFromRequest(body, s.serviceType)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_notification_event"})
+		return
+	}
+	results := s.deliverNotificationEvent(r, eventType, incident)
+	writeJSON(w, http.StatusAccepted, results)
+}
+
+func notificationIncidentFromRequest(body notificationEventRequest, fallbackService string) (store.Incident, error) {
+	action := safeNotificationField(body.Action, 128)
+	if action == "" {
+		return store.Incident{}, errors.New("action is required")
+	}
+	resourceType := safeNotificationField(body.ResourceType, 80)
+	resourceID := safeNotificationField(body.ResourceID, 160)
+	actor := safeNotificationField(body.ActorUsername, 80)
+	status := safeNotificationStatus(body.Status)
+	severity := safeNotificationSeverity(body.Severity)
+	summary := safeNotificationField(body.Summary, 240)
+	if summary == "" {
+		summary = "管理イベント: " + action + " / " + status
+	}
+	if resourceType != "" {
+		summary += " / " + resourceType
+		if resourceID != "" {
+			summary += " " + resourceID
+		}
+	}
+	if actor != "" {
+		summary += " / actor=" + actor
+	}
+	serviceID := strings.TrimSpace(fallbackService)
+	if serviceID == "" {
+		serviceID = "observability"
+	}
+	return store.Incident{
+		Rule:      action,
+		Severity:  severity,
+		Status:    status,
+		SummaryJA: summary,
+		ServiceID: serviceID,
+	}, nil
+}
+
+func safeNotificationField(value string, maxLen int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if safeEvidenceValue(value) == "<redacted>" {
+		return ""
+	}
+	if maxLen > 0 && len(value) > maxLen {
+		return value[:maxLen]
+	}
+	return value
+}
+
+func safeNotificationSeverity(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "critical", "error", "warning", "info":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "info"
+	}
+}
+
+func safeNotificationStatus(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || safeEvidenceValue(value) == "<redacted>" {
+		return "recorded"
+	}
+	if len(value) > 64 {
+		return value[:64]
+	}
+	return value
 }
 
 func notificationChannelFromRequest(body notificationChannelRequest) store.NotificationChannel {
@@ -1119,8 +1225,12 @@ func (s *Server) createRemediationActions(r *http.Request, incident store.Incide
 }
 
 func (s *Server) notifyIncidentEvent(r *http.Request, eventType string, incident store.Incident) {
+	_ = s.deliverNotificationEvent(r, eventType, incident)
+}
+
+func (s *Server) deliverNotificationEvent(r *http.Request, eventType string, incident store.Incident) []notifications.DeliveryResult {
 	if s.notifier == nil {
-		return
+		return nil
 	}
 	results, err := notifications.NotifyIncidentEvent(r.Context(), s.notifier, eventType, incident)
 	if err != nil && len(results) == 0 {
@@ -1154,6 +1264,7 @@ func (s *Server) notifyIncidentEvent(r *http.Request, eventType string, incident
 			},
 		})
 	}
+	return results
 }
 
 func metricSnapshots(signals []store.Signal) []store.MetricSnapshot {

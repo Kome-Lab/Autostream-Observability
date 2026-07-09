@@ -792,6 +792,65 @@ func TestListNotificationDeliveriesRequiresAuthorization(t *testing.T) {
 	}
 }
 
+func TestCreateNotificationEventDeliversAdminAudit(t *testing.T) {
+	st := store.NewMemoryStore()
+	notifier := &eventRecordingNotifier{}
+	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), notifier, nil)
+	req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(`{"event_type":"admin.audit","severity":"info","status":"success","action":"oauth_accounts.update","resource_type":"oauth_account","resource_id":"acct-01","actor_username":"ops","summary":"OAuth connected account updated"}`))
+	req.Header.Set("Authorization", "Bearer admin-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	if len(notifier.events) != 1 || notifier.events[0] != "admin.audit" {
+		t.Fatalf("unexpected event notifier calls: %#v", notifier.events)
+	}
+	deliveries, err := st.ListNotificationDeliveries(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 1 {
+		t.Fatalf("expected one saved delivery, got %#v", deliveries)
+	}
+	delivery := deliveries[0]
+	if delivery.EventType != "admin.audit" || delivery.IncidentID != "" || delivery.Status != "success" {
+		t.Fatalf("unexpected saved delivery: %#v", delivery)
+	}
+	if delivery.Metadata["severity"] != "info" || delivery.Metadata["rule"] != "oauth_accounts.update" {
+		t.Fatalf("unexpected delivery metadata: %#v", delivery.Metadata)
+	}
+	if strings.Contains(res.Body.String(), "acct-01") || strings.Contains(res.Body.String(), "ops") {
+		t.Fatalf("notification event response should only include sanitized delivery results: %s", res.Body.String())
+	}
+}
+
+func TestCreateNotificationEventRejectsUnsafeAdminAuditFields(t *testing.T) {
+	st := store.NewMemoryStore()
+	notifier := &eventRecordingNotifier{}
+	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), notifier, nil)
+	req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(`{"event_type":"admin.audit","severity":"info","status":"success","action":"raw-secret-token","resource_type":"oauth_account","resource_id":"acct-01"}`))
+	req.Header.Set("Authorization", "Bearer admin-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	if len(notifier.events) != 0 {
+		t.Fatalf("unsafe event should not notify: %#v", notifier.events)
+	}
+	deliveries, err := st.ListNotificationDeliveries(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 0 {
+		t.Fatalf("unsafe event should not save deliveries: %#v", deliveries)
+	}
+	if strings.Contains(res.Body.String(), "raw-secret-token") {
+		t.Fatalf("unsafe notification event response leaked raw secret: %s", res.Body.String())
+	}
+}
+
 func TestNotificationChannelCRUDDoesNotExposeWebhookURL(t *testing.T) {
 	handler := newTestServer(store.NewMemoryStore())
 	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"discord main","type":"discord","enabled":true,"webhook_url":"https://discord.com/api/webhooks/id/secret-token","severity_filter":["critical"],"event_type_filter":["incident.opened"]}`))
@@ -1690,6 +1749,22 @@ func (n *fakeNotifier) NotifyIncidentOpened(ctx context.Context, incident store.
 	}
 	n.count++
 	return []notifications.DeliveryResult{{EventType: "incident.opened", Channel: "generic", Target: "https://<WEBHOOK_HOST>/<WEBHOOK_PATH>", Status: "success"}}, nil
+}
+
+type eventRecordingNotifier struct {
+	events []string
+}
+
+func (n *eventRecordingNotifier) NotifyIncidentOpened(ctx context.Context, incident store.Incident) ([]notifications.DeliveryResult, error) {
+	return n.NotifyIncidentEvent(ctx, "incident.opened", incident)
+}
+
+func (n *eventRecordingNotifier) NotifyIncidentEvent(ctx context.Context, eventType string, incident store.Incident) ([]notifications.DeliveryResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	n.events = append(n.events, eventType)
+	return []notifications.DeliveryResult{{EventType: eventType, Channel: "slack", Target: "https://hooks.slack.com/<WEBHOOK_PATH>", Status: "success"}}, nil
 }
 
 type failingNotifier struct{}

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/example/autostream-observability/internal/version"
 )
 
 func TestExecuteRemediationDispatchesToControlPanel(t *testing.T) {
@@ -152,8 +154,14 @@ func TestRegisterAndHeartbeat(t *testing.T) {
 	if registration.OS != runtime.GOOS || registration.Arch != runtime.GOARCH {
 		t.Fatalf("registration did not include runtime platform: %#v", registration)
 	}
+	if registration.Commit != version.Commit || registration.BuildDate != version.BuildDate {
+		t.Fatalf("registration did not include build metadata: %#v", registration)
+	}
 	if heartbeat.OS != runtime.GOOS || heartbeat.Arch != runtime.GOARCH || heartbeat.Capabilities["diagnostics"] != true {
 		t.Fatalf("heartbeat did not include platform/capabilities: %#v", heartbeat)
+	}
+	if heartbeat.Commit != version.Commit || heartbeat.BuildDate != version.BuildDate {
+		t.Fatalf("heartbeat did not include build metadata: %#v", heartbeat)
 	}
 	if heartbeat.Metrics["observability.goroutines"] == nil || heartbeat.Metrics["observability.uptime_seconds"] == nil {
 		t.Fatalf("heartbeat did not include observability metrics: %#v", heartbeat.Metrics)

@@ -235,6 +235,37 @@ func TestChannelNotifierAppliesLifecycleEventFilter(t *testing.T) {
 	}
 }
 
+func TestChannelNotifierAppliesAdminAuditEventFilter(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	st := store.NewMemoryStore()
+	if _, err := st.CreateNotificationChannel(t.Context(), store.NotificationChannel{
+		Name:            "admin audit only",
+		Type:            "generic",
+		Enabled:         true,
+		WebhookURL:      server.URL + "/hook/secret",
+		EventTypeFilter: []string{"admin.audit"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	notifier := ChannelNotifier{Store: st, Timeout: time.Second, AllowPrivate: true}
+	incident := store.Incident{Rule: "oauth_accounts.update", Severity: "info", Status: "success", SummaryJA: "管理イベント: oauth_accounts.update", ServiceID: "observability"}
+	if results, err := notifier.NotifyIncidentEvent(t.Context(), "incident.updated", incident); err != nil || len(results) != 0 {
+		t.Fatalf("unexpected non-admin delivery: results=%#v err=%v", results, err)
+	}
+	results, err := notifier.NotifyIncidentEvent(t.Context(), "admin.audit", incident)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || len(results) != 1 || results[0].EventType != "admin.audit" {
+		t.Fatalf("unexpected admin-audit delivery: calls=%d results=%#v", calls, results)
+	}
+}
+
 func TestChannelNotifierPreservesMultipleMatchingDeliveryResults(t *testing.T) {
 	var webhookCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
