@@ -61,8 +61,6 @@ type Heartbeat struct {
 	Metrics      map[string]any `json:"metrics,omitempty"`
 }
 
-var processStartedAt = time.Now()
-
 func FromEnv() Client {
 	timeout := 5 * time.Second
 	if raw := strings.TrimSpace(os.Getenv("CONTROL_PANEL_TIMEOUT_SEC")); raw != "" {
@@ -253,13 +251,16 @@ func reportHostname() string {
 func NodeRuntimeMetrics() map[string]any {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
-	return map[string]any{
-		"observability.goroutines":       runtime.NumGoroutine(),
-		"observability.heap_alloc_bytes": mem.HeapAlloc,
-		"observability.heap_sys_bytes":   mem.HeapSys,
-		"observability.heap_objects":     mem.HeapObjects,
-		"observability.uptime_seconds":   time.Since(processStartedAt).Seconds(),
+	metrics := make(map[string]any)
+	for name, value := range NodeHostMetrics() {
+		metrics[name] = value
 	}
+	metrics["observability.goroutines"] = runtime.NumGoroutine()
+	metrics["observability.heap_alloc_bytes"] = mem.HeapAlloc
+	metrics["observability.heap_sys_bytes"] = mem.HeapSys
+	metrics["observability.heap_objects"] = mem.HeapObjects
+	metrics["observability.uptime_seconds"] = time.Since(processStartedAt).Seconds()
+	return metrics
 }
 
 func validateHTTPURL(raw, name string) error {

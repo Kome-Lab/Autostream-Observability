@@ -158,6 +158,9 @@ func TestRegisterAndHeartbeat(t *testing.T) {
 	if heartbeat.Metrics["observability.goroutines"] == nil || heartbeat.Metrics["observability.uptime_seconds"] == nil {
 		t.Fatalf("heartbeat did not include observability metrics: %#v", heartbeat.Metrics)
 	}
+	if heartbeat.Metrics["node.cpu_count"] == nil || heartbeat.Metrics["process.heap_alloc_bytes"] == nil || heartbeat.Metrics["process.uptime_seconds"] == nil {
+		t.Fatalf("heartbeat did not include host/process metrics: %#v", heartbeat.Metrics)
+	}
 }
 
 func TestRegisterRejectsInvalidPublicURL(t *testing.T) {
