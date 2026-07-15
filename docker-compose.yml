@@ -4,6 +4,7 @@ services:
     env_file: .env.example
     environment:
       AUTOSTREAM_NODE_CONFIG: /etc/autostream-observability/config.yml
+      OBSERVABILITY_BIND_ADDR: 0.0.0.0:8080
     ports:
       - "8080:8080"
     volumes:

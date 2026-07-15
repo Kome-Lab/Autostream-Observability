@@ -3,5 +3,10 @@ services:
     image: observability:latest
     restart: unless-stopped
     env_file: .env
+    environment:
+      AUTOSTREAM_NODE_CONFIG: /etc/autostream-observability/config.yml
+      OBSERVABILITY_BIND_ADDR: 0.0.0.0:8080
     ports:
       - "127.0.0.1:8080:8080"
+    volumes:
+      - ${OBSERVABILITY_NODE_CONFIG_PATH:-./config/config.yml}:/etc/autostream-observability/config.yml:ro
