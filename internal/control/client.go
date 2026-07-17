@@ -17,7 +17,10 @@ import (
 	"github.com/example/autostream-observability/internal/version"
 )
 
-const ServiceType = "observability"
+const (
+	ServiceType                    = "observability"
+	dockerComposeObservabilityHost = "observability"
+)
 
 type Client struct {
 	BaseURL          string
@@ -140,7 +143,7 @@ func (c Client) Register(ctx context.Context) error {
 	if !c.Enabled() {
 		return errors.New("control panel registration is not configured")
 	}
-	if err := validateHTTPURL(c.ServicePublicURL, "SERVICE_PUBLIC_URL"); err != nil {
+	if err := validateServicePublicURL(c.ServicePublicURL, "SERVICE_PUBLIC_URL"); err != nil {
 		return err
 	}
 	return c.post(ctx, "/services/register", Registration{
@@ -272,6 +275,14 @@ func NodeRuntimeMetrics() map[string]any {
 }
 
 func validateHTTPURL(raw, name string) error {
+	return validateHTTPURLWithAllowedHTTPHost(raw, name, "")
+}
+
+func validateServicePublicURL(raw, name string) error {
+	return validateHTTPURLWithAllowedHTTPHost(raw, name, dockerComposeObservabilityHost)
+}
+
+func validateHTTPURLWithAllowedHTTPHost(raw, name, allowedHTTPHost string) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return errors.New(name + " must be an absolute URL")
@@ -285,7 +296,7 @@ func validateHTTPURL(raw, name string) error {
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return errors.New(name + " must not include query or fragment")
 	}
-	if parsed.Scheme == "http" && !isLocalDevHost(parsed.Hostname()) {
+	if parsed.Scheme == "http" && !isLocalDevHost(parsed.Hostname()) && !(allowedHTTPHost != "" && strings.EqualFold(parsed.Hostname(), allowedHTTPHost)) {
 		return errors.New(name + " must use https for remote hosts")
 	}
 	return nil

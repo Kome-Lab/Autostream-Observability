@@ -199,3 +199,51 @@ func TestRegisterRejectsPublicURLQueryOrFragment(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestRegisterAllowsDockerComposeObservabilityHTTPPublicURL(t *testing.T) {
+	var registration Registration
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&registration); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	const publicURL = "http://observability:8080"
+	client := Client{
+		BaseURL:          server.URL,
+		Token:            "service-token",
+		ServiceID:        "observability-01",
+		ServicePublicURL: publicURL,
+		HTTP:             server.Client(),
+	}
+	if err := client.Register(t.Context()); err != nil {
+		t.Fatalf("expected exact Docker Compose observability host to be allowed: %v", err)
+	}
+	if registration.PublicURL != publicURL {
+		t.Fatalf("unexpected registered public URL: %q", registration.PublicURL)
+	}
+}
+
+func TestServicePublicURLHTTPHostExceptionIsScoped(t *testing.T) {
+	if err := validateHTTPURL("http://observability:8080", "CONTROL_PANEL_URL"); err == nil {
+		t.Fatal("expected Docker Compose observability HTTP host to remain rejected for the control panel")
+	}
+	if err := validateHTTPURL("http://:8080", "CONTROL_PANEL_URL"); err == nil {
+		t.Fatal("expected empty HTTP hostname to remain rejected for the control panel")
+	}
+
+	for _, publicURL := range []string{
+		"http://worker:8080",
+		"http://metrics:8080",
+		"http://observability.local:8080",
+		"http://observability-1:8080",
+	} {
+		t.Run(publicURL, func(t *testing.T) {
+			if err := validateServicePublicURL(publicURL, "SERVICE_PUBLIC_URL"); err == nil {
+				t.Fatal("expected non-observability HTTP host to fail")
+			}
+		})
+	}
+}

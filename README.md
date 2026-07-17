@@ -17,7 +17,7 @@ AUTOSTREAM_NODE_CONFIG=/etc/autostream-observability/config.yml
 
 DATABASE_URL=mysql://autostream_observability:<PASSWORD>@tcp(db.example.com:3306)/autostream_observability?parseTime=true
 AUTOSTREAM_SECRET_ENCRYPTION_KEY=<32_BYTE_BASE64_OR_HEX_ENCRYPTION_KEY>
-OBSERVABILITY_BIND_ADDR=127.0.0.1:8080
+OBSERVABILITY_BIND_ADDR=127.0.0.1:8082
 
 REMEDIATION_MODE=suggest_only
 TZ=Asia/Tokyo
