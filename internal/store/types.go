@@ -54,6 +54,8 @@ type NotificationChannel struct {
 	Name                   string    `json:"name"`
 	Type                   string    `json:"type"`
 	Enabled                bool      `json:"enabled"`
+	UseGlobalSMTP          bool      `json:"uses_global_smtp"`
+	UseGlobalSMTPSet       bool      `json:"-"`
 	WebhookURL             string    `json:"-"`
 	MaskedWebhookURL       string    `json:"masked_webhook_url,omitempty"`
 	EmailRecipients        []string  `json:"email_recipients,omitempty"`
@@ -77,6 +79,7 @@ func (c NotificationChannel) MarshalJSON() ([]byte, error) {
 		Name                   string    `json:"name"`
 		Type                   string    `json:"type"`
 		Enabled                bool      `json:"enabled"`
+		UseGlobalSMTP          bool      `json:"uses_global_smtp"`
 		MaskedWebhookURL       string    `json:"masked_webhook_url,omitempty"`
 		SMTPPasswordConfigured bool      `json:"smtp_password_configured,omitempty"`
 		MaskedEmailTarget      string    `json:"masked_email_target,omitempty"`
@@ -90,6 +93,7 @@ func (c NotificationChannel) MarshalJSON() ([]byte, error) {
 		Name:                   c.Name,
 		Type:                   c.Type,
 		Enabled:                c.Enabled,
+		UseGlobalSMTP:          c.UseGlobalSMTP,
 		MaskedWebhookURL:       c.MaskedWebhookURL,
 		SMTPPasswordConfigured: c.SMTPPasswordConfigured,
 		MaskedEmailTarget:      c.MaskedEmailTarget,

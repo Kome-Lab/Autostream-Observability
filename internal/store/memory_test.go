@@ -170,6 +170,55 @@ func TestNotificationChannelJSONOmitsEmailOperationalSecrets(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreInfersGlobalSMTPAndClearsLegacyConfigOnUpdate(t *testing.T) {
+	s := NewMemoryStore()
+	global, err := s.CreateNotificationChannel(t.Context(), NotificationChannel{
+		Name:            "global email",
+		Type:            "email",
+		Enabled:         true,
+		EmailRecipients: []string{"ops@example.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !global.UseGlobalSMTP || global.SMTPPort != 0 {
+		t.Fatalf("email channel without legacy SMTP must use global settings: %#v", global)
+	}
+
+	legacy, err := s.CreateNotificationChannel(t.Context(), NotificationChannel{
+		Name:            "legacy email",
+		Type:            "email",
+		Enabled:         true,
+		EmailRecipients: []string{"legacy@example.com"},
+		SMTPHost:        "smtp.example.com",
+		SMTPPort:        587,
+		SMTPTLS:         true,
+		SMTPFrom:        "autostream@example.com",
+		SMTPUsername:    "autostream",
+		SMTPPassword:    "raw-smtp-password",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.UseGlobalSMTP {
+		t.Fatalf("legacy SMTP channel unexpectedly switched to global: %#v", legacy)
+	}
+	updated, err := s.UpdateNotificationChannel(t.Context(), NotificationChannel{
+		ID:               legacy.ID,
+		Name:             legacy.Name,
+		Type:             "email",
+		Enabled:          true,
+		UseGlobalSMTP:    true,
+		UseGlobalSMTPSet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.UseGlobalSMTP || updated.SMTPHost != "" || updated.SMTPPort != 0 || updated.SMTPFrom != "" || updated.SMTPUsername != "" || updated.SMTPPassword != "" || updated.SMTPPasswordConfigured {
+		t.Fatalf("global SMTP update retained legacy secrets: %#v", updated)
+	}
+}
+
 func TestMemoryStoreRemediationActions(t *testing.T) {
 	s := NewMemoryStore()
 	action, err := s.CreateRemediationAction(t.Context(), RemediationAction{IncidentID: "inc-1", Action: "retry_gdrive_upload", Mode: "suggest_only", SafeAuto: true})

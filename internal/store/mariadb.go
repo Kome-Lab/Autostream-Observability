@@ -375,6 +375,13 @@ func (s MariaDBStore) UpdateNotificationChannel(ctx context.Context, channel Not
 		existing.Type = normalizeChannelType(channel.Type)
 	}
 	existing.Enabled = channel.Enabled
+	if channel.UseGlobalSMTPSet {
+		existing.UseGlobalSMTP = channel.UseGlobalSMTP
+		existing.UseGlobalSMTPSet = true
+		if channel.UseGlobalSMTP {
+			clearLegacySMTPConfiguration(&existing)
+		}
+	}
 	if channel.WebhookURL != "" {
 		existing.WebhookURL = channel.WebhookURL
 	}
@@ -597,7 +604,7 @@ func (s MariaDBStore) scanNotificationChannel(scanner notificationChannelScanner
 		channel.SMTPPassword = plaintext
 		channel.SMTPPasswordConfigured = true
 	}
-	return channel, nil
+	return normalizeNotificationChannelSecrets(channel), nil
 }
 
 func scanIncident(scanner incidentScanner) (Incident, error) {

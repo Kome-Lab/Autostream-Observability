@@ -1,6 +1,7 @@
 package control
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,88 @@ import (
 
 	"github.com/example/autostream-observability/internal/version"
 )
+
+func TestSendNotificationEmailDispatchesAuthenticatedPayload(t *testing.T) {
+	var gotAuth string
+	var gotPath string
+	var gotBody NotificationEmailRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client := Client{BaseURL: server.URL, Token: "runtime-token", HTTP: server.Client()}
+	if err := client.SendNotificationEmail(t.Context(), []string{" ops@example.com "}, "[AutoStream] INFO test", "test body"); err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer runtime-token" || gotPath != "/services/notifications/email" {
+		t.Fatalf("unexpected relay request auth=%q path=%q", gotAuth, gotPath)
+	}
+	if len(gotBody.Recipients) != 1 || gotBody.Recipients[0] != "ops@example.com" || gotBody.Subject != "[AutoStream] INFO test" || gotBody.Text != "test body" {
+		t.Fatalf("unexpected relay payload: %#v", gotBody)
+	}
+}
+
+func TestSendNotificationEmailRejectsUnsafePayloadAndRedirect(t *testing.T) {
+	client := Client{BaseURL: "https://panel.example.com", Token: "runtime-token"}
+	if err := client.SendNotificationEmail(t.Context(), []string{"ops@example.com\r\nBcc: attacker@example.com"}, "subject", "body"); err == nil {
+		t.Fatal("expected header-injection recipient to be rejected")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://attacker.example.com/collect", http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+	client = Client{BaseURL: server.URL, Token: "runtime-token", HTTP: noRedirectClient(time.Second)}
+	if err := client.SendNotificationEmail(context.Background(), []string{"ops@example.com"}, "subject", "body"); err == nil || err.Error() != "send_failed" {
+		t.Fatalf("expected redirect to be rejected without following it, got %v", err)
+	}
+}
+
+func TestSendNotificationEmailOnlyExposesWhitelistedFailureCode(t *testing.T) {
+	for name, response := range map[string]string{
+		"known":   `{"code":"smtp_not_configured","detail":"smtp.internal.example raw-secret"}`,
+		"unknown": `{"code":"database_failed","detail":"raw-secret"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(response))
+			}))
+			defer server.Close()
+			client := Client{BaseURL: server.URL, Token: "runtime-token", HTTP: noRedirectClient(time.Second)}
+			err := client.SendNotificationEmail(t.Context(), []string{"ops@example.com"}, "subject", "body")
+			want := "send_failed"
+			if name == "known" {
+				want = "smtp_not_configured"
+			}
+			if err == nil || err.Error() != want || strings.Contains(err.Error(), "raw-secret") {
+				t.Fatalf("unexpected safe relay error: %v", err)
+			}
+		})
+	}
+}
+
+func TestSendNotificationEmailExposesRateLimitedCodeFromHTTP429(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"code":"rate_limited","detail":"internal limiter state"}`))
+	}))
+	defer server.Close()
+
+	client := Client{BaseURL: server.URL, Token: "runtime-token", HTTP: noRedirectClient(time.Second)}
+	err := client.SendNotificationEmail(t.Context(), []string{"ops@example.com"}, "subject", "body")
+	if err == nil || err.Error() != "rate_limited" {
+		t.Fatalf("expected safe rate_limited relay error, got %v", err)
+	}
+}
 
 func TestExecuteRemediationDispatchesToControlPanel(t *testing.T) {
 	var gotAuth string

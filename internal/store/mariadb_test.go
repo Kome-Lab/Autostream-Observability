@@ -145,6 +145,44 @@ func TestMariaDBNotificationChannelStoresSMTPPasswordAsCiphertextAndNonce(t *tes
 	}
 }
 
+func TestMariaDBGlobalSMTPChannelDoesNotPersistLegacySMTPFields(t *testing.T) {
+	db, err := sql.Open("autostream_observability_capture_exec", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	store := MariaDBStore{DB: db, SecretKey: "test-secret-key"}
+	created, err := store.CreateNotificationChannel(t.Context(), NotificationChannel{
+		ID:                     "ntc-global-email",
+		Name:                   "global email",
+		Type:                   "email",
+		Enabled:                true,
+		UseGlobalSMTP:          true,
+		UseGlobalSMTPSet:       true,
+		EmailRecipients:        []string{"ops@example.com"},
+		SMTPHost:               "smtp.should-be-cleared.example",
+		SMTPPort:               587,
+		SMTPTLS:                true,
+		SMTPFrom:               "legacy@example.com",
+		SMTPUsername:           "legacy-user",
+		SMTPPassword:           "legacy-password",
+		SMTPPasswordConfigured: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created.UseGlobalSMTP || created.SMTPHost != "" || created.SMTPPasswordConfigured {
+		t.Fatalf("global SMTP create retained legacy settings: %#v", created)
+	}
+	args := capturedExecArgs(t, "notification_channels")
+	for _, index := range []int{8, 11, 12, 13, 14} {
+		if value := namedArgString(t, args, index); value != "" {
+			t.Fatalf("legacy SMTP arg %d was persisted: %q", index, value)
+		}
+	}
+}
+
 func capturedExecArgs(t *testing.T, queryFragment string) []driver.NamedValue {
 	t.Helper()
 	captureExecMu.Lock()

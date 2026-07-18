@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,6 +40,24 @@ type RemediationRequest struct {
 	Action     string `json:"action"`
 	IncidentID string `json:"incident_id"`
 	StreamID   string `json:"stream_id"`
+}
+
+type NotificationEmailRequest struct {
+	Recipients []string `json:"recipients"`
+	Subject    string   `json:"subject"`
+	Text       string   `json:"text"`
+}
+
+type NotificationEmailError struct {
+	Code string
+}
+
+func (e NotificationEmailError) Error() string {
+	return e.Code
+}
+
+func (e NotificationEmailError) SafeDeliveryCode() string {
+	return e.Code
 }
 
 type Registration struct {
@@ -134,6 +153,73 @@ func (c Client) ExecuteRemediation(ctx context.Context, req RemediationRequest) 
 		return fmt.Errorf("control panel dispatch returned HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (c Client) SendNotificationEmail(ctx context.Context, recipients []string, subject, text string) error {
+	if strings.TrimSpace(c.ConfigError) != "" {
+		return errors.New(c.ConfigError)
+	}
+	if !c.Enabled() {
+		return errors.New("control panel email relay is not configured")
+	}
+	cleanRecipients := make([]string, 0, len(recipients))
+	for _, recipient := range recipients {
+		recipient = strings.TrimSpace(recipient)
+		if recipient == "" || strings.ContainsAny(recipient, "\r\n") {
+			return errors.New("notification email recipients are invalid")
+		}
+		cleanRecipients = append(cleanRecipients, recipient)
+	}
+	if len(cleanRecipients) == 0 || strings.TrimSpace(subject) == "" || strings.ContainsAny(subject, "\r\n") || strings.TrimSpace(text) == "" {
+		return errors.New("notification email payload is invalid")
+	}
+	request := NotificationEmailRequest{
+		Recipients: cleanRecipients,
+		Subject:    strings.TrimSpace(subject),
+		Text:       text,
+	}
+	if err := validateHTTPURL(c.BaseURL, "CONTROL_PANEL_URL"); err != nil {
+		return NotificationEmailError{Code: "send_failed"}
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return NotificationEmailError{Code: "send_failed"}
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/services/notifications/email", bytes.NewReader(body))
+	if err != nil {
+		return NotificationEmailError{Code: "send_failed"}
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.Token)
+	httpClient := c.HTTP
+	if httpClient == nil {
+		httpClient = noRedirectClient(5 * time.Second)
+	}
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return NotificationEmailError{Code: "send_failed"}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	var failure struct {
+		Code string `json:"code"`
+	}
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&failure)
+	if !safeNotificationEmailCode(failure.Code) {
+		failure.Code = "send_failed"
+	}
+	return NotificationEmailError{Code: failure.Code}
+}
+
+func safeNotificationEmailCode(code string) bool {
+	switch strings.TrimSpace(code) {
+	case "smtp_not_configured", "smtp_requires_tls", "smtp_dial_failed", "smtp_starttls_failed", "smtp_auth_failed", "smtp_from_rejected", "smtp_recipient_rejected", "smtp_data_failed", "smtp_write_failed", "smtp_close_failed", "rate_limited", "send_failed":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c Client) Register(ctx context.Context) error {

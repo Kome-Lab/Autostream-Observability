@@ -38,11 +38,15 @@ func NotifyIncidentEvent(ctx context.Context, notifier Notifier, eventType strin
 }
 
 type DeliveryResult struct {
-	EventType string
-	Channel   string
-	Target    string
-	Status    string
-	Error     string
+	EventType string `json:"event_type"`
+	Channel   string `json:"channel"`
+	Target    string `json:"target"`
+	Status    string `json:"status"`
+	Error     string `json:"error,omitempty"`
+}
+
+type EmailRelay interface {
+	SendNotificationEmail(ctx context.Context, recipients []string, subject, text string) error
 }
 
 type WebhookNotifier struct {
@@ -58,6 +62,7 @@ type WebhookNotifier struct {
 
 type EmailNotifier struct {
 	Channel        store.NotificationChannel
+	Relay          EmailRelay
 	Timeout        time.Duration
 	RetryMax       int
 	RetryBaseDelay time.Duration
@@ -75,6 +80,7 @@ type ChannelStore interface {
 type ChannelNotifier struct {
 	Store          ChannelStore
 	Fallback       Notifier
+	EmailRelay     EmailRelay
 	Timeout        time.Duration
 	RetryMax       int
 	RetryBaseDelay time.Duration
@@ -110,11 +116,14 @@ func (n WebhookNotifier) NotifyIncidentEvent(ctx context.Context, eventType stri
 		return []DeliveryResult{result}, errors.New(result.Error)
 	}
 	allowPrivate := n.AllowPrivate || allowPrivateWebhooksFromEnv()
-	if err := ValidateWebhookURLForTypeWithPolicy(n.URL, n.Type, allowPrivate); err != nil {
+	normalizedURL, err := NormalizeWebhookURLForTypeWithPolicy(n.URL, n.Type, allowPrivate)
+	if err != nil {
 		result.Status = "failure"
 		result.Error = SanitizeDeliveryError(err)
 		return []DeliveryResult{result}, err
 	}
+	n.URL = normalizedURL
+	result.Target = MaskWebhookURL(n.URL)
 	payload, err := json.Marshal(n.payload(eventType, incident))
 	if err != nil {
 		result.Status = "failure"
@@ -190,10 +199,13 @@ func (n ChannelNotifier) NotifyIncidentEvent(ctx context.Context, eventType stri
 	}
 	results := make([]DeliveryResult, 0, len(channels))
 	for _, channel := range channels {
-		if !channel.Enabled || !matchesFilters(channel, incident, eventType) {
+		if !channel.Enabled {
 			continue
 		}
-		notifier := NotifierForChannel(channel, n.Timeout, n.RetryMax, n.RetryBaseDelay, n.HTTP, n.AllowPrivate)
+		if eventType != "admin.audit" && !matchesFilters(channel, incident, eventType) {
+			continue
+		}
+		notifier := NotifierForChannelWithRelay(channel, n.Timeout, n.RetryMax, n.RetryBaseDelay, n.HTTP, n.AllowPrivate, n.EmailRelay)
 		deliveries, _ := notifier.NotifyIncidentEvent(ctx, eventType, incident)
 		for _, delivery := range deliveries {
 			delivery.Channel = channel.Type
@@ -212,8 +224,12 @@ func (n ChannelNotifier) NotifyIncidentEvent(ctx context.Context, eventType stri
 }
 
 func NotifierForChannel(channel store.NotificationChannel, timeout time.Duration, retryMax int, retryBaseDelay time.Duration, client *http.Client, allowPrivate bool) IncidentEventNotifier {
+	return NotifierForChannelWithRelay(channel, timeout, retryMax, retryBaseDelay, client, allowPrivate, nil)
+}
+
+func NotifierForChannelWithRelay(channel store.NotificationChannel, timeout time.Duration, retryMax int, retryBaseDelay time.Duration, client *http.Client, allowPrivate bool, emailRelay EmailRelay) IncidentEventNotifier {
 	if channel.Type == "email" {
-		return EmailNotifier{Channel: channel, Timeout: timeout, RetryMax: retryMax, RetryBaseDelay: retryBaseDelay}
+		return EmailNotifier{Channel: channel, Relay: emailRelay, Timeout: timeout, RetryMax: retryMax, RetryBaseDelay: retryBaseDelay}
 	}
 	if timeout == 0 {
 		timeout = 5 * time.Second
@@ -236,21 +252,36 @@ func (n EmailNotifier) NotifyIncidentEvent(ctx context.Context, eventType string
 		target = "<EMAIL>"
 	}
 	result := DeliveryResult{EventType: eventType, Channel: "email", Target: target}
-	if len(channel.EmailRecipients) == 0 || strings.TrimSpace(channel.SMTPHost) == "" || strings.TrimSpace(channel.SMTPFrom) == "" {
+	if len(channel.EmailRecipients) == 0 {
 		result.Status = "failure"
 		result.Error = "email notification is not configured"
 		return []DeliveryResult{result}, errors.New(result.Error)
 	}
-	port := channel.SMTPPort
-	if port == 0 {
-		port = 587
+	usesGlobalSMTP := channel.UseGlobalSMTP || !hasDirectSMTPConfiguration(channel)
+	if usesGlobalSMTP && n.Relay == nil {
+		result.Status = "failure"
+		result.Error = "email notification delivery failed"
+		return []DeliveryResult{result}, errors.New(result.Error)
 	}
-	addr := net.JoinHostPort(channel.SMTPHost, strconv.Itoa(port))
+	if !usesGlobalSMTP && (strings.TrimSpace(channel.SMTPHost) == "" || strings.TrimSpace(channel.SMTPFrom) == "") {
+		result.Status = "failure"
+		result.Error = "email notification is not configured"
+		return []DeliveryResult{result}, errors.New(result.Error)
+	}
+	addr := ""
 	var auth smtp.Auth
-	if channel.SMTPUsername != "" && channel.SMTPPassword != "" {
-		auth = smtp.PlainAuth("", channel.SMTPUsername, channel.SMTPPassword, channel.SMTPHost)
+	var msg []byte
+	if !usesGlobalSMTP {
+		port := channel.SMTPPort
+		if port == 0 {
+			port = 587
+		}
+		addr = net.JoinHostPort(channel.SMTPHost, strconv.Itoa(port))
+		if channel.SMTPUsername != "" && channel.SMTPPassword != "" {
+			auth = smtp.PlainAuth("", channel.SMTPUsername, channel.SMTPPassword, channel.SMTPHost)
+		}
+		msg = []byte(formatEmailMessage(eventType, incident, channel.SMTPFrom, channel.EmailRecipients))
 	}
-	msg := []byte(formatEmailMessage(eventType, incident, channel.SMTPFrom, channel.EmailRecipients))
 	if n.Timeout <= 0 {
 		n.Timeout = 5 * time.Second
 	}
@@ -258,9 +289,23 @@ func (n EmailNotifier) NotifyIncidentEvent(ctx context.Context, eventType string
 	if attempts < 1 {
 		attempts = 1
 	}
+	// The Control Panel relay may have delivered to an earlier recipient before
+	// returning a later-recipient failure. Retrying the whole recipient list here
+	// would therefore duplicate messages that were already accepted.
+	if usesGlobalSMTP {
+		attempts = 1
+	}
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		if n.Send == nil {
+		if usesGlobalSMTP {
+			reqCtx, cancel := context.WithTimeout(ctx, n.Timeout)
+			lastErr = n.Relay.SendNotificationEmail(reqCtx, append([]string(nil), channel.EmailRecipients...), formatEmailSubject(incident), formatIncidentText(eventType, incident))
+			cancel()
+			if lastErr == nil {
+				result.Status = "success"
+				return []DeliveryResult{result}, nil
+			}
+		} else if n.Send == nil {
 			reqCtx, cancel := context.WithTimeout(ctx, n.Timeout)
 			lastErr = safeSMTPSendMail(reqCtx, channel, auth, msg, allowPrivateSMTPFromEnv())
 			cancel()
@@ -301,7 +346,27 @@ func (n EmailNotifier) NotifyIncidentEvent(ctx context.Context, eventType string
 	}
 	result.Status = "failure"
 	result.Error = "email notification delivery failed"
+	if usesGlobalSMTP {
+		result.Error = safeEmailRelayError(lastErr)
+	}
 	return []DeliveryResult{result}, lastErr
+}
+
+func safeEmailRelayError(err error) string {
+	type safeDeliveryCoder interface {
+		SafeDeliveryCode() string
+	}
+	var coder safeDeliveryCoder
+	if !errors.As(err, &coder) {
+		return "send_failed"
+	}
+	code := coder.SafeDeliveryCode()
+	switch code {
+	case "smtp_not_configured", "smtp_requires_tls", "smtp_dial_failed", "smtp_starttls_failed", "smtp_auth_failed", "smtp_from_rejected", "smtp_recipient_rejected", "smtp_data_failed", "smtp_write_failed", "smtp_close_failed", "rate_limited", "send_failed":
+		return code
+	default:
+		return "send_failed"
+	}
 }
 
 func safeSMTPSendMail(ctx context.Context, channel store.NotificationChannel, auth smtp.Auth, msg []byte, allowPrivate bool) error {
@@ -380,7 +445,7 @@ func safeSMTPDialContext(ctx context.Context, host string, port int, allowPrivat
 }
 
 func formatEmailMessage(eventType string, incident store.Incident, from string, to []string) string {
-	subject := "[AutoStream] " + strings.ToUpper(incident.Severity) + " " + incident.Rule
+	subject := formatEmailSubject(incident)
 	headers := []string{
 		"From: " + from,
 		"To: " + strings.Join(to, ", "),
@@ -391,13 +456,32 @@ func formatEmailMessage(eventType string, incident store.Incident, from string, 
 	return strings.Join(headers, "\r\n") + "\r\n\r\n" + formatIncidentText(eventType, incident)
 }
 
+func formatEmailSubject(incident store.Incident) string {
+	subject := "[AutoStream] " + strings.ToUpper(incident.Severity) + " " + incident.Rule
+	return strings.Join(strings.Fields(strings.ReplaceAll(strings.ReplaceAll(subject, "\r", " "), "\n", " ")), " ")
+}
+
+func hasDirectSMTPConfiguration(channel store.NotificationChannel) bool {
+	return strings.TrimSpace(channel.SMTPHost) != "" ||
+		channel.SMTPPort != 0 ||
+		strings.TrimSpace(channel.SMTPFrom) != "" ||
+		strings.TrimSpace(channel.SMTPUsername) != "" ||
+		strings.TrimSpace(channel.SMTPPassword) != "" ||
+		channel.SMTPPasswordConfigured
+}
+
 func (n WebhookNotifier) payload(eventType string, incident store.Incident) map[string]any {
 	text := formatIncidentText(eventType, incident)
 	switch normalizedType(n.Type) {
 	case "discord":
-		return map[string]any{"content": text}
+		return map[string]any{
+			"content": text,
+			"allowed_mentions": map[string]any{
+				"parse": []string{},
+			},
+		}
 	case "slack":
-		return map[string]any{"text": text}
+		return map[string]any{"text": escapeSlackText(text)}
 	default:
 		return map[string]any{
 			"event_type":  eventType,
@@ -410,6 +494,14 @@ func (n WebhookNotifier) payload(eventType string, incident store.Incident) map[
 			"summary":     incident.SummaryJA,
 		}
 	}
+}
+
+func escapeSlackText(value string) string {
+	return strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+	).Replace(value)
 }
 
 func formatIncidentText(eventType string, incident store.Incident) string {
@@ -531,11 +623,21 @@ func ValidateWebhookURLForType(raw, channelType string) error {
 	return ValidateWebhookURLForTypeWithPolicy(raw, channelType, allowPrivateWebhooksFromEnv())
 }
 
+func NormalizeWebhookURLForType(raw, channelType string) (string, error) {
+	return NormalizeWebhookURLForTypeWithPolicy(raw, channelType, allowPrivateWebhooksFromEnv())
+}
+
 func ValidateSMTPChannel(channel store.NotificationChannel) error {
 	return ValidateSMTPChannelWithPolicy(channel, allowPrivateSMTPFromEnv())
 }
 
 func ValidateSMTPChannelWithPolicy(channel store.NotificationChannel, allowPrivate bool) error {
+	if channel.UseGlobalSMTP || !hasDirectSMTPConfiguration(channel) {
+		if len(channel.EmailRecipients) == 0 {
+			return errors.New("notification email recipient is required")
+		}
+		return nil
+	}
 	host := strings.TrimSpace(channel.SMTPHost)
 	if host == "" {
 		return errors.New("notification SMTP host is required")
@@ -548,6 +650,11 @@ func ValidateSMTPChannelWithPolicy(channel store.NotificationChannel, allowPriva
 	}
 	if channel.SMTPPort < 0 || channel.SMTPPort > 65535 {
 		return errors.New("notification SMTP port is invalid")
+	}
+	usernameConfigured := strings.TrimSpace(channel.SMTPUsername) != ""
+	passwordConfigured := strings.TrimSpace(channel.SMTPPassword) != "" || channel.SMTPPasswordConfigured
+	if usernameConfigured != passwordConfigured {
+		return errors.New("notification SMTP credentials are incomplete")
 	}
 	if !allowPrivate && !channel.SMTPTLS {
 		return errors.New("notification SMTP requires TLS for remote targets")
@@ -563,38 +670,89 @@ func ValidateWebhookURLWithPolicy(raw string, allowPrivate bool) error {
 }
 
 func ValidateWebhookURLForTypeWithPolicy(raw, channelType string, allowPrivate bool) error {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
+	_, err := NormalizeWebhookURLForTypeWithPolicy(raw, channelType, allowPrivate)
+	return err
+}
+
+func NormalizeWebhookURLForTypeWithPolicy(raw, channelType string, allowPrivate bool) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	parsed, err := url.Parse(trimmed)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return errors.New("notification webhook URL must be an absolute URL")
+		return "", errors.New("notification webhook URL must be an absolute URL")
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return errors.New("notification webhook URL must use http or https")
+		return "", errors.New("notification webhook URL must use http or https")
 	}
 	if parsed.Scheme == "http" && !allowPrivate {
-		return errors.New("notification webhook URL must use https for remote targets")
+		return "", errors.New("notification webhook URL must use https for remote targets")
 	}
 	if parsed.User != nil {
-		return errors.New("notification webhook URL must not include userinfo")
+		return "", errors.New("notification webhook URL must not include userinfo")
 	}
 	if !allowPrivate && unsafeWebhookHost(parsed.Hostname()) {
-		return errors.New("notification webhook URL must not target a private network")
+		return "", errors.New("notification webhook URL must not target a private network")
 	}
 	if !allowPrivate && !webhookHostAllowedForType(parsed.Hostname(), channelType) {
-		return errors.New("notification webhook URL host does not match channel type")
+		return "", errors.New("notification webhook URL host does not match channel type")
 	}
-	return nil
+	if normalizedType(channelType) == "discord" && isDiscordWebhookHost(parsed.Hostname()) {
+		if parsed.Scheme != "https" {
+			return "", errors.New("notification Discord webhook URL must use https")
+		}
+		if port := parsed.Port(); port != "" && port != "443" {
+			return "", errors.New("notification Discord webhook URL must use the default HTTPS port")
+		}
+		if parsed.Fragment != "" {
+			return "", errors.New("notification Discord webhook URL must not include a fragment")
+		}
+		if !validDiscordWebhookPath(parsed.EscapedPath()) {
+			return "", errors.New("notification Discord webhook URL path is invalid")
+		}
+		parsed.Scheme = "https"
+		parsed.Host = "discord.com"
+		return parsed.String(), nil
+	}
+	return trimmed, nil
 }
 
 func webhookHostAllowedForType(host, channelType string) bool {
 	normalizedHost := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 	switch normalizedType(channelType) {
 	case "discord":
-		return normalizedHost == "discord.com" || normalizedHost == "www.discord.com"
+		return isDiscordWebhookHost(normalizedHost)
 	case "slack":
 		return normalizedHost == "hooks.slack.com"
 	default:
 		return true
 	}
+}
+
+func isDiscordWebhookHost(host string) bool {
+	switch strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), ".")) {
+	case "discord.com", "www.discord.com", "ptb.discord.com", "canary.discord.com",
+		"discordapp.com", "www.discordapp.com", "ptb.discordapp.com", "canary.discordapp.com":
+		return true
+	default:
+		return false
+	}
+}
+
+func validDiscordWebhookPath(path string) bool {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 4 {
+		return parts[0] == "api" && parts[1] == "webhooks" && parts[2] != "" && parts[3] != ""
+	}
+	if len(parts) == 5 {
+		version := strings.TrimPrefix(parts[1], "v")
+		if version == parts[1] || version == "" {
+			return false
+		}
+		if _, err := strconv.Atoi(version); err != nil {
+			return false
+		}
+		return parts[0] == "api" && parts[2] == "webhooks" && parts[3] != "" && parts[4] != ""
+	}
+	return false
 }
 
 func webhookHTTPClient(timeout time.Duration, allowPrivate bool, channelType string) *http.Client {
@@ -609,7 +767,16 @@ func webhookHTTPClient(timeout time.Duration, allowPrivate bool, channelType str
 		Timeout:   timeout,
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
-			return ValidateWebhookURLForTypeWithPolicy(req.URL.String(), channelType, allowPrivate)
+			normalizedURL, err := NormalizeWebhookURLForTypeWithPolicy(req.URL.String(), channelType, allowPrivate)
+			if err != nil {
+				return err
+			}
+			normalized, err := url.Parse(normalizedURL)
+			if err != nil {
+				return errors.New("notification webhook redirect URL is invalid")
+			}
+			req.URL = normalized
+			return nil
 		},
 	}
 }

@@ -26,7 +26,7 @@ func TestDiscordWebhookPayload(t *testing.T) {
 	defer server.Close()
 
 	notifier := WebhookNotifier{Type: "discord", URL: server.URL + "/api/webhooks/id/token", Timeout: time.Second, AllowPrivate: true}
-	results, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-1", Rule: "encoder_process_exited", Severity: "critical", Status: "open", SummaryJA: "Encoder process stopped.", ServiceID: "enc-01", StreamID: "stream-01"})
+	results, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-1", Rule: "encoder_process_exited", Severity: "critical", Status: "open", SummaryJA: "Encoder process stopped. @everyone <@123>", ServiceID: "enc-01", StreamID: "stream-01"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,6 +37,38 @@ func TestDiscordWebhookPayload(t *testing.T) {
 	content, ok := got["content"].(string)
 	if !ok || !strings.Contains(content, "CRITICAL") || !strings.Contains(content, "enc-01") {
 		t.Fatalf("unexpected payload: %#v", got)
+	}
+	allowedMentions, ok := got["allowed_mentions"].(map[string]any)
+	if !ok {
+		t.Fatalf("Discord payload is missing allowed_mentions: %#v", got)
+	}
+	parse, ok := allowedMentions["parse"].([]any)
+	if !ok || len(parse) != 0 {
+		t.Fatalf("Discord payload must disable all automatic mentions: %#v", got)
+	}
+}
+
+func TestSlackWebhookPayloadEscapesMentionsAndMarkup(t *testing.T) {
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	notifier := WebhookNotifier{Type: "slack", URL: server.URL + "/services/id/token", Timeout: time.Second, AllowPrivate: true}
+	_, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-1", Rule: "auth.login", Severity: "warning", Status: "failure", SummaryJA: "A&B <!channel> <@U123>", ServiceID: "control-panel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, ok := got["text"].(string)
+	if !ok || !strings.Contains(text, "A&amp;B &lt;!channel&gt; &lt;@U123&gt;") {
+		t.Fatalf("Slack payload did not escape mentions and markup: %#v", got)
+	}
+	if strings.Contains(text, "<!channel>") || strings.Contains(text, "<@U123>") {
+		t.Fatalf("Slack payload retained active mention syntax: %#v", got)
 	}
 }
 
@@ -51,10 +83,10 @@ func TestGenericWebhookPayload(t *testing.T) {
 	defer server.Close()
 
 	notifier := WebhookNotifier{Type: "generic", URL: server.URL + "/hook/secret", Timeout: time.Second, AllowPrivate: true}
-	if _, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-1", Rule: "gdrive_upload_failed", Severity: "error", Status: "open", SummaryJA: "Google Drive upload failed.", ServiceID: "enc-01"}); err != nil {
+	if _, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-1", Rule: "gdrive_upload_failed", Severity: "error", Status: "open", SummaryJA: "Google Drive upload failed. A&B <raw>", ServiceID: "enc-01"}); err != nil {
 		t.Fatal(err)
 	}
-	if got["event_type"] != "incident.opened" || got["rule"] != "gdrive_upload_failed" {
+	if got["event_type"] != "incident.opened" || got["rule"] != "gdrive_upload_failed" || got["summary"] != "Google Drive upload failed. A&B <raw>" {
 		t.Fatalf("unexpected payload: %#v", got)
 	}
 }
@@ -235,7 +267,7 @@ func TestChannelNotifierAppliesLifecycleEventFilter(t *testing.T) {
 	}
 }
 
-func TestChannelNotifierAppliesAdminAuditEventFilter(t *testing.T) {
+func TestChannelNotifierAdminAuditBypassesIncidentFilters(t *testing.T) {
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -244,11 +276,12 @@ func TestChannelNotifierAppliesAdminAuditEventFilter(t *testing.T) {
 	defer server.Close()
 	st := store.NewMemoryStore()
 	if _, err := st.CreateNotificationChannel(t.Context(), store.NotificationChannel{
-		Name:            "admin audit only",
+		Name:            "critical incidents only",
 		Type:            "generic",
 		Enabled:         true,
 		WebhookURL:      server.URL + "/hook/secret",
-		EventTypeFilter: []string{"admin.audit"},
+		SeverityFilter:  []string{"critical"},
+		EventTypeFilter: []string{"incident.opened"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -387,6 +420,91 @@ func TestValidateWebhookURLRestrictsDiscordAndSlackHosts(t *testing.T) {
 	}
 }
 
+func TestNormalizeDiscordWebhookURLAliases(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "canonical", raw: "https://discord.com/api/webhooks/id/token", want: "https://discord.com/api/webhooks/id/token"},
+		{name: "www", raw: "https://www.discord.com/api/webhooks/id/token", want: "https://discord.com/api/webhooks/id/token"},
+		{name: "ptb", raw: "https://ptb.discord.com/api/webhooks/id/token?wait=true", want: "https://discord.com/api/webhooks/id/token?wait=true"},
+		{name: "canary", raw: "https://canary.discord.com/api/webhooks/id/token", want: "https://discord.com/api/webhooks/id/token"},
+		{name: "legacy", raw: "https://discordapp.com/api/webhooks/id/token", want: "https://discord.com/api/webhooks/id/token"},
+		{name: "legacy www", raw: "https://www.discordapp.com/api/webhooks/id/token", want: "https://discord.com/api/webhooks/id/token"},
+		{name: "legacy ptb", raw: "https://ptb.discordapp.com/api/webhooks/id/token", want: "https://discord.com/api/webhooks/id/token"},
+		{name: "legacy canary", raw: "https://canary.discordapp.com/api/webhooks/id/token", want: "https://discord.com/api/webhooks/id/token"},
+		{name: "explicit default port", raw: "https://ptb.discord.com:443/api/webhooks/id/token", want: "https://discord.com/api/webhooks/id/token"},
+		{name: "versioned API path", raw: "https://canary.discord.com/api/v10/webhooks/id/token?thread_id=123", want: "https://discord.com/api/v10/webhooks/id/token?thread_id=123"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NormalizeWebhookURLForTypeWithPolicy(tt.raw, "discord", false)
+			if err != nil {
+				t.Fatalf("normalize Discord webhook URL: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("normalized URL = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeDiscordWebhookURLRejectsDeceptiveOrInvalidTargets(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "deceptive suffix", raw: "https://discord.com.evil.example/api/webhooks/id/token"},
+		{name: "unapproved subdomain", raw: "https://evil.discord.com/api/webhooks/id/token"},
+		{name: "legacy deceptive suffix", raw: "https://discordapp.com.evil.example/api/webhooks/id/token"},
+		{name: "non default port", raw: "https://discord.com:444/api/webhooks/id/token"},
+		{name: "wrong path", raw: "https://discord.com/channels/id/token"},
+		{name: "missing token", raw: "https://discord.com/api/webhooks/id"},
+		{name: "extra path segment", raw: "https://discord.com/api/webhooks/id/token/extra"},
+		{name: "invalid API version", raw: "https://discord.com/api/latest/webhooks/id/token"},
+		{name: "fragment", raw: "https://discord.com/api/webhooks/id/token#secret"},
+		{name: "HTTP", raw: "http://discord.com/api/webhooks/id/token"},
+		{name: "userinfo", raw: "https://user@discord.com/api/webhooks/id/token"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := NormalizeWebhookURLForTypeWithPolicy(tt.raw, "discord", false); err == nil {
+				t.Fatalf("expected Discord webhook URL to be rejected: %s", tt.raw)
+			}
+		})
+	}
+}
+
+func TestDiscordWebhookNotifierCanonicalizesAliasBeforeSend(t *testing.T) {
+	var gotURL string
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotURL = req.URL.String()
+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header)}, nil
+	})}
+	notifier := WebhookNotifier{
+		Type: "discord",
+		URL:  "https://ptb.discord.com/api/webhooks/id/token?wait=true",
+		HTTP: client,
+	}
+	results, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-01", Severity: "info"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotURL != "https://discord.com/api/webhooks/id/token?wait=true" {
+		t.Fatalf("request URL = %q", gotURL)
+	}
+	if len(results) != 1 || results[0].Target != "https://discord.com/<WEBHOOK_PATH>" {
+		t.Fatalf("unexpected delivery result: %#v", results)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func TestValidateSMTPChannelRequiresTLSForRemoteTargets(t *testing.T) {
 	channel := store.NotificationChannel{
 		Type:            "email",
@@ -404,6 +522,27 @@ func TestValidateSMTPChannelRequiresTLSForRemoteTargets(t *testing.T) {
 	channel.SMTPTLS = true
 	if err := ValidateSMTPChannelWithPolicy(channel, false); err != nil {
 		t.Fatalf("remote SMTP channel with TLS rejected: %v", err)
+	}
+}
+
+func TestValidateSMTPChannelRejectsPartialLegacyCredentials(t *testing.T) {
+	base := store.NotificationChannel{
+		Type:            "email",
+		EmailRecipients: []string{"ops@example.com"},
+		SMTPHost:        "smtp.example.com",
+		SMTPPort:        587,
+		SMTPTLS:         true,
+		SMTPFrom:        "autostream@example.com",
+	}
+	withUsernameOnly := base
+	withUsernameOnly.SMTPUsername = "autostream"
+	if err := ValidateSMTPChannelWithPolicy(withUsernameOnly, false); err == nil {
+		t.Fatal("legacy SMTP username without password must be rejected")
+	}
+	withPasswordOnly := base
+	withPasswordOnly.SMTPPassword = "raw-smtp-password"
+	if err := ValidateSMTPChannelWithPolicy(withPasswordOnly, false); err == nil {
+		t.Fatal("legacy SMTP password without username must be rejected")
 	}
 }
 
@@ -466,6 +605,102 @@ func TestEmailNotifierSendsMaskedDelivery(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].Status != "success" || results[0].Target != "o***s@<EMAIL_DOMAIN>" {
 		t.Fatalf("unexpected result: %#v", results)
+	}
+}
+
+type recordingEmailRelay struct {
+	recipients []string
+	subject    string
+	text       string
+	attempts   int
+	err        error
+}
+
+func (r *recordingEmailRelay) SendNotificationEmail(_ context.Context, recipients []string, subject, text string) error {
+	r.attempts++
+	r.recipients = append([]string(nil), recipients...)
+	r.subject = subject
+	r.text = text
+	return r.err
+}
+
+type codedEmailRelayError string
+
+func (e codedEmailRelayError) Error() string            { return string(e) }
+func (e codedEmailRelayError) SafeDeliveryCode() string { return string(e) }
+
+func TestEmailNotifierUsesGlobalSMTPRelay(t *testing.T) {
+	relay := &recordingEmailRelay{}
+	notifier := EmailNotifier{
+		Channel: store.NotificationChannel{
+			Type:              "email",
+			UseGlobalSMTP:     true,
+			EmailRecipients:   []string{"ops@example.com"},
+			MaskedEmailTarget: "o***s@<EMAIL_DOMAIN>",
+		},
+		Relay: relay,
+	}
+	results, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-global", Rule: "encoder_down", Severity: "critical", Status: "open", SummaryJA: "Encoder process stopped.", ServiceID: "enc-01"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if relay.attempts != 1 || len(relay.recipients) != 1 || relay.recipients[0] != "ops@example.com" || relay.subject != "[AutoStream] CRITICAL encoder_down" || !strings.Contains(relay.text, "Encoder process stopped.") {
+		t.Fatalf("unexpected global email relay call: %#v", relay)
+	}
+	if len(results) != 1 || results[0].Status != "success" || results[0].Target != "o***s@<EMAIL_DOMAIN>" {
+		t.Fatalf("unexpected result: %#v", results)
+	}
+}
+
+func TestEmailNotifierReturnsOnlySafeGlobalSMTPFailureCodeWithoutRetry(t *testing.T) {
+	for _, code := range []string{"smtp_auth_failed", "rate_limited"} {
+		t.Run(code, func(t *testing.T) {
+			relay := &recordingEmailRelay{err: codedEmailRelayError(code)}
+			notifier := EmailNotifier{
+				Channel: store.NotificationChannel{
+					Type:              "email",
+					UseGlobalSMTP:     true,
+					EmailRecipients:   []string{"ops@example.com"},
+					MaskedEmailTarget: "o***s@<EMAIL_DOMAIN>",
+				},
+				Relay:          relay,
+				RetryMax:       3,
+				RetryBaseDelay: time.Millisecond,
+				Sleep: func(context.Context, time.Duration) error {
+					return nil
+				},
+			}
+			results, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-global-failure", Rule: "encoder_down", Severity: "critical", Status: "open", SummaryJA: "Encoder process stopped.", ServiceID: "enc-01"})
+			if err == nil || relay.attempts != 1 {
+				t.Fatalf("expected a single relay attempt, attempts=%d err=%v", relay.attempts, err)
+			}
+			if len(results) != 1 || results[0].Status != "failure" || results[0].Error != code || strings.Contains(results[0].Error, "example.com") {
+				t.Fatalf("unexpected safe failure result: %#v", results)
+			}
+		})
+	}
+}
+
+func TestChannelNotifierUsesGlobalSMTPRelayForIncident(t *testing.T) {
+	st := store.NewMemoryStore()
+	_, err := st.CreateNotificationChannel(t.Context(), store.NotificationChannel{
+		Name:            "global email",
+		Type:            "email",
+		Enabled:         true,
+		UseGlobalSMTP:   true,
+		EmailRecipients: []string{"ops@example.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := &recordingEmailRelay{}
+	notifier := ChannelNotifier{Store: st, EmailRelay: relay, Timeout: time.Second}
+	results, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-channel", Rule: "encoder_down", Severity: "critical", Status: "open", SummaryJA: "Encoder stopped.", ServiceID: "enc-01"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if relay.attempts != 1 || len(results) != 1 || results[0].Status != "success" {
+		t.Fatalf("global relay was not used: attempts=%d results=%#v", relay.attempts, results)
 	}
 }
 

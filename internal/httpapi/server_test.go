@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -792,11 +793,11 @@ func TestListNotificationDeliveriesRequiresAuthorization(t *testing.T) {
 	}
 }
 
-func TestCreateNotificationEventDeliversAdminAudit(t *testing.T) {
+func TestCreateNotificationEventAcceptsExactControlPanelPayload(t *testing.T) {
 	st := store.NewMemoryStore()
 	notifier := &eventRecordingNotifier{}
 	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), notifier, nil)
-	req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(`{"event_type":"admin.audit","severity":"info","status":"success","action":"oauth_accounts.update","resource_type":"oauth_account","resource_id":"acct-01","actor_username":"ops","summary":"OAuth connected account updated"}`))
+	req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(`{"event_type":"admin.audit","severity":"info","status":"success","action":"oauth_accounts.update","resource_type":"oauth_account","resource_id":"acct-01","actor_username":"ops","summary":"OAuth connected account updated","timestamp":"2026-07-18T01:32:00Z"}`))
 	req.Header.Set("Authorization", "Bearer admin-token")
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
@@ -825,29 +826,148 @@ func TestCreateNotificationEventDeliversAdminAudit(t *testing.T) {
 	}
 }
 
-func TestCreateNotificationEventRejectsUnsafeAdminAuditFields(t *testing.T) {
+func TestCreateNotificationEventValidatesKnownEventType(t *testing.T) {
+	for _, eventType := range []string{
+		"incident.opened",
+		"incident.updated",
+		"incident.resolved",
+		"diagnostic.created",
+		"remediation.pending_approval",
+		"remediation.executed",
+		"admin.audit",
+	} {
+		if !validNotificationEventType(eventType) {
+			t.Fatalf("known event type rejected: %q", eventType)
+		}
+	}
+
 	st := store.NewMemoryStore()
 	notifier := &eventRecordingNotifier{}
 	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), notifier, nil)
-	req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(`{"event_type":"admin.audit","severity":"info","status":"success","action":"raw-secret-token","resource_type":"oauth_account","resource_id":"acct-01"}`))
+	req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(`{"event_type":"admin.audit.typo","severity":"info","status":"success","action":"oauth_accounts.update"}`))
 	req.Header.Set("Authorization", "Bearer admin-token")
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
-	if res.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "invalid_notification_event") {
+		t.Fatalf("unknown event type status = %d body = %s", res.Code, res.Body.String())
 	}
 	if len(notifier.events) != 0 {
-		t.Fatalf("unsafe event should not notify: %#v", notifier.events)
+		t.Fatalf("unknown event type should not notify: %#v", notifier.events)
+	}
+}
+
+func TestCreateNotificationEventUsesStrictAuditActionIdentifier(t *testing.T) {
+	valid := []string{
+		"secrets.update",
+		"users.reset_password",
+		"nodes.configure_token.rotate",
+		"nodes.registration_token.create",
+		"nodes.runtime_token.rotate",
+	}
+	for _, action := range valid {
+		t.Run("valid_"+strings.ReplaceAll(action, ".", "_"), func(t *testing.T) {
+			st := store.NewMemoryStore()
+			notifier := &eventRecordingNotifier{}
+			handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), notifier, nil)
+			body, err := json.Marshal(notificationEventRequest{EventType: "admin.audit", Severity: "info", Status: "success", Action: action})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer admin-token")
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
+			if res.Code != http.StatusAccepted || len(notifier.events) != 1 {
+				t.Fatalf("valid action %q status = %d body = %s events=%#v", action, res.Code, res.Body.String(), notifier.events)
+			}
+		})
+	}
+
+	invalid := []string{
+		"raw-secret-token",
+		"secrets..update",
+		".secrets.update",
+		"secrets.update.",
+		strings.Repeat("a", 129),
+	}
+	for index, action := range invalid {
+		t.Run("invalid_"+strconv.Itoa(index), func(t *testing.T) {
+			st := store.NewMemoryStore()
+			notifier := &eventRecordingNotifier{}
+			handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), notifier, nil)
+			body, err := json.Marshal(notificationEventRequest{EventType: "admin.audit", Severity: "info", Status: "success", Action: action})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer admin-token")
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
+			if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "invalid_notification_event") {
+				t.Fatalf("invalid action status = %d body = %s", res.Code, res.Body.String())
+			}
+			if len(notifier.events) != 0 {
+				t.Fatalf("invalid action should not notify: %#v", notifier.events)
+			}
+			if strings.Contains(res.Body.String(), action) {
+				t.Fatalf("invalid action leaked in response: %s", res.Body.String())
+			}
+		})
+	}
+}
+
+func TestCreateNotificationEventAdminAuditFansOutToAllEnabledChannelsAndSavesDeliveries(t *testing.T) {
+	var callsMu sync.Mutex
+	calls := map[string]int{}
+	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callsMu.Lock()
+		calls[r.URL.Path]++
+		callsMu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer webhookServer.Close()
+
+	st := store.NewMemoryStore()
+	channels := []store.NotificationChannel{
+		{Name: "critical opened", Type: "generic", Enabled: true, WebhookURL: webhookServer.URL + "/critical-opened", SeverityFilter: []string{"critical"}, EventTypeFilter: []string{"incident.opened"}},
+		{Name: "warning resolved", Type: "generic", Enabled: true, WebhookURL: webhookServer.URL + "/warning-resolved", SeverityFilter: []string{"warning"}, EventTypeFilter: []string{"incident.resolved"}},
+		{Name: "disabled audit", Type: "generic", Enabled: false, WebhookURL: webhookServer.URL + "/disabled", SeverityFilter: []string{"info"}, EventTypeFilter: []string{"admin.audit"}},
+	}
+	for _, channel := range channels {
+		if _, err := st.CreateNotificationChannel(t.Context(), channel); err != nil {
+			t.Fatal(err)
+		}
+	}
+	notifier := notifications.ChannelNotifier{Store: st, Timeout: time.Second, AllowPrivate: true}
+	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), notifier, nil)
+	req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(`{"event_type":"admin.audit","severity":"info","status":"success","action":"nodes.runtime_token.rotate","resource_type":"node","resource_id":"node-01","actor_username":"ops","summary":"Node runtime token rotated","timestamp":"2026-07-18T01:32:00Z"}`))
+	req.Header.Set("Authorization", "Bearer admin-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+
+	callsMu.Lock()
+	gotCalls := map[string]int{}
+	for path, count := range calls {
+		gotCalls[path] = count
+	}
+	callsMu.Unlock()
+	if gotCalls["/critical-opened"] != 1 || gotCalls["/warning-resolved"] != 1 || gotCalls["/disabled"] != 0 {
+		t.Fatalf("unexpected admin audit fanout: %#v", gotCalls)
 	}
 	deliveries, err := st.ListNotificationDeliveries(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(deliveries) != 0 {
-		t.Fatalf("unsafe event should not save deliveries: %#v", deliveries)
+	if len(deliveries) != 2 {
+		t.Fatalf("expected two saved deliveries, got %#v", deliveries)
 	}
-	if strings.Contains(res.Body.String(), "raw-secret-token") {
-		t.Fatalf("unsafe notification event response leaked raw secret: %s", res.Body.String())
+	for _, delivery := range deliveries {
+		if delivery.EventType != "admin.audit" || delivery.IncidentID != "" || delivery.Status != "success" || delivery.Metadata["rule"] != "nodes.runtime_token.rotate" {
+			t.Fatalf("unexpected saved admin audit delivery: %#v", delivery)
+		}
 	}
 }
 
@@ -903,6 +1023,44 @@ func TestNotificationChannelCRUDDoesNotExposeWebhookURL(t *testing.T) {
 	handler.ServeHTTP(deleteRes, deleteReq)
 	if deleteRes.Code != http.StatusOK {
 		t.Fatalf("delete status = %d body = %s", deleteRes.Code, deleteRes.Body.String())
+	}
+}
+
+func TestNotificationChannelCanonicalizesDiscordAliasesBeforePersistence(t *testing.T) {
+	st := store.NewMemoryStore()
+	handler := newTestServer(st)
+	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"discord ptb","type":"discord","enabled":true,"webhook_url":"https://ptb.discord.com/api/webhooks/id/secret-token?wait=true"}`))
+	createReq.Header.Set("Authorization", "Bearer service-token")
+	createRes := httptest.NewRecorder()
+	handler.ServeHTTP(createRes, createReq)
+	if createRes.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body = %s", createRes.Code, createRes.Body.String())
+	}
+	var created store.NotificationChannel
+	if err := json.NewDecoder(createRes.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetNotificationChannel(t.Context(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WebhookURL != "https://discord.com/api/webhooks/id/secret-token?wait=true" {
+		t.Fatalf("stored create URL = %q", stored.WebhookURL)
+	}
+
+	updateReq := httptest.NewRequest(http.MethodPut, "/notification-channels/"+created.ID, bytes.NewBufferString(`{"name":"discord legacy canary","type":"discord","enabled":true,"webhook_url":"https://canary.discordapp.com/api/webhooks/id/new-secret-token"}`))
+	updateReq.Header.Set("Authorization", "Bearer service-token")
+	updateRes := httptest.NewRecorder()
+	handler.ServeHTTP(updateRes, updateReq)
+	if updateRes.Code != http.StatusOK {
+		t.Fatalf("update status = %d body = %s", updateRes.Code, updateRes.Body.String())
+	}
+	stored, err = st.GetNotificationChannel(t.Context(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WebhookURL != "https://discord.com/api/webhooks/id/new-secret-token" {
+		t.Fatalf("stored update URL = %q", stored.WebhookURL)
 	}
 }
 
@@ -1016,6 +1174,148 @@ func TestEmailNotificationChannelCRUDDoesNotExposeSMTPPassword(t *testing.T) {
 		if strings.Contains(getRes.Body.String(), raw) {
 			t.Fatalf("email channel raw detail leaked in get response: %s", getRes.Body.String())
 		}
+	}
+}
+
+func TestGlobalSMTPEmailChannelCreateUpdateAndLegacyClear(t *testing.T) {
+	mem := store.NewMemoryStore()
+	handler := NewServerWithStoreAuthzNotifierExecutorAndEmailRelay("observability", mem, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), &fakeNotifier{}, nil, &fakeEmailRelay{})
+	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"global email","type":"email","enabled":true,"uses_global_smtp":true,"email_recipients":["ops@example.com"],"severity_filter":["critical"]}`))
+	createReq.Header.Set("Authorization", "Bearer admin-token")
+	createRes := httptest.NewRecorder()
+	handler.ServeHTTP(createRes, createReq)
+	if createRes.Code != http.StatusCreated {
+		t.Fatalf("global email create status=%d body=%s", createRes.Code, createRes.Body.String())
+	}
+	var created store.NotificationChannel
+	if err := json.NewDecoder(createRes.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	if !created.UseGlobalSMTP || created.ID == "" {
+		t.Fatalf("global SMTP marker missing from create response: %#v", created)
+	}
+
+	updateReq := httptest.NewRequest(http.MethodPut, "/notification-channels/"+created.ID, bytes.NewBufferString(`{"name":"global email renamed","type":"email","enabled":true,"uses_global_smtp":true}`))
+	updateReq.Header.Set("Authorization", "Bearer admin-token")
+	updateRes := httptest.NewRecorder()
+	handler.ServeHTTP(updateRes, updateReq)
+	if updateRes.Code != http.StatusOK {
+		t.Fatalf("global email update status=%d body=%s", updateRes.Code, updateRes.Body.String())
+	}
+	stored, err := mem.GetNotificationChannel(t.Context(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.UseGlobalSMTP || len(stored.EmailRecipients) != 1 || stored.EmailRecipients[0] != "ops@example.com" {
+		t.Fatalf("update did not preserve omitted recipients: %#v", stored)
+	}
+
+	legacy, err := mem.CreateNotificationChannel(t.Context(), store.NotificationChannel{
+		Name: "legacy", Type: "email", Enabled: true, EmailRecipients: []string{"legacy@example.com"},
+		SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPTLS: true, SMTPFrom: "autostream@example.com", SMTPUsername: "autostream", SMTPPassword: "raw-smtp-password",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearReq := httptest.NewRequest(http.MethodPut, "/notification-channels/"+legacy.ID, bytes.NewBufferString(`{"name":"legacy","type":"email","enabled":true,"uses_global_smtp":true}`))
+	clearReq.Header.Set("Authorization", "Bearer admin-token")
+	clearRes := httptest.NewRecorder()
+	handler.ServeHTTP(clearRes, clearReq)
+	if clearRes.Code != http.StatusOK {
+		t.Fatalf("legacy clear update status=%d body=%s", clearRes.Code, clearRes.Body.String())
+	}
+	cleared, err := mem.GetNotificationChannel(t.Context(), legacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cleared.UseGlobalSMTP || cleared.SMTPHost != "" || cleared.SMTPFrom != "" || cleared.SMTPPassword != "" || cleared.SMTPPasswordConfigured {
+		t.Fatalf("legacy SMTP fields were not cleared: %#v", cleared)
+	}
+}
+
+func TestGlobalSMTPEmailChannelRejectsEmptyRecipients(t *testing.T) {
+	mem := store.NewMemoryStore()
+	handler := NewServerWithStoreAuthzNotifierExecutorAndEmailRelay("observability", mem, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), &fakeNotifier{}, nil, &fakeEmailRelay{})
+	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"global email","type":"email","enabled":true,"uses_global_smtp":true,"email_recipients":[]}`))
+	createReq.Header.Set("Authorization", "Bearer admin-token")
+	createRes := httptest.NewRecorder()
+	handler.ServeHTTP(createRes, createReq)
+	if createRes.Code != http.StatusBadRequest || !strings.Contains(createRes.Body.String(), "invalid_notification_channel") {
+		t.Fatalf("empty recipients must be rejected, status=%d body=%s", createRes.Code, createRes.Body.String())
+	}
+}
+
+func TestGlobalSMTPEmailChannelRejectsMixedLegacySMTPFields(t *testing.T) {
+	mem := store.NewMemoryStore()
+	handler := NewServerWithStoreAuthzNotifierExecutorAndEmailRelay("observability", mem, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), &fakeNotifier{}, nil, &fakeEmailRelay{})
+	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"mixed email","type":"email","enabled":true,"uses_global_smtp":true,"email_recipients":["ops@example.com"],"smtp_host":"smtp.example.com"}`))
+	createReq.Header.Set("Authorization", "Bearer admin-token")
+	createRes := httptest.NewRecorder()
+	handler.ServeHTTP(createRes, createReq)
+	if createRes.Code != http.StatusBadRequest || !strings.Contains(createRes.Body.String(), "invalid_notification_channel") {
+		t.Fatalf("global and legacy SMTP fields must not be mixed, status=%d body=%s", createRes.Code, createRes.Body.String())
+	}
+}
+
+func TestNotificationChannelRejectsGlobalSMTPForNonEmailTypes(t *testing.T) {
+	mem := store.NewMemoryStore()
+	handler := NewServerWithStoreAuthzNotifierExecutorAndEmailRelay("observability", mem, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), &fakeNotifier{}, nil, &fakeEmailRelay{})
+
+	for _, tt := range []struct {
+		channelType string
+		webhookURL  string
+	}{
+		{channelType: "generic", webhookURL: "https://example.com/hook/token"},
+		{channelType: "discord", webhookURL: "https://discord.com/api/webhooks/id/token"},
+		{channelType: "slack", webhookURL: "https://hooks.slack.com/services/id/token"},
+	} {
+		t.Run("create_"+tt.channelType, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{
+				"name":             tt.channelType + " invalid global SMTP",
+				"type":             tt.channelType,
+				"enabled":          true,
+				"uses_global_smtp": true,
+				"webhook_url":      tt.webhookURL,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewReader(body))
+			req.Header.Set("Authorization", "Bearer admin-token")
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
+			if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "invalid_notification_channel") {
+				t.Fatalf("non-email global SMTP create must fail, status=%d body=%s", res.Code, res.Body.String())
+			}
+		})
+	}
+
+	generic, err := mem.CreateNotificationChannel(t.Context(), store.NotificationChannel{
+		Name: "generic", Type: "generic", Enabled: true, WebhookURL: "https://example.com/hook/token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitReq := httptest.NewRequest(http.MethodPut, "/notification-channels/"+generic.ID, bytes.NewBufferString(`{"name":"generic","type":"generic","enabled":true,"uses_global_smtp":true}`))
+	explicitReq.Header.Set("Authorization", "Bearer admin-token")
+	explicitRes := httptest.NewRecorder()
+	handler.ServeHTTP(explicitRes, explicitReq)
+	if explicitRes.Code != http.StatusBadRequest || !strings.Contains(explicitRes.Body.String(), "invalid_notification_channel") {
+		t.Fatalf("explicit non-email global SMTP update must fail, status=%d body=%s", explicitRes.Code, explicitRes.Body.String())
+	}
+
+	globalEmail, err := mem.CreateNotificationChannel(t.Context(), store.NotificationChannel{
+		Name: "global email", Type: "email", Enabled: true, UseGlobalSMTP: true, UseGlobalSMTPSet: true, EmailRecipients: []string{"ops@example.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inheritedReq := httptest.NewRequest(http.MethodPut, "/notification-channels/"+globalEmail.ID, bytes.NewBufferString(`{"name":"generic conversion","type":"generic","enabled":true,"webhook_url":"https://example.com/hook/token"}`))
+	inheritedReq.Header.Set("Authorization", "Bearer admin-token")
+	inheritedRes := httptest.NewRecorder()
+	handler.ServeHTTP(inheritedRes, inheritedReq)
+	if inheritedRes.Code != http.StatusBadRequest || !strings.Contains(inheritedRes.Body.String(), "invalid_notification_channel") {
+		t.Fatalf("effective non-email global SMTP update must fail, status=%d body=%s", inheritedRes.Code, inheritedRes.Body.String())
 	}
 }
 
@@ -1226,8 +1526,51 @@ func TestEmailNotificationChannelTestDoesNotExposeSMTPDetails(t *testing.T) {
 			t.Fatalf("email notification test response leaked SMTP detail %q: %s", raw, body)
 		}
 	}
-	if !strings.Contains(body, `o***s@\u003cEMAIL_DOMAIN\u003e`) || !strings.Contains(body, "email notification is not configured") {
+	if !strings.Contains(body, `o***s@\u003cEMAIL_DOMAIN\u003e`) || !strings.Contains(body, "send_failed") {
 		t.Fatalf("email notification test response should include masked target and sanitized error: %s", body)
+	}
+}
+
+func TestGlobalSMTPNotificationChannelTestUsesRelay(t *testing.T) {
+	st := store.NewMemoryStore()
+	channel, err := st.CreateNotificationChannel(t.Context(), store.NotificationChannel{
+		Name: "global email", Type: "email", Enabled: true, UseGlobalSMTP: true, EmailRecipients: []string{"ops@example.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := &fakeEmailRelay{}
+	handler := NewServerWithStoreAuthzNotifierExecutorAndEmailRelay("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), &fakeNotifier{}, nil, relay)
+	testReq := httptest.NewRequest(http.MethodPost, "/notification-channels/"+channel.ID+"/test", nil)
+	testReq.Header.Set("Authorization", "Bearer admin-token")
+	testRes := httptest.NewRecorder()
+	handler.ServeHTTP(testRes, testReq)
+	if testRes.Code != http.StatusAccepted || relay.calls != 1 || !strings.Contains(testRes.Body.String(), `"status":"success"`) {
+		t.Fatalf("global relay test failed: calls=%d status=%d body=%s", relay.calls, testRes.Code, testRes.Body.String())
+	}
+}
+
+func TestGlobalSMTPNotificationChannelTestReturnsSafeFailureCodes(t *testing.T) {
+	for _, code := range []string{"smtp_not_configured", "rate_limited"} {
+		t.Run(code, func(t *testing.T) {
+			st := store.NewMemoryStore()
+			channel, err := st.CreateNotificationChannel(t.Context(), store.NotificationChannel{
+				Name: "global email", Type: "email", Enabled: true, UseGlobalSMTP: true, EmailRecipients: []string{"ops@example.com"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			relay := &fakeEmailRelay{err: fakeSafeEmailError(code)}
+			handler := NewServerWithStoreAuthzNotifierExecutorAndEmailRelay("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), &fakeNotifier{}, nil, relay)
+			testReq := httptest.NewRequest(http.MethodPost, "/notification-channels/"+channel.ID+"/test", nil)
+			testReq.Header.Set("Authorization", "Bearer admin-token")
+			testRes := httptest.NewRecorder()
+			handler.ServeHTTP(testRes, testReq)
+			body := testRes.Body.String()
+			if testRes.Code != http.StatusAccepted || relay.calls != 1 || !strings.Contains(body, `"status":"failure"`) || !strings.Contains(body, `"error":"`+code+`"`) || strings.Contains(body, "ops@example.com") {
+				t.Fatalf("unexpected safe global relay failure: calls=%d status=%d body=%s", relay.calls, testRes.Code, body)
+			}
+		})
 	}
 }
 
@@ -1509,6 +1852,7 @@ func TestSensitiveStateChangingEndpointsAreRateLimited(t *testing.T) {
 		{http.MethodPost, "/incidents/incident-1/acknowledge"},
 		{http.MethodPost, "/incidents/incident-1/resolve"},
 		{http.MethodPost, "/notification-channels"},
+		{http.MethodPost, "/notification-events"},
 		{http.MethodPut, "/notification-channels/channel-1"},
 		{http.MethodDelete, "/notification-channels/channel-1"},
 		{http.MethodPost, "/notification-channels/channel-1/test"},
@@ -1741,6 +2085,21 @@ func (s *fakeRateLimitStore) AllowRateLimit(ctx context.Context, bucketKey strin
 
 type fakeNotifier struct {
 	count int
+}
+
+type fakeEmailRelay struct {
+	calls int
+	err   error
+}
+
+type fakeSafeEmailError string
+
+func (e fakeSafeEmailError) Error() string            { return string(e) }
+func (e fakeSafeEmailError) SafeDeliveryCode() string { return string(e) }
+
+func (f *fakeEmailRelay) SendNotificationEmail(_ context.Context, _ []string, _, _ string) error {
+	f.calls++
+	return f.err
 }
 
 func (n *fakeNotifier) NotifyIncidentOpened(ctx context.Context, incident store.Incident) ([]notifications.DeliveryResult, error) {

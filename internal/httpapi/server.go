@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/mail"
 	"net/netip"
 	"os"
 	"regexp"
@@ -39,12 +40,15 @@ var standaloneSecretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\b[MN][0-9A-Za-z]{23}\.[0-9A-Za-z_-]{6}\.[0-9A-Za-z_-]{27}\b`),
 }
 
+var notificationActionPattern = regexp.MustCompile(`^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*$`)
+
 type Server struct {
 	serviceType string
 	store       store.Store
 	ingestAuth  auth.Verifier
 	adminAuth   auth.Verifier
 	notifier    notifications.Notifier
+	emailRelay  notifications.EmailRelay
 	executor    controlExecutor
 	rateLimiter *rateLimiter
 }
@@ -72,6 +76,12 @@ func (envControlExecutor) ExecuteRemediation(ctx context.Context, req control.Re
 	return control.FromEnv().ExecuteRemediation(ctx, req)
 }
 
+type envEmailRelay struct{}
+
+func (envEmailRelay) SendNotificationEmail(ctx context.Context, recipients []string, subject, text string) error {
+	return control.FromEnv().SendNotificationEmail(ctx, recipients, subject, text)
+}
+
 type IngestResponse struct {
 	Signal    store.Signal     `json:"signal"`
 	Incidents []store.Incident `json:"incidents"`
@@ -92,6 +102,7 @@ type notificationChannelRequest struct {
 	Name            string   `json:"name"`
 	Type            string   `json:"type"`
 	Enabled         bool     `json:"enabled"`
+	UseGlobalSMTP   *bool    `json:"uses_global_smtp"`
 	WebhookURL      string   `json:"webhook_url"`
 	EmailRecipients []string `json:"email_recipients"`
 	SMTPHost        string   `json:"smtp_host"`
@@ -125,7 +136,7 @@ func NewServerWithStore(serviceType string, st store.Store) http.Handler {
 }
 
 func NewServerWithStoreAndAuth(serviceType string, st store.Store, verifier auth.Verifier) http.Handler {
-	return NewServerWithStoreAuthAndNotifier(serviceType, st, verifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: 5 * time.Second})
+	return NewServerWithStoreAuthAndNotifier(serviceType, st, verifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: 5 * time.Second, RetryMax: 3, RetryBaseDelay: time.Second})
 }
 
 func NewServerWithStoreAuthAndNotifier(serviceType string, st store.Store, verifier auth.Verifier, notifier notifications.Notifier) http.Handler {
@@ -137,14 +148,29 @@ func NewServerWithStoreAuthNotifierAndExecutor(serviceType string, st store.Stor
 }
 
 func NewServerWithStoreAuthz(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier) http.Handler {
-	return NewServerWithStoreAuthzNotifierAndExecutor(serviceType, st, ingestVerifier, adminVerifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: 5 * time.Second}, envControlExecutor{})
+	return NewServerWithStoreAuthzNotifierAndExecutor(serviceType, st, ingestVerifier, adminVerifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: 5 * time.Second, RetryMax: 3, RetryBaseDelay: time.Second}, envControlExecutor{})
 }
 
 func NewServerWithStoreAuthzNotifierAndExecutor(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor) http.Handler {
+	return NewServerWithStoreAuthzNotifierExecutorAndEmailRelay(serviceType, st, ingestVerifier, adminVerifier, notifier, executor, envEmailRelay{})
+}
+
+func NewServerWithStoreAuthzNotifierExecutorAndEmailRelay(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor, emailRelay notifications.EmailRelay) http.Handler {
 	if st == nil {
 		st = store.NewMemoryStore()
 	}
-	s := &Server{serviceType: serviceType, store: st, ingestAuth: ingestVerifier, adminAuth: adminVerifier, notifier: notifier, executor: executor, rateLimiter: rateLimiterFromEnv(st)}
+	switch configured := notifier.(type) {
+	case notifications.ChannelNotifier:
+		if configured.EmailRelay == nil {
+			configured.EmailRelay = emailRelay
+		}
+		notifier = configured
+	case *notifications.ChannelNotifier:
+		if configured != nil && configured.EmailRelay == nil {
+			configured.EmailRelay = emailRelay
+		}
+	}
+	s := &Server{serviceType: serviceType, store: st, ingestAuth: ingestVerifier, adminAuth: adminVerifier, notifier: notifier, emailRelay: emailRelay, executor: executor, rateLimiter: rateLimiterFromEnv(st)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.root)
 	mux.HandleFunc("GET /health", s.health)
@@ -409,6 +435,10 @@ func (s *Server) createNotificationChannel(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "bad_request"})
 		return
 	}
+	if body.UseGlobalSMTP != nil && *body.UseGlobalSMTP && hasLegacySMTPRequest(body) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_notification_channel"})
+		return
+	}
 	channel := notificationChannelFromRequest(body)
 	if channel.Name == "" || !validNotificationChannelConfig(channel) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_notification_channel"})
@@ -419,9 +449,13 @@ func (s *Server) createNotificationChannel(w http.ResponseWriter, r *http.Reques
 			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_smtp_channel"})
 			return
 		}
-	} else if notifications.ValidateWebhookURLForType(channel.WebhookURL, channel.Type) != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_webhook_url"})
-		return
+	} else {
+		normalizedURL, err := notifications.NormalizeWebhookURLForType(channel.WebhookURL, channel.Type)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_webhook_url"})
+			return
+		}
+		channel.WebhookURL = normalizedURL
 	}
 	created, err := s.store.CreateNotificationChannel(r.Context(), channel)
 	if errors.Is(err, store.ErrSecretKeyRequired) {
@@ -460,6 +494,10 @@ func (s *Server) updateNotificationChannel(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "bad_request"})
 		return
 	}
+	if body.UseGlobalSMTP != nil && *body.UseGlobalSMTP && hasLegacySMTPRequest(body) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_notification_channel"})
+		return
+	}
 	channel := notificationChannelFromRequest(body)
 	channel.ID = r.PathValue("id")
 	effective := channel
@@ -472,16 +510,22 @@ func (s *Server) updateNotificationChannel(w http.ResponseWriter, r *http.Reques
 	} else {
 		effective = effectiveNotificationChannel(existing, channel)
 	}
+	if effective.Name == "" || !validNotificationChannelConfig(effective) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_notification_channel"})
+		return
+	}
 	if effective.Type == "email" {
 		if err := notifications.ValidateSMTPChannel(effective); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_smtp_channel"})
 			return
 		}
 	} else if effective.WebhookURL != "" {
-		if err := notifications.ValidateWebhookURLForType(effective.WebhookURL, effective.Type); err != nil {
+		normalizedURL, err := notifications.NormalizeWebhookURLForType(effective.WebhookURL, effective.Type)
+		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_webhook_url"})
 			return
 		}
+		channel.WebhookURL = normalizedURL
 	}
 	updated, err := s.store.UpdateNotificationChannel(r.Context(), channel)
 	if errors.Is(err, store.ErrNotFound) {
@@ -526,7 +570,7 @@ func (s *Server) testNotificationChannel(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "get_notification_channel_failed"})
 		return
 	}
-	notifier := notifications.NotifierForChannel(channel, 5*time.Second, 0, time.Second, nil, false)
+	notifier := notifications.NotifierForChannelWithRelay(channel, 5*time.Second, 0, time.Second, nil, false, s.emailRelay)
 	results, _ := notifier.NotifyIncidentEvent(r.Context(), "incident.opened", store.Incident{ID: "test", Rule: "notification_test", Severity: "info", Status: "open", SummaryJA: "Notification channel test.", ServiceID: s.serviceType})
 	for i := range results {
 		results[i].Target = notificationChannelTarget(channel)
@@ -548,6 +592,10 @@ func (s *Server) createNotificationEvent(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "event_type_required"})
 		return
 	}
+	if !validNotificationEventType(eventType) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_notification_event"})
+		return
+	}
 	incident, err := notificationIncidentFromRequest(body, s.serviceType)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_notification_event"})
@@ -558,8 +606,8 @@ func (s *Server) createNotificationEvent(w http.ResponseWriter, r *http.Request)
 }
 
 func notificationIncidentFromRequest(body notificationEventRequest, fallbackService string) (store.Incident, error) {
-	action := safeNotificationField(body.Action, 128)
-	if action == "" {
+	action := strings.TrimSpace(body.Action)
+	if !validNotificationAction(action) {
 		return store.Incident{}, errors.New("action is required")
 	}
 	resourceType := safeNotificationField(body.ResourceType, 80)
@@ -591,6 +639,19 @@ func notificationIncidentFromRequest(body notificationEventRequest, fallbackServ
 		SummaryJA: summary,
 		ServiceID: serviceID,
 	}, nil
+}
+
+func validNotificationEventType(value string) bool {
+	switch value {
+	case "incident.opened", "incident.updated", "incident.resolved", "diagnostic.created", "remediation.pending_approval", "remediation.executed", "admin.audit":
+		return true
+	default:
+		return false
+	}
+}
+
+func validNotificationAction(value string) bool {
+	return value != "" && len(value) <= 128 && notificationActionPattern.MatchString(value)
 }
 
 func safeNotificationField(value string, maxLen int) string {
@@ -636,21 +697,32 @@ func notificationChannelFromRequest(body notificationChannelRequest) store.Notif
 	if body.SMTPTLS != nil {
 		smtpTLS = *body.SMTPTLS
 	}
-	return store.NotificationChannel{
-		Name:            strings.TrimSpace(body.Name),
-		Type:            channelType,
-		Enabled:         body.Enabled,
-		WebhookURL:      strings.TrimSpace(body.WebhookURL),
-		EmailRecipients: cleanStringSlice(body.EmailRecipients),
-		SMTPHost:        strings.TrimSpace(body.SMTPHost),
-		SMTPPort:        body.SMTPPort,
-		SMTPTLS:         smtpTLS,
-		SMTPFrom:        strings.TrimSpace(body.SMTPFrom),
-		SMTPUsername:    strings.TrimSpace(body.SMTPUsername),
-		SMTPPassword:    strings.TrimSpace(body.SMTPPassword),
-		SeverityFilter:  body.SeverityFilter,
-		EventTypeFilter: body.EventTypeFilter,
+	channel := store.NotificationChannel{
+		Name:             strings.TrimSpace(body.Name),
+		Type:             channelType,
+		Enabled:          body.Enabled,
+		UseGlobalSMTPSet: body.UseGlobalSMTP != nil,
+		WebhookURL:       strings.TrimSpace(body.WebhookURL),
+		EmailRecipients:  cleanStringSlice(body.EmailRecipients),
+		SMTPHost:         strings.TrimSpace(body.SMTPHost),
+		SMTPPort:         body.SMTPPort,
+		SMTPTLS:          smtpTLS,
+		SMTPFrom:         strings.TrimSpace(body.SMTPFrom),
+		SMTPUsername:     strings.TrimSpace(body.SMTPUsername),
+		SMTPPassword:     strings.TrimSpace(body.SMTPPassword),
+		SeverityFilter:   body.SeverityFilter,
+		EventTypeFilter:  body.EventTypeFilter,
 	}
+	if body.UseGlobalSMTP != nil {
+		channel.UseGlobalSMTP = *body.UseGlobalSMTP
+	} else if channelType == "email" && !hasLegacySMTPRequest(body) {
+		channel.UseGlobalSMTP = true
+	}
+	return channel
+}
+
+func hasLegacySMTPRequest(body notificationChannelRequest) bool {
+	return strings.TrimSpace(body.SMTPHost) != "" || body.SMTPPort != 0 || body.SMTPTLS != nil || strings.TrimSpace(body.SMTPFrom) != "" || strings.TrimSpace(body.SMTPUsername) != "" || strings.TrimSpace(body.SMTPPassword) != ""
 }
 
 func effectiveNotificationChannel(existing, incoming store.NotificationChannel) store.NotificationChannel {
@@ -662,6 +734,19 @@ func effectiveNotificationChannel(existing, incoming store.NotificationChannel) 
 		effective.Type = incoming.Type
 	}
 	effective.Enabled = incoming.Enabled
+	if incoming.UseGlobalSMTPSet {
+		effective.UseGlobalSMTP = incoming.UseGlobalSMTP
+		effective.UseGlobalSMTPSet = true
+		if incoming.UseGlobalSMTP {
+			effective.SMTPHost = ""
+			effective.SMTPPort = 0
+			effective.SMTPTLS = false
+			effective.SMTPFrom = ""
+			effective.SMTPUsername = ""
+			effective.SMTPPassword = ""
+			effective.SMTPPasswordConfigured = false
+		}
+	}
 	if incoming.WebhookURL != "" {
 		effective.WebhookURL = incoming.WebhookURL
 	}
@@ -700,6 +785,7 @@ type publicNotificationChannelResponse struct {
 	Name                   string   `json:"name"`
 	Type                   string   `json:"type"`
 	Enabled                bool     `json:"enabled"`
+	UseGlobalSMTP          bool     `json:"uses_global_smtp"`
 	MaskedWebhookURL       string   `json:"masked_webhook_url,omitempty"`
 	SMTPPasswordConfigured bool     `json:"smtp_password_configured,omitempty"`
 	MaskedEmailTarget      string   `json:"masked_email_target,omitempty"`
@@ -723,6 +809,7 @@ func publicNotificationChannel(channel store.NotificationChannel) publicNotifica
 		Name:                   channel.Name,
 		Type:                   channel.Type,
 		Enabled:                channel.Enabled,
+		UseGlobalSMTP:          channel.UseGlobalSMTP,
 		MaskedWebhookURL:       channel.MaskedWebhookURL,
 		SMTPPasswordConfigured: channel.SMTPPasswordConfigured,
 		MaskedEmailTarget:      channel.MaskedEmailTarget,
@@ -739,22 +826,40 @@ func publicNotificationChannel(channel store.NotificationChannel) publicNotifica
 }
 
 func validNotificationChannelConfig(channel store.NotificationChannel) bool {
+	if channel.UseGlobalSMTP && channel.Type != "email" {
+		return false
+	}
 	if channel.Type == "email" {
-		return len(channel.EmailRecipients) > 0 &&
-			channel.SMTPHost != "" &&
-			channel.SMTPFrom != "" &&
-			safeEmailHeaderValue(channel.SMTPFrom) &&
-			safeEmailHeaderValue(channel.SMTPUsername) &&
-			safeEmailRecipients(channel.EmailRecipients)
+		if len(channel.EmailRecipients) == 0 || !safeEmailRecipients(channel.EmailRecipients) {
+			return false
+		}
+		if channel.UseGlobalSMTP {
+			return true
+		}
+		return channel.SMTPHost != "" && channel.SMTPFrom != "" && safeEmailHeaderValue(channel.SMTPFrom) && safeEmailHeaderValue(channel.SMTPUsername)
 	}
 	return channel.WebhookURL != ""
 }
 
 func safeEmailRecipients(recipients []string) bool {
+	if len(recipients) == 0 || len(recipients) > 20 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(recipients))
 	for _, recipient := range recipients {
-		if !safeEmailHeaderValue(recipient) {
+		recipient = strings.TrimSpace(recipient)
+		if len(recipient) > 320 || !safeEmailHeaderValue(recipient) {
 			return false
 		}
+		address, err := mail.ParseAddress(recipient)
+		if err != nil || address.Address != recipient {
+			return false
+		}
+		key := strings.ToLower(recipient)
+		if _, duplicate := seen[key]; duplicate {
+			return false
+		}
+		seen[key] = struct{}{}
 	}
 	return true
 }
@@ -777,6 +882,9 @@ func notificationChannelTarget(channel store.NotificationChannel) string {
 }
 
 func cleanStringSlice(values []string) []string {
+	if values == nil {
+		return nil
+	}
 	out := make([]string, 0, len(values))
 	for _, value := range values {
 		value = strings.TrimSpace(value)
@@ -1447,7 +1555,7 @@ func isRateLimitedEndpoint(r *http.Request) bool {
 			return true
 		}
 	case http.MethodPost:
-		if path == "/heartbeat" || path == "/signals" || path == "/notification-channels" {
+		if path == "/heartbeat" || path == "/signals" || path == "/notification-channels" || path == "/notification-events" {
 			return true
 		}
 		if strings.HasPrefix(path, "/incidents/") && (strings.HasSuffix(path, "/acknowledge") || strings.HasSuffix(path, "/resolve")) {

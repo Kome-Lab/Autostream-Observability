@@ -238,6 +238,13 @@ func (s *MemoryStore) UpdateNotificationChannel(ctx context.Context, channel Not
 		existing.Type = normalizeChannelType(channel.Type)
 	}
 	existing.Enabled = channel.Enabled
+	if channel.UseGlobalSMTPSet {
+		existing.UseGlobalSMTP = channel.UseGlobalSMTP
+		existing.UseGlobalSMTPSet = true
+		if channel.UseGlobalSMTP {
+			clearLegacySMTPConfiguration(&existing)
+		}
+	}
 	if channel.WebhookURL != "" {
 		existing.WebhookURL = channel.WebhookURL
 	}
@@ -323,16 +330,43 @@ func normalizeChannelType(value string) string {
 
 func normalizeNotificationChannelSecrets(channel NotificationChannel) NotificationChannel {
 	if channel.Type == "email" {
+		if channel.UseGlobalSMTPSet && channel.UseGlobalSMTP {
+			clearLegacySMTPConfiguration(&channel)
+		}
+		if !hasLegacySMTPConfiguration(channel) {
+			channel.UseGlobalSMTP = true
+		} else if !channel.UseGlobalSMTPSet {
+			channel.UseGlobalSMTP = false
+		}
 		channel.MaskedWebhookURL = ""
 		channel.SMTPPasswordConfigured = strings.TrimSpace(channel.SMTPPassword) != "" || channel.SMTPPasswordConfigured
 		channel.MaskedEmailTarget = maskEmailRecipients(channel.EmailRecipients)
-		if channel.SMTPPort == 0 {
+		if !channel.UseGlobalSMTP && channel.SMTPPort == 0 {
 			channel.SMTPPort = 587
 		}
 		return channel
 	}
 	channel.MaskedWebhookURL = maskWebhookURL(channel.WebhookURL)
 	return channel
+}
+
+func hasLegacySMTPConfiguration(channel NotificationChannel) bool {
+	return strings.TrimSpace(channel.SMTPHost) != "" ||
+		channel.SMTPPort != 0 ||
+		strings.TrimSpace(channel.SMTPFrom) != "" ||
+		strings.TrimSpace(channel.SMTPUsername) != "" ||
+		strings.TrimSpace(channel.SMTPPassword) != "" ||
+		channel.SMTPPasswordConfigured
+}
+
+func clearLegacySMTPConfiguration(channel *NotificationChannel) {
+	channel.SMTPHost = ""
+	channel.SMTPPort = 0
+	channel.SMTPTLS = false
+	channel.SMTPFrom = ""
+	channel.SMTPUsername = ""
+	channel.SMTPPassword = ""
+	channel.SMTPPasswordConfigured = false
 }
 
 func maskEmailRecipients(recipients []string) string {
