@@ -4,13 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/mail"
 	"net/smtp"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/example/autostream-observability/internal/store"
 )
@@ -121,11 +126,98 @@ func TestAdminAuditNotificationUsesSpecificStructuredTitleAndContext(t *testing.
 	if !strings.Contains(message, "Subject: [AutoStream] WARNING secrets.update | =?UTF-8?") {
 		t.Fatalf("admin audit email subject lost its stable ASCII prefix or MIME encoding: %s", message)
 	}
+	if !strings.Contains(message, "Content-Type: multipart/alternative;") {
+		t.Fatalf("admin audit email is not multipart/alternative: %s", message)
+	}
 	text := formatIncidentText("admin.audit", incident)
 	for _, want := range []string{"シークレットを更新", "重要度: 警告", "結果: 成功", "操作コード: secrets.update", "対象: secret", "実行者: ops", occurredAt.Format(time.RFC3339)} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("structured admin audit text is missing %q: %s", want, text)
 		}
+	}
+}
+
+func TestEmailNotificationMultipartEscapesHTMLAndPreventsHeaderInjection(t *testing.T) {
+	occurredAt := time.Date(2026, 7, 18, 3, 45, 0, 0, time.UTC)
+	incident := store.Incident{
+		Rule:      "secrets.update",
+		Severity:  "warning",
+		Status:    "success",
+		SummaryJA: "シークレットを更新\n対象: <script>alert('resource')</script> & secret\n実行者: <img src=x onerror=alert(1)>",
+		ServiceID: "control-panel",
+		UpdatedAt: occurredAt,
+	}
+	message := formatEmailMessage(
+		"admin.audit",
+		incident,
+		"autostream@example.jp\r\nBcc: attacker@example.jp",
+		[]string{"ops@example.jp\r\nCc: attacker@example.jp"},
+	)
+	parsed, err := mail.ReadMessage(strings.NewReader(message))
+	if err != nil {
+		t.Fatalf("parse multipart email: %v\n%s", err, message)
+	}
+	if parsed.Header.Get("Bcc") != "" || parsed.Header.Get("Cc") != "" {
+		t.Fatalf("injected mail header survived: %#v", parsed.Header)
+	}
+	mediaType, params, err := mime.ParseMediaType(parsed.Header.Get("Content-Type"))
+	if err != nil || mediaType != "multipart/alternative" || params["boundary"] == "" {
+		t.Fatalf("unexpected multipart content type: %q err=%v", parsed.Header.Get("Content-Type"), err)
+	}
+	reader := multipart.NewReader(parsed.Body, params["boundary"])
+	parts := map[string]string{}
+	for {
+		part, partErr := reader.NextPart()
+		if partErr == io.EOF {
+			break
+		}
+		if partErr != nil {
+			t.Fatalf("read multipart email: %v", partErr)
+		}
+		body, readErr := io.ReadAll(part)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		partType, _, parseErr := mime.ParseMediaType(part.Header.Get("Content-Type"))
+		if parseErr != nil {
+			t.Fatalf("parse email part type: %v", parseErr)
+		}
+		parts[partType] = string(body)
+	}
+	plain := parts["text/plain"]
+	html := parts["text/html"]
+	if plain == "" || html == "" {
+		t.Fatalf("plain or HTML alternative is missing: %#v", parts)
+	}
+	for _, want := range []string{"イベント", "操作 / ルール", "対象", "実行者", "結果", "重要度", "日時", "admin.audit", "secrets.update", occurredAt.Format(time.RFC3339)} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("HTML card is missing %q: %s", want, html)
+		}
+	}
+	if strings.Contains(html, "<script>") || strings.Contains(html, "<img") || !strings.Contains(html, "&lt;script&gt;") || !strings.Contains(html, "&amp; secret") {
+		t.Fatalf("HTML notification did not escape dynamic content: %s", html)
+	}
+}
+
+func TestEmailNotificationAlternativesStayWithinRelayLimits(t *testing.T) {
+	incident := store.Incident{
+		Rule:      strings.Repeat("rule", 5000),
+		Severity:  "critical",
+		Status:    "open",
+		SummaryJA: strings.Repeat("非常に長い概要", 10000),
+		ServiceID: strings.Repeat("service", 2000),
+		UpdatedAt: time.Date(2026, 7, 18, 4, 0, 0, 0, time.UTC),
+	}
+	text := formatIncidentEmailText("incident.opened", incident)
+	html := formatIncidentHTML("incident.opened", incident)
+	if len(text) > maxNotificationEmailTextBytes || !utf8.ValidString(text) {
+		t.Fatalf("plain alternative exceeded relay limits: bytes=%d valid_utf8=%t", len(text), utf8.ValidString(text))
+	}
+	if len(html) > 64*1024 || !utf8.ValidString(html) {
+		t.Fatalf("HTML alternative exceeded relay limits: bytes=%d valid_utf8=%t", len(html), utf8.ValidString(html))
+	}
+	if subject := formatEmailSubject("incident.opened", incident); len([]rune(subject)) > 200 {
+		t.Fatalf("email subject exceeded relay limit: runes=%d", len([]rune(subject)))
 	}
 }
 
@@ -135,14 +227,28 @@ func TestNotificationActionLabelsCoverControlPanelAuditVocabulary(t *testing.T) 
 		"app.settings.test_email",
 		"archive.artifact.share.create",
 		"auth.change_password",
+		"auth.avatar.update",
+		"auth.avatar.delete",
 		"auth.oauth.provision_user",
+		"auth.passkey.login.start",
+		"auth.passkey.login.finish",
 		"integrations.drive_destination.update",
 		"integrations.oauth_account.connect",
 		"integrations.oauth_provider.update",
 		"mfa.recovery_codes.regenerate",
 		"passkeys.registration.start",
+		"passkeys.registration.finish",
 		"security.settings.update",
 		"services.runtime_config.preview",
+		"system_updates.create",
+		"system_updates.request",
+		"system_updates.cancel",
+		"system_updates.claim",
+		"system_updates.authorize",
+		"system_updates.report",
+		"system_updates.succeeded",
+		"system_updates.rolled_back",
+		"system_updates.failed",
 		"streams.discord_youtube_notify",
 		"streams.retry_upload",
 		"streams.worker_event_test",
@@ -759,18 +865,31 @@ func TestEmailNotifierSendsMaskedDelivery(t *testing.T) {
 }
 
 type recordingEmailRelay struct {
-	recipients []string
-	subject    string
-	text       string
-	attempts   int
-	err        error
+	recipients  []string
+	subject     string
+	text        string
+	html        string
+	attempts    int
+	err         error
+	deadline    time.Time
+	hasDeadline bool
 }
 
-func (r *recordingEmailRelay) SendNotificationEmail(_ context.Context, recipients []string, subject, text string) error {
+func (r *recordingEmailRelay) SendNotificationEmail(ctx context.Context, recipients []string, subject, text string) error {
+	return r.record(ctx, recipients, subject, text, "")
+}
+
+func (r *recordingEmailRelay) SendNotificationEmailHTML(ctx context.Context, recipients []string, subject, text, html string) error {
+	return r.record(ctx, recipients, subject, text, html)
+}
+
+func (r *recordingEmailRelay) record(ctx context.Context, recipients []string, subject, text, html string) error {
 	r.attempts++
 	r.recipients = append([]string(nil), recipients...)
 	r.subject = subject
 	r.text = text
+	r.html = html
+	r.deadline, r.hasDeadline = ctx.Deadline()
 	return r.err
 }
 
@@ -844,13 +963,30 @@ func TestChannelNotifierUsesGlobalSMTPRelayForIncident(t *testing.T) {
 		t.Fatal(err)
 	}
 	relay := &recordingEmailRelay{}
-	notifier := ChannelNotifier{Store: st, EmailRelay: relay, Timeout: time.Second}
+	notifier := ChannelNotifier{Store: st, EmailRelay: relay, Timeout: 10 * time.Millisecond, EmailTimeout: 500 * time.Millisecond}
 	results, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-channel", Rule: "encoder_down", Severity: "critical", Status: "open", SummaryJA: "Encoder stopped.", ServiceID: "enc-01"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if relay.attempts != 1 || len(results) != 1 || results[0].Status != "success" {
 		t.Fatalf("global relay was not used: attempts=%d results=%#v", relay.attempts, results)
+	}
+	if !strings.Contains(relay.html, "<!doctype html>") || !strings.Contains(relay.html, "イベント") || !strings.Contains(relay.html, "encoder_down") {
+		t.Fatalf("global relay did not receive the structured HTML alternative: %q", relay.html)
+	}
+	if !relay.hasDeadline || time.Until(relay.deadline) < 300*time.Millisecond {
+		t.Fatalf("email relay inherited the webhook timeout: deadline=%v hasDeadline=%t", relay.deadline, relay.hasDeadline)
+	}
+}
+
+func TestSanitizeChannelDeliveryErrorPreservesOnlySafeEmailCodes(t *testing.T) {
+	for _, code := range []string{"smtp_auth_failed", "missing_service_scope", "secret_encryption_key_required"} {
+		if got := SanitizeChannelDeliveryError("email", errors.New(code)); got != code {
+			t.Fatalf("safe email code %q was not preserved: %q", code, got)
+		}
+	}
+	if got := SanitizeChannelDeliveryError("email", errors.New("smtp.internal.example raw-secret")); got != "send_failed" {
+		t.Fatalf("unsafe email error was exposed: %q", got)
 	}
 }
 

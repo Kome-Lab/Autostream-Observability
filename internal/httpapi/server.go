@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/mail"
@@ -52,6 +53,7 @@ type Server struct {
 	emailRelay  notifications.EmailRelay
 	executor    controlExecutor
 	rateLimiter *rateLimiter
+	logger      *log.Logger
 }
 
 const maxJSONBodyBytes = 64 << 10
@@ -65,6 +67,9 @@ const (
 	adminScopeRemediationRead     = "remediation.read"
 	adminScopeRemediationApprove  = "remediation.approve"
 	adminScopeRemediationExecute  = "remediation.execute"
+	notificationWebhookTimeout    = 5 * time.Second
+	notificationEmailTimeout      = 30 * time.Second
+	notificationFanoutTimeout     = 35 * time.Second
 )
 
 type controlExecutor interface {
@@ -81,6 +86,10 @@ type envEmailRelay struct{}
 
 func (envEmailRelay) SendNotificationEmail(ctx context.Context, recipients []string, subject, text string) error {
 	return control.FromEnv().SendNotificationEmail(ctx, recipients, subject, text)
+}
+
+func (envEmailRelay) SendNotificationEmailHTML(ctx context.Context, recipients []string, subject, text, html string) error {
+	return control.FromEnv().SendNotificationEmailHTML(ctx, recipients, subject, text, html)
 }
 
 type IngestResponse struct {
@@ -137,7 +146,7 @@ func NewServerWithStore(serviceType string, st store.Store) http.Handler {
 }
 
 func NewServerWithStoreAndAuth(serviceType string, st store.Store, verifier auth.Verifier) http.Handler {
-	return NewServerWithStoreAuthAndNotifier(serviceType, st, verifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: 5 * time.Second, RetryMax: 3, RetryBaseDelay: time.Second})
+	return NewServerWithStoreAuthAndNotifier(serviceType, st, verifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: notificationWebhookTimeout, EmailTimeout: notificationEmailTimeout, RetryMax: 3, RetryBaseDelay: time.Second})
 }
 
 func NewServerWithStoreAuthAndNotifier(serviceType string, st store.Store, verifier auth.Verifier, notifier notifications.Notifier) http.Handler {
@@ -149,7 +158,7 @@ func NewServerWithStoreAuthNotifierAndExecutor(serviceType string, st store.Stor
 }
 
 func NewServerWithStoreAuthz(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier) http.Handler {
-	return NewServerWithStoreAuthzNotifierAndExecutor(serviceType, st, ingestVerifier, adminVerifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: 5 * time.Second, RetryMax: 3, RetryBaseDelay: time.Second}, envControlExecutor{})
+	return NewServerWithStoreAuthzNotifierAndExecutor(serviceType, st, ingestVerifier, adminVerifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: notificationWebhookTimeout, EmailTimeout: notificationEmailTimeout, RetryMax: 3, RetryBaseDelay: time.Second}, envControlExecutor{})
 }
 
 func NewServerWithStoreAuthzNotifierAndExecutor(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor) http.Handler {
@@ -171,7 +180,7 @@ func NewServerWithStoreAuthzNotifierExecutorAndEmailRelay(serviceType string, st
 			configured.EmailRelay = emailRelay
 		}
 	}
-	s := &Server{serviceType: serviceType, store: st, ingestAuth: ingestVerifier, adminAuth: adminVerifier, notifier: notifier, emailRelay: emailRelay, executor: executor, rateLimiter: rateLimiterFromEnv(st)}
+	s := &Server{serviceType: serviceType, store: st, ingestAuth: ingestVerifier, adminAuth: adminVerifier, notifier: notifier, emailRelay: emailRelay, executor: executor, rateLimiter: rateLimiterFromEnv(st), logger: log.Default()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.root)
 	mux.HandleFunc("GET /health", s.health)
@@ -571,11 +580,17 @@ func (s *Server) testNotificationChannel(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "get_notification_channel_failed"})
 		return
 	}
-	notifier := notifications.NotifierForChannelWithRelay(channel, 5*time.Second, 0, time.Second, nil, false, s.emailRelay)
-	results, _ := notifier.NotifyIncidentEvent(r.Context(), "incident.opened", store.Incident{ID: "test", Rule: "notification_test", Severity: "info", Status: "open", SummaryJA: "Notification channel test.", ServiceID: s.serviceType})
+	testIncident := store.Incident{ID: "test", Rule: "notification_test", Severity: "info", Status: "open", SummaryJA: "Notification channel test.", ServiceID: s.serviceType}
+	timeout := notificationWebhookTimeout
+	if channel.Type == "email" {
+		timeout = notificationEmailTimeout
+	}
+	notifier := notifications.NotifierForChannelWithRelay(channel, timeout, 0, time.Second, nil, false, s.emailRelay)
+	results, _ := notifier.NotifyIncidentEvent(r.Context(), "incident.opened", testIncident)
 	for i := range results {
 		results[i].Target = notificationChannelTarget(channel)
 	}
+	s.saveNotificationDeliveryResults(r.Context(), "incident.opened", testIncident, results)
 	writeJSON(w, http.StatusAccepted, results)
 }
 
@@ -1381,16 +1396,27 @@ func (s *Server) deliverNotificationEvent(r *http.Request, eventType string, inc
 	if s.notifier == nil {
 		return nil
 	}
-	results, err := notifications.NotifyIncidentEvent(r.Context(), s.notifier, eventType, incident)
+	// Notification delivery must not be canceled just because the originating
+	// HTTP client used a shorter request timeout. Keep request values, detach
+	// cancellation, and retain a hard deadline so a stuck provider cannot keep
+	// the handler alive indefinitely.
+	deliveryContext, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), notificationFanoutTimeout)
+	defer cancel()
+	results, err := notifications.NotifyIncidentEvent(deliveryContext, s.notifier, eventType, incident)
 	if err != nil && len(results) == 0 {
 		results = []notifications.DeliveryResult{{EventType: eventType, Channel: "generic", Target: "<WEBHOOK_URL>", Status: "failure", Error: notifications.SanitizeDeliveryError(err)}}
 	}
+	s.saveNotificationDeliveryResults(deliveryContext, eventType, incident, results)
+	return results
+}
+
+func (s *Server) saveNotificationDeliveryResults(ctx context.Context, eventType string, incident store.Incident, results []notifications.DeliveryResult) {
 	for _, result := range results {
 		status := result.Status
 		if status == "" {
 			status = "success"
 		}
-		errorText := notifications.SanitizeDeliveryError(errors.New(result.Error))
+		errorText := notifications.SanitizeChannelDeliveryError(result.Channel, errors.New(result.Error))
 		if result.Error == "" {
 			errorText = ""
 		}
@@ -1411,7 +1437,7 @@ func (s *Server) deliverNotificationEvent(r *http.Request, eventType string, inc
 		if !incident.UpdatedAt.IsZero() {
 			metadata["occurred_at"] = incident.UpdatedAt.UTC().Format(time.RFC3339)
 		}
-		_, _ = s.store.SaveNotificationDelivery(r.Context(), store.NotificationDelivery{
+		_, err := s.store.SaveNotificationDelivery(ctx, store.NotificationDelivery{
 			EventType:  result.EventType,
 			Channel:    result.Channel,
 			Target:     result.Target,
@@ -1420,8 +1446,14 @@ func (s *Server) deliverNotificationEvent(r *http.Request, eventType string, inc
 			Error:      errorText,
 			Metadata:   metadata,
 		})
+		if err != nil {
+			logger := s.logger
+			if logger == nil {
+				logger = log.Default()
+			}
+			logger.Printf("notification delivery history save failed: event_type=%q channel=%q status=%q", result.EventType, result.Channel, status)
+		}
 	}
-	return results
 }
 
 func metricSnapshots(signals []store.Signal) []store.MetricSnapshot {

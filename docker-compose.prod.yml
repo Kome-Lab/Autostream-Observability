@@ -1,6 +1,6 @@
 services:
   observability:
-    image: observability:latest
+    image: ${AUTOSTREAM_IMAGE_REGISTRY:-ghcr.io/kome-lab/autostream-docker}/observability:${AUTOSTREAM_DOCKER_VERSION:-latest}
     restart: unless-stopped
     env_file: .env
     environment:

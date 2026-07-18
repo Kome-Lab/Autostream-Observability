@@ -28,14 +28,31 @@ func TestSendNotificationEmailDispatchesAuthenticatedPayload(t *testing.T) {
 	defer server.Close()
 
 	client := Client{BaseURL: server.URL, Token: "runtime-token", HTTP: server.Client()}
-	if err := client.SendNotificationEmail(t.Context(), []string{" ops@example.com "}, "[AutoStream] INFO test", "test body"); err != nil {
+	if err := client.SendNotificationEmailHTML(t.Context(), []string{" ops@example.com "}, "[AutoStream] INFO test", "test body", "<p>test body</p>"); err != nil {
 		t.Fatal(err)
 	}
 	if gotAuth != "Bearer runtime-token" || gotPath != "/services/notifications/email" {
 		t.Fatalf("unexpected relay request auth=%q path=%q", gotAuth, gotPath)
 	}
-	if len(gotBody.Recipients) != 1 || gotBody.Recipients[0] != "ops@example.com" || gotBody.Subject != "[AutoStream] INFO test" || gotBody.Text != "test body" {
+	if len(gotBody.Recipients) != 1 || gotBody.Recipients[0] != "ops@example.com" || gotBody.Subject != "[AutoStream] INFO test" || gotBody.Text != "test body" || gotBody.HTML != "<p>test body</p>" {
 		t.Fatalf("unexpected relay payload: %#v", gotBody)
+	}
+}
+
+func TestSendNotificationEmailExtendsShortClientTimeoutWithoutMutatingSharedClient(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(25 * time.Millisecond)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	sharedClient := noRedirectClient(5 * time.Millisecond)
+	client := Client{BaseURL: server.URL, Token: "runtime-token", HTTP: sharedClient}
+	if err := client.SendNotificationEmail(t.Context(), []string{"ops@example.com"}, "subject", "body"); err != nil {
+		t.Fatalf("email relay inherited the short default client timeout: %v", err)
+	}
+	if sharedClient.Timeout != 5*time.Millisecond {
+		t.Fatalf("shared client was mutated: timeout=%s", sharedClient.Timeout)
 	}
 }
 
@@ -43,6 +60,15 @@ func TestSendNotificationEmailRejectsUnsafePayloadAndRedirect(t *testing.T) {
 	client := Client{BaseURL: "https://panel.example.com", Token: "runtime-token"}
 	if err := client.SendNotificationEmail(t.Context(), []string{"ops@example.com\r\nBcc: attacker@example.com"}, "subject", "body"); err == nil {
 		t.Fatal("expected header-injection recipient to be rejected")
+	}
+	if err := client.SendNotificationEmailHTML(t.Context(), []string{"ops@example.com"}, "subject\r\nBcc: attacker@example.com", "body", "<p>body</p>"); err == nil {
+		t.Fatal("expected header-injection subject to be rejected")
+	}
+	if err := client.SendNotificationEmailHTML(t.Context(), []string{"ops@example.com"}, "subject", "body", "<p>unsafe\x00html</p>"); err == nil {
+		t.Fatal("expected NUL in HTML body to be rejected")
+	}
+	if err := client.SendNotificationEmailHTML(t.Context(), []string{"ops@example.com"}, "subject", "body", strings.Repeat("a", maxNotificationEmailHTMLBytes+1)); err == nil {
+		t.Fatal("expected oversized HTML body to be rejected")
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,8 +83,9 @@ func TestSendNotificationEmailRejectsUnsafePayloadAndRedirect(t *testing.T) {
 
 func TestSendNotificationEmailOnlyExposesWhitelistedFailureCode(t *testing.T) {
 	for name, response := range map[string]string{
-		"known":   `{"code":"smtp_not_configured","detail":"smtp.internal.example raw-secret"}`,
-		"unknown": `{"code":"database_failed","detail":"raw-secret"}`,
+		"smtp":          `{"code":"smtp_not_configured","detail":"smtp.internal.example raw-secret"}`,
+		"missing scope": `{"code":"missing_service_scope","detail":"raw-secret"}`,
+		"unknown":       `{"code":"database_failed","detail":"raw-secret"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -70,8 +97,10 @@ func TestSendNotificationEmailOnlyExposesWhitelistedFailureCode(t *testing.T) {
 			client := Client{BaseURL: server.URL, Token: "runtime-token", HTTP: noRedirectClient(time.Second)}
 			err := client.SendNotificationEmail(t.Context(), []string{"ops@example.com"}, "subject", "body")
 			want := "send_failed"
-			if name == "known" {
+			if name == "smtp" {
 				want = "smtp_not_configured"
+			} else if name == "missing scope" {
+				want = "missing_service_scope"
 			}
 			if err == nil || err.Error() != want || strings.Contains(err.Error(), "raw-secret") {
 				t.Fatalf("unexpected safe relay error: %v", err)

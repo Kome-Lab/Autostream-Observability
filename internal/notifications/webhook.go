@@ -7,15 +7,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"net/http"
+	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/example/autostream-observability/internal/store"
 )
@@ -50,6 +56,12 @@ type EmailRelay interface {
 	SendNotificationEmail(ctx context.Context, recipients []string, subject, text string) error
 }
 
+type HTMLEmailRelay interface {
+	SendNotificationEmailHTML(ctx context.Context, recipients []string, subject, text, html string) error
+}
+
+const maxNotificationEmailTextBytes = 16 * 1024
+
 type WebhookNotifier struct {
 	Type           string
 	URL            string
@@ -83,6 +95,7 @@ type ChannelNotifier struct {
 	Fallback       Notifier
 	EmailRelay     EmailRelay
 	Timeout        time.Duration
+	EmailTimeout   time.Duration
 	RetryMax       int
 	RetryBaseDelay time.Duration
 	HTTP           *http.Client
@@ -206,7 +219,11 @@ func (n ChannelNotifier) NotifyIncidentEvent(ctx context.Context, eventType stri
 		if eventType != "admin.audit" && !matchesFilters(channel, incident, eventType) {
 			continue
 		}
-		notifier := NotifierForChannelWithRelay(channel, n.Timeout, n.RetryMax, n.RetryBaseDelay, n.HTTP, n.AllowPrivate, n.EmailRelay)
+		timeout := n.Timeout
+		if channel.Type == "email" && n.EmailTimeout > 0 {
+			timeout = n.EmailTimeout
+		}
+		notifier := NotifierForChannelWithRelay(channel, timeout, n.RetryMax, n.RetryBaseDelay, n.HTTP, n.AllowPrivate, n.EmailRelay)
 		deliveries, _ := notifier.NotifyIncidentEvent(ctx, eventType, incident)
 		for _, delivery := range deliveries {
 			delivery.Channel = channel.Type
@@ -300,7 +317,14 @@ func (n EmailNotifier) NotifyIncidentEvent(ctx context.Context, eventType string
 	for attempt := 0; attempt < attempts; attempt++ {
 		if usesGlobalSMTP {
 			reqCtx, cancel := context.WithTimeout(ctx, n.Timeout)
-			lastErr = n.Relay.SendNotificationEmail(reqCtx, append([]string(nil), channel.EmailRecipients...), formatEmailSubject(eventType, incident), formatIncidentText(eventType, incident))
+			recipients := append([]string(nil), channel.EmailRecipients...)
+			subject := formatEmailSubject(eventType, incident)
+			text := formatIncidentEmailText(eventType, incident)
+			if htmlRelay, ok := n.Relay.(HTMLEmailRelay); ok {
+				lastErr = htmlRelay.SendNotificationEmailHTML(reqCtx, recipients, subject, text, formatIncidentHTML(eventType, incident))
+			} else {
+				lastErr = n.Relay.SendNotificationEmail(reqCtx, recipients, subject, text)
+			}
 			cancel()
 			if lastErr == nil {
 				result.Status = "success"
@@ -357,17 +381,38 @@ func safeEmailRelayError(err error) string {
 	type safeDeliveryCoder interface {
 		SafeDeliveryCode() string
 	}
+	code := ""
 	var coder safeDeliveryCoder
-	if !errors.As(err, &coder) {
-		return "send_failed"
+	if errors.As(err, &coder) {
+		code = coder.SafeDeliveryCode()
+	} else if err != nil {
+		code = err.Error()
 	}
-	code := coder.SafeDeliveryCode()
-	switch code {
-	case "smtp_not_configured", "smtp_requires_tls", "smtp_dial_failed", "smtp_starttls_failed", "smtp_auth_failed", "smtp_from_rejected", "smtp_recipient_rejected", "smtp_data_failed", "smtp_write_failed", "smtp_close_failed", "rate_limited", "send_failed":
-		return code
+	if safeEmailRelayCode(code) {
+		return strings.TrimSpace(code)
+	}
+	return "send_failed"
+}
+
+func safeEmailRelayCode(code string) bool {
+	switch strings.TrimSpace(code) {
+	case "smtp_not_configured", "smtp_requires_tls", "smtp_dial_failed", "smtp_starttls_failed", "smtp_auth_failed", "smtp_from_rejected", "smtp_recipient_rejected", "smtp_data_failed", "smtp_write_failed", "smtp_close_failed", "rate_limited", "send_failed",
+		"missing_service_scope", "missing_service_token", "invalid_service_token", "service_token_not_registered", "service_type_not_allowed",
+		"service_registry_not_configured", "list_services_failed", "app_settings_failed", "secret_encryption_key_required":
+		return true
 	default:
-		return "send_failed"
+		return false
 	}
+}
+
+func SanitizeChannelDeliveryError(channel string, err error) string {
+	if err == nil {
+		return ""
+	}
+	if normalizedType(channel) == "email" {
+		return safeEmailRelayError(err)
+	}
+	return SanitizeDeliveryError(err)
 }
 
 func safeSMTPSendMail(ctx context.Context, channel store.NotificationChannel, auth smtp.Auth, msg []byte, allowPrivate bool) error {
@@ -447,17 +492,83 @@ func safeSMTPDialContext(ctx context.Context, host string, port int, allowPrivat
 
 func formatEmailMessage(eventType string, incident store.Incident, from string, to []string) string {
 	subject := formatEmailSubjectHeader(formatEmailSubject(eventType, incident))
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	plainHeader := textproto.MIMEHeader{}
+	plainHeader.Set("Content-Type", `text/plain; charset="UTF-8"`)
+	plainHeader.Set("Content-Transfer-Encoding", "quoted-printable")
+	plainPart, plainErr := writer.CreatePart(plainHeader)
+	if plainErr == nil {
+		plainWriter := quotedprintable.NewWriter(plainPart)
+		_, plainErr = plainWriter.Write([]byte(formatIncidentEmailText(eventType, incident)))
+		if closeErr := plainWriter.Close(); plainErr == nil {
+			plainErr = closeErr
+		}
+	}
+	htmlHeader := textproto.MIMEHeader{}
+	htmlHeader.Set("Content-Type", `text/html; charset="UTF-8"`)
+	htmlHeader.Set("Content-Transfer-Encoding", "quoted-printable")
+	htmlPart, htmlErr := writer.CreatePart(htmlHeader)
+	if htmlErr == nil {
+		htmlWriter := quotedprintable.NewWriter(htmlPart)
+		_, htmlErr = htmlWriter.Write([]byte(formatIncidentHTML(eventType, incident)))
+		if closeErr := htmlWriter.Close(); htmlErr == nil {
+			htmlErr = closeErr
+		}
+	}
+	closeErr := writer.Close()
+	if plainErr != nil || htmlErr != nil || closeErr != nil {
+		return formatPlainEmailMessage(subject, from, to, formatIncidentEmailText(eventType, incident))
+	}
 	headers := []string{
-		"From: " + from,
-		"To: " + strings.Join(to, ", "),
+		"From: " + formatEmailAddressHeader(from),
+		"To: " + formatEmailAddressListHeader(to),
+		"Subject: " + subject,
+		"MIME-Version: 1.0",
+		fmt.Sprintf(`Content-Type: multipart/alternative; boundary=%q`, writer.Boundary()),
+	}
+	return strings.Join(headers, "\r\n") + "\r\n\r\n" + body.String()
+}
+
+func formatPlainEmailMessage(subject, from string, to []string, text string) string {
+	headers := []string{
+		"From: " + formatEmailAddressHeader(from),
+		"To: " + formatEmailAddressListHeader(to),
 		"Subject: " + subject,
 		"MIME-Version: 1.0",
 		"Content-Type: text/plain; charset=UTF-8",
+		"Content-Transfer-Encoding: 8bit",
 	}
-	return strings.Join(headers, "\r\n") + "\r\n\r\n" + formatIncidentText(eventType, incident)
+	return strings.Join(headers, "\r\n") + "\r\n\r\n" + text
+}
+
+func formatEmailAddressHeader(value string) string {
+	value = sanitizeEmailHeaderValue(value)
+	if address, err := mail.ParseAddress(value); err == nil && strings.TrimSpace(address.Address) != "" {
+		return address.String()
+	}
+	return value
+}
+
+func formatEmailAddressListHeader(values []string) string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = formatEmailAddressHeader(value); value != "" {
+			out = append(out, value)
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
+func sanitizeEmailHeaderValue(value string) string {
+	value = strings.ReplaceAll(value, "\r", "")
+	value = strings.ReplaceAll(value, "\n", "")
+	value = strings.ReplaceAll(value, "\x00", "")
+	return strings.TrimSpace(value)
 }
 
 func formatEmailSubjectHeader(subject string) string {
+	subject = sanitizeEmailHeaderValue(subject)
 	for index, value := range subject {
 		if value > 127 {
 			return subject[:index] + mime.QEncoding.Encode("UTF-8", subject[index:])
@@ -477,7 +588,7 @@ func formatEmailSubject(eventType string, incident store.Incident) string {
 	if title != "" && title != strings.TrimSpace(incident.Rule) {
 		subject += " | " + title
 	}
-	return strings.Join(strings.Fields(strings.ReplaceAll(strings.ReplaceAll(subject, "\r", " "), "\n", " ")), " ")
+	return truncateNotificationText(strings.Join(strings.Fields(strings.ReplaceAll(strings.ReplaceAll(subject, "\r", " "), "\n", " ")), " "), 200)
 }
 
 func hasDirectSMTPConfiguration(channel store.NotificationChannel) bool {
@@ -556,6 +667,141 @@ func formatIncidentText(eventType string, incident store.Incident) string {
 	return strings.Join(parts, "\n")
 }
 
+func formatIncidentEmailText(eventType string, incident store.Incident) string {
+	return truncateEmailBytes(formatIncidentText(eventType, incident), maxNotificationEmailTextBytes)
+}
+
+func formatIncidentHTML(eventType string, incident store.Incident) string {
+	title := truncateNotificationText(notificationTitle(eventType, incident), 256)
+	summary := truncateNotificationText(notificationDescription(eventType, incident), 12000)
+	if summary == "" {
+		summary = "詳細情報はありません。"
+	}
+
+	var rows strings.Builder
+	for _, field := range emailNotificationFields(eventType, incident) {
+		rows.WriteString(`<tr><th scope="row" style="padding:10px 12px;text-align:left;vertical-align:top;width:34%;border-bottom:1px solid #e4e7ec;color:#475467;font-size:13px;font-weight:600;">`)
+		rows.WriteString(html.EscapeString(field.Name))
+		rows.WriteString(`</th><td style="padding:10px 12px;vertical-align:top;border-bottom:1px solid #e4e7ec;color:#101828;font-size:14px;word-break:break-word;">`)
+		rows.WriteString(formatEmailHTMLText(truncateNotificationText(field.Value, 2048)))
+		rows.WriteString(`</td></tr>`)
+	}
+
+	return `<!doctype html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>` +
+		`<body style="margin:0;padding:0;background:#f2f4f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#101828;">` +
+		`<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f2f4f7;"><tr><td align="center" style="padding:24px 12px;">` +
+		`<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#ffffff;border:1px solid #e4e7ec;border-radius:12px;overflow:hidden;">` +
+		`<tr><td style="height:6px;background:` + notificationEmailAccent(incident.Severity) + `;font-size:0;line-height:0;">&nbsp;</td></tr>` +
+		`<tr><td style="padding:22px 24px 14px;"><div style="color:#667085;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;">AutoStream Notification</div>` +
+		`<h1 style="margin:8px 0 0;font-size:22px;line-height:1.35;color:#101828;">` + html.EscapeString(title) + `</h1></td></tr>` +
+		`<tr><td style="padding:0 24px 18px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e4e7ec;border-radius:8px;border-collapse:separate;border-spacing:0;overflow:hidden;">` + rows.String() + `</table></td></tr>` +
+		`<tr><td style="padding:0 24px 24px;"><div style="margin-bottom:8px;color:#475467;font-size:13px;font-weight:700;">概要</div>` +
+		`<div style="padding:14px 16px;background:#f9fafb;border-radius:8px;color:#344054;font-size:14px;line-height:1.65;word-break:break-word;">` + formatEmailHTMLText(summary) + `</div></td></tr>` +
+		`<tr><td style="padding:14px 24px;background:#f9fafb;border-top:1px solid #e4e7ec;color:#667085;font-size:12px;">AutoStream Control Panel から送信された通知です。</td></tr>` +
+		`</table></td></tr></table></body></html>`
+}
+
+func emailNotificationFields(eventType string, incident store.Incident) []notificationMessageField {
+	eventType = normalizedEventType(eventType)
+	eventValue := notificationEventLabel(eventType) + " (" + eventType + ")"
+	actionCode := strings.TrimSpace(incident.Rule)
+	actionValue := actionCode
+	if actionCode != "" && eventType == "admin.audit" {
+		actionValue = NotificationActionLabel(actionCode) + " (" + actionCode + ")"
+	}
+	if actionValue == "" {
+		actionValue = "—"
+	}
+	description := notificationDescription(eventType, incident)
+	resource := notificationContextValue(description, "対象", "resource")
+	if resource == "" {
+		switch {
+		case strings.TrimSpace(incident.StreamID) != "":
+			resource = "配信枠: " + strings.TrimSpace(incident.StreamID)
+		case strings.TrimSpace(incident.ServiceID) != "":
+			resource = "サービス: " + strings.TrimSpace(incident.ServiceID)
+		case strings.TrimSpace(incident.ID) != "":
+			resource = "インシデント: " + strings.TrimSpace(incident.ID)
+		default:
+			resource = "—"
+		}
+	}
+	actor := notificationContextValue(description, "実行者", "actor")
+	if actor == "" {
+		actor = "—"
+	}
+	timestamp := notificationTimestamp(incident)
+	if timestamp == "" {
+		timestamp = "—"
+	}
+	return []notificationMessageField{
+		{Name: "イベント", Value: eventValue},
+		{Name: "操作 / ルール", Value: actionValue},
+		{Name: "対象", Value: resource},
+		{Name: "実行者", Value: actor},
+		{Name: "結果", Value: notificationStatusLabel(incident.Status)},
+		{Name: "重要度", Value: notificationSeverityLabel(incident.Severity)},
+		{Name: "日時", Value: timestamp},
+	}
+}
+
+func notificationContextValue(summary string, keys ...string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(summary, "\r\n", "\n"), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		for _, key := range keys {
+			if strings.EqualFold(strings.TrimSpace(parts[0]), key) {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return ""
+}
+
+func formatEmailHTMLText(value string) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	return strings.ReplaceAll(html.EscapeString(value), "\n", "<br>")
+}
+
+func notificationEmailAccent(severity string) string {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "critical", "error":
+		return "#d92d20"
+	case "warning":
+		return "#f79009"
+	case "info":
+		return "#1570ef"
+	default:
+		return "#667085"
+	}
+}
+
+func truncateEmailBytes(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	suffix := "…"
+	limit := maxBytes - len(suffix)
+	if limit <= 0 {
+		return suffix[:maxBytes]
+	}
+	used := 0
+	for _, value := range value {
+		size := utf8.RuneLen(value)
+		if size < 1 || used+size > limit {
+			break
+		}
+		used += size
+	}
+	return strings.TrimSpace(value[:used]) + suffix
+}
+
 type notificationMessageField struct {
 	Name  string
 	Value string
@@ -585,9 +831,13 @@ func NotificationActionLabel(action string) string {
 		"auth.email.confirm":                    "メールアドレス変更を確認",
 		"auth.login":                            "管理画面へログイン",
 		"auth.logout":                           "管理画面からログアウト",
+		"auth.avatar.update":                    "プロフィール画像を更新",
+		"auth.avatar.delete":                    "プロフィール画像を削除",
 		"auth.oauth.login":                      "OAuthでログイン",
 		"auth.oauth.provision_user":             "OAuthユーザーを作成",
 		"auth.oauth.start":                      "OAuthログインを開始",
+		"auth.passkey.login.start":              "Passkeyログインを開始",
+		"auth.passkey.login.finish":             "Passkeyでログイン",
 		"auth.oauth_link.create":                "OAuth連携を作成",
 		"auth.oauth_link.delete":                "OAuth連携を解除",
 		"discord_configs.create":                "Discord BOT設定を作成",
@@ -635,6 +885,7 @@ func NotificationActionLabel(action string) string {
 		"overlay_profiles.update":               "Overlayプロファイルを更新",
 		"passkeys.delete":                       "Passkeyを削除",
 		"passkeys.registration.start":           "Passkey登録を開始",
+		"passkeys.registration.finish":          "Passkey登録を完了",
 		"remediation.approve":                   "復旧操作を承認",
 		"remediation.execute":                   "復旧操作を実行",
 		"roles.create":                          "ロールを作成",
@@ -648,6 +899,15 @@ func NotificationActionLabel(action string) string {
 		"services.runtime_config.preview":       "Node実行設定をプレビュー",
 		"services.unassign":                     "Nodeの割り当てを解除",
 		"setup.first_admin":                     "初期管理者を作成",
+		"system_updates.create":                 "システム更新を依頼",
+		"system_updates.request":                "システム更新を依頼",
+		"system_updates.cancel":                 "システム更新をキャンセル",
+		"system_updates.claim":                  "システム更新ジョブを取得",
+		"system_updates.authorize":              "システム更新の実行を承認",
+		"system_updates.report":                 "システム更新の進捗を報告",
+		"system_updates.succeeded":              "システム更新に成功",
+		"system_updates.rolled_back":            "システム更新をロールバック",
+		"system_updates.failed":                 "システム更新に失敗",
 		"streams.create":                        "配信枠を作成",
 		"streams.discord_youtube_notify":        "DiscordへYouTube配信を通知",
 		"streams.mark_failed":                   "配信を失敗状態に変更",

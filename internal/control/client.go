@@ -21,6 +21,9 @@ import (
 const (
 	ServiceType                    = "observability"
 	dockerComposeObservabilityHost = "observability"
+	notificationEmailRelayTimeout  = 25 * time.Second
+	maxNotificationEmailTextBytes  = 16 * 1024
+	maxNotificationEmailHTMLBytes  = 64 * 1024
 )
 
 type Client struct {
@@ -46,6 +49,7 @@ type NotificationEmailRequest struct {
 	Recipients []string `json:"recipients"`
 	Subject    string   `json:"subject"`
 	Text       string   `json:"text"`
+	HTML       string   `json:"html,omitempty"`
 }
 
 type NotificationEmailError struct {
@@ -156,6 +160,10 @@ func (c Client) ExecuteRemediation(ctx context.Context, req RemediationRequest) 
 }
 
 func (c Client) SendNotificationEmail(ctx context.Context, recipients []string, subject, text string) error {
+	return c.SendNotificationEmailHTML(ctx, recipients, subject, text, "")
+}
+
+func (c Client) SendNotificationEmailHTML(ctx context.Context, recipients []string, subject, text, html string) error {
 	if strings.TrimSpace(c.ConfigError) != "" {
 		return errors.New(c.ConfigError)
 	}
@@ -170,13 +178,17 @@ func (c Client) SendNotificationEmail(ctx context.Context, recipients []string, 
 		}
 		cleanRecipients = append(cleanRecipients, recipient)
 	}
-	if len(cleanRecipients) == 0 || strings.TrimSpace(subject) == "" || strings.ContainsAny(subject, "\r\n") || strings.TrimSpace(text) == "" {
+	if len(cleanRecipients) == 0 || strings.TrimSpace(subject) == "" || strings.ContainsAny(subject, "\r\n\x00") || strings.TrimSpace(text) == "" || strings.ContainsRune(text, '\x00') || len(text) > maxNotificationEmailTextBytes {
+		return errors.New("notification email payload is invalid")
+	}
+	if strings.ContainsRune(html, '\x00') || len(html) > maxNotificationEmailHTMLBytes {
 		return errors.New("notification email payload is invalid")
 	}
 	request := NotificationEmailRequest{
 		Recipients: cleanRecipients,
 		Subject:    strings.TrimSpace(subject),
 		Text:       text,
+		HTML:       html,
 	}
 	if err := validateHTTPURL(c.BaseURL, "CONTROL_PANEL_URL"); err != nil {
 		return NotificationEmailError{Code: "send_failed"}
@@ -193,7 +205,11 @@ func (c Client) SendNotificationEmail(ctx context.Context, recipients []string, 
 	httpReq.Header.Set("Authorization", "Bearer "+c.Token)
 	httpClient := c.HTTP
 	if httpClient == nil {
-		httpClient = noRedirectClient(5 * time.Second)
+		httpClient = noRedirectClient(notificationEmailRelayTimeout)
+	} else if httpClient.Timeout > 0 && httpClient.Timeout < notificationEmailRelayTimeout {
+		clonedClient := *httpClient
+		clonedClient.Timeout = notificationEmailRelayTimeout
+		httpClient = &clonedClient
 	}
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -215,7 +231,9 @@ func (c Client) SendNotificationEmail(ctx context.Context, recipients []string, 
 
 func safeNotificationEmailCode(code string) bool {
 	switch strings.TrimSpace(code) {
-	case "smtp_not_configured", "smtp_requires_tls", "smtp_dial_failed", "smtp_starttls_failed", "smtp_auth_failed", "smtp_from_rejected", "smtp_recipient_rejected", "smtp_data_failed", "smtp_write_failed", "smtp_close_failed", "rate_limited", "send_failed":
+	case "smtp_not_configured", "smtp_requires_tls", "smtp_dial_failed", "smtp_starttls_failed", "smtp_auth_failed", "smtp_from_rejected", "smtp_recipient_rejected", "smtp_data_failed", "smtp_write_failed", "smtp_close_failed", "rate_limited", "send_failed",
+		"missing_service_scope", "missing_service_token", "invalid_service_token", "service_token_not_registered", "service_type_not_allowed",
+		"service_registry_not_configured", "list_services_failed", "app_settings_failed", "secret_encryption_key_required":
 		return true
 	default:
 		return false

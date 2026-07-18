@@ -1,0 +1,54 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+readonly DEFAULTS_FILE=/etc/autostream/mariadb-backup.cnf
+readonly BACKUP_DIR=/var/backups/autostream/observability
+readonly DATABASE=autostream_observability
+
+fail() {
+  printf 'autostream-backup-observability: %s\n' "$*" >&2
+  exit 1
+}
+
+require_private_root_file() {
+  local path="$1" owner mode
+  [[ -f "$path" && ! -L "$path" ]] || fail "$path must be a regular non-symlink file"
+  owner="$(/usr/bin/stat -c '%u' -- "$path")"
+  mode="$(/usr/bin/stat -c '%a' -- "$path")"
+  [[ "$owner" == 0 ]] || fail "$path must be owned by root"
+  (( (8#$mode & 077) == 0 )) || fail "$path must not be accessible by group or other users"
+}
+
+require_private_root_dir() {
+  local path="$1" owner mode
+  [[ -d "$path" && ! -L "$path" ]] || fail "$path must be a non-symlink directory"
+  owner="$(/usr/bin/stat -c '%u' -- "$path")"
+  mode="$(/usr/bin/stat -c '%a' -- "$path")"
+  [[ "$owner" == 0 ]] || fail "$path must be owned by root"
+  (( (8#$mode & 022) == 0 )) || fail "$path must not be writable by group or other users"
+}
+
+[[ -x /usr/bin/mariadb-dump ]] || fail "/usr/bin/mariadb-dump is unavailable"
+require_private_root_file "$DEFAULTS_FILE"
+require_private_root_dir "$BACKUP_DIR"
+
+timestamp="$(/usr/bin/date -u +%Y%m%dT%H%M%SZ)"
+tmp="$(/usr/bin/mktemp --tmpdir="$BACKUP_DIR" ".${DATABASE}-${timestamp}.XXXXXX.part")"
+final="$BACKUP_DIR/${DATABASE}-${timestamp}-$$.sql"
+trap '/usr/bin/rm -f -- "$tmp"' EXIT
+
+/usr/bin/mariadb-dump \
+  --defaults-extra-file="$DEFAULTS_FILE" \
+  --single-transaction \
+  --quick \
+  --skip-lock-tables \
+  --triggers \
+  --hex-blob \
+  --databases "$DATABASE" >"$tmp"
+
+[[ -s "$tmp" ]] || fail "mariadb-dump produced an empty backup"
+/usr/bin/chmod 0600 "$tmp"
+/usr/bin/mv -- "$tmp" "$final"
+trap - EXIT
+printf '%s\n' "$final"

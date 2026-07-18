@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1622,6 +1623,10 @@ func TestGlobalSMTPNotificationChannelTestUsesRelay(t *testing.T) {
 	if testRes.Code != http.StatusAccepted || relay.calls != 1 || !strings.Contains(testRes.Body.String(), `"status":"success"`) {
 		t.Fatalf("global relay test failed: calls=%d status=%d body=%s", relay.calls, testRes.Code, testRes.Body.String())
 	}
+	deliveries, err := st.ListNotificationDeliveries(t.Context())
+	if err != nil || len(deliveries) != 1 || deliveries[0].Status != "success" || deliveries[0].Channel != "email" {
+		t.Fatalf("successful channel test was not saved to delivery history: deliveries=%#v err=%v", deliveries, err)
+	}
 }
 
 func TestGlobalSMTPNotificationChannelTestReturnsSafeFailureCodes(t *testing.T) {
@@ -1643,6 +1648,10 @@ func TestGlobalSMTPNotificationChannelTestReturnsSafeFailureCodes(t *testing.T) 
 			body := testRes.Body.String()
 			if testRes.Code != http.StatusAccepted || relay.calls != 1 || !strings.Contains(body, `"status":"failure"`) || !strings.Contains(body, `"error":"`+code+`"`) || strings.Contains(body, "ops@example.com") {
 				t.Fatalf("unexpected safe global relay failure: calls=%d status=%d body=%s", relay.calls, testRes.Code, body)
+			}
+			deliveries, err := st.ListNotificationDeliveries(t.Context())
+			if err != nil || len(deliveries) != 1 || deliveries[0].Status != "failure" || deliveries[0].Error != code || deliveries[0].Channel != "email" {
+				t.Fatalf("failed channel test was not safely saved to delivery history: deliveries=%#v err=%v", deliveries, err)
 			}
 		})
 	}
@@ -1716,6 +1725,73 @@ func TestNotificationDeliveryHistoryDoesNotExposeWebhookErrorSecrets(t *testing.
 	}
 	if !strings.Contains(body, "notification webhook delivery failed") {
 		t.Fatalf("expected sanitized delivery error: %s", body)
+	}
+}
+
+func TestDeliverNotificationEventOutlivesRequestCancellationWithinBoundedDeadline(t *testing.T) {
+	st := store.NewMemoryStore()
+	notifier := &eventRecordingNotifier{}
+	server := &Server{serviceType: "observability", store: st, notifier: notifier}
+	requestContext, cancelRequest := context.WithCancel(context.Background())
+	cancelRequest()
+	request := httptest.NewRequest(http.MethodPost, "/signals", nil).WithContext(requestContext)
+
+	results := server.deliverNotificationEvent(request, "incident.opened", store.Incident{ID: "inc-detached", Rule: "encoder_down", Severity: "critical", Status: "open", SummaryJA: "Encoder stopped."})
+	if len(results) != 1 || results[0].Status != "success" || len(notifier.events) != 1 {
+		t.Fatalf("request cancellation stopped notification delivery: results=%#v events=%#v", results, notifier.events)
+	}
+	if !notifier.hasDeadline {
+		t.Fatal("detached notification delivery has no bounded deadline")
+	}
+	remaining := time.Until(notifier.deadline)
+	if remaining <= 0 || remaining > notificationFanoutTimeout {
+		t.Fatalf("unexpected detached delivery deadline: remaining=%s", remaining)
+	}
+	deliveries, err := st.ListNotificationDeliveries(t.Context())
+	if err != nil || len(deliveries) != 1 || deliveries[0].IncidentID != "inc-detached" {
+		t.Fatalf("detached delivery history was not saved: deliveries=%#v err=%v", deliveries, err)
+	}
+}
+
+func TestSaveNotificationDeliveryResultsLogsSafeFailureAndContinues(t *testing.T) {
+	const (
+		targetSecret   = "https://discord.com/api/webhooks/id/target-secret"
+		bodySecret     = "notification body contains body-secret"
+		databaseSecret = "database connection failed with db-secret"
+	)
+	st := &failingNotificationDeliveryStore{
+		Store: store.NewMemoryStore(),
+		err:   errors.New(databaseSecret),
+	}
+	var output bytes.Buffer
+	server := &Server{store: st, logger: log.New(&output, "", 0)}
+
+	server.saveNotificationDeliveryResults(t.Context(), "incident.opened", store.Incident{
+		ID:        "incident-secret-id",
+		Rule:      "encoder_down",
+		Severity:  "critical",
+		SummaryJA: bodySecret,
+	}, []notifications.DeliveryResult{
+		{EventType: "admin.audit", Channel: "email", Target: targetSecret, Status: "success", Error: "smtp_auth_failed"},
+		{Channel: "discord", Target: "https://example.com/second-target-secret", Status: "success"},
+	})
+
+	if st.attempts != 2 {
+		t.Fatalf("notification delivery save attempts = %d, want 2", st.attempts)
+	}
+	logged := output.String()
+	for _, want := range []string{
+		`event_type="admin.audit" channel="email" status="failure"`,
+		`event_type="incident.opened" channel="discord" status="success"`,
+	} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("safe save failure log missing %q: %s", want, logged)
+		}
+	}
+	for _, forbidden := range []string{targetSecret, "second-target-secret", bodySecret, databaseSecret, "smtp_auth_failed", "incident-secret-id"} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("notification delivery save failure log leaked %q: %s", forbidden, logged)
+		}
 	}
 }
 
@@ -2166,6 +2242,17 @@ func newTestServer(st store.Store) http.Handler {
 	return NewServerWithStoreAndAuth("observability", st, auth.NewVerifierFromRawTokens("service-token"))
 }
 
+type failingNotificationDeliveryStore struct {
+	store.Store
+	err      error
+	attempts int
+}
+
+func (s *failingNotificationDeliveryStore) SaveNotificationDelivery(context.Context, store.NotificationDelivery) (store.NotificationDelivery, error) {
+	s.attempts++
+	return store.NotificationDelivery{}, s.err
+}
+
 type fakeRateLimitStore struct {
 	*store.MemoryStore
 	allowed bool
@@ -2214,8 +2301,10 @@ func (n *fakeNotifier) NotifyIncidentOpened(ctx context.Context, incident store.
 }
 
 type eventRecordingNotifier struct {
-	events    []string
-	incidents []store.Incident
+	events      []string
+	incidents   []store.Incident
+	deadline    time.Time
+	hasDeadline bool
 }
 
 func (n *eventRecordingNotifier) NotifyIncidentOpened(ctx context.Context, incident store.Incident) ([]notifications.DeliveryResult, error) {
@@ -2226,6 +2315,7 @@ func (n *eventRecordingNotifier) NotifyIncidentEvent(ctx context.Context, eventT
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	n.deadline, n.hasDeadline = ctx.Deadline()
 	n.events = append(n.events, eventType)
 	n.incidents = append(n.incidents, incident)
 	return []notifications.DeliveryResult{{EventType: eventType, Channel: "slack", Target: "https://hooks.slack.com/<WEBHOOK_PATH>", Status: "success"}}, nil
