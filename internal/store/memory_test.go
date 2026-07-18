@@ -102,6 +102,58 @@ func TestMemoryStoreNotificationDelivery(t *testing.T) {
 	}
 }
 
+func TestMemoryStorePreservesValidatedAdminAuditActionIdentifiers(t *testing.T) {
+	s := NewMemoryStore()
+	delivery, err := s.SaveNotificationDelivery(t.Context(), NotificationDelivery{
+		EventType: "admin.audit",
+		Channel:   "discord",
+		Status:    "success",
+		Metadata: map[string]any{
+			"action":  "secrets.update",
+			"rule":    "secrets.update",
+			"summary": "シークレットを更新\n実行者: ops",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivery.Metadata["action"] != "secrets.update" || delivery.Metadata["rule"] != "secrets.update" {
+		t.Fatalf("validated admin audit action was redacted: %#v", delivery.Metadata)
+	}
+	if delivery.Metadata["summary"] != "シークレットを更新\n実行者: ops" {
+		t.Fatalf("safe admin audit summary was redacted: %#v", delivery.Metadata)
+	}
+
+	unsafe, err := s.SaveNotificationDelivery(t.Context(), NotificationDelivery{
+		EventType: "admin.audit",
+		Channel:   "discord",
+		Status:    "success",
+		Metadata: map[string]any{
+			"action":  "raw.secret.token",
+			"rule":    "secrets.ast_svc_raw_token",
+			"summary": "<redacted> / opaque-value-that-must-not-survive",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unsafe.Metadata["action"] != "<redacted>" || unsafe.Metadata["rule"] != "<redacted>" {
+		t.Fatalf("invalid secret-like action identifier was retained: %#v", unsafe.Metadata)
+	}
+	if unsafe.Metadata["summary"] != "<redacted>" {
+		t.Fatalf("compound redaction marker bypassed secret filtering: %#v", unsafe.Metadata)
+	}
+	unsafeBody, err := json.Marshal(unsafe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{"raw.secret.token", "ast_svc_raw_token", "opaque-value-that-must-not-survive"} {
+		if strings.Contains(string(unsafeBody), raw) {
+			t.Fatalf("secret-like admin audit metadata was retained: %s", unsafeBody)
+		}
+	}
+}
+
 func TestMemoryStoreMasksNotificationChannelWebhookPath(t *testing.T) {
 	s := NewMemoryStore()
 	channel, err := s.CreateNotificationChannel(t.Context(), NotificationChannel{

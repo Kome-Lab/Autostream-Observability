@@ -807,6 +807,19 @@ func TestCreateNotificationEventAcceptsExactControlPanelPayload(t *testing.T) {
 	if len(notifier.events) != 1 || notifier.events[0] != "admin.audit" {
 		t.Fatalf("unexpected event notifier calls: %#v", notifier.events)
 	}
+	if len(notifier.incidents) != 1 {
+		t.Fatalf("notification incident was not recorded: %#v", notifier.incidents)
+	}
+	notificationIncident := notifier.incidents[0]
+	if notificationIncident.SummaryJA != "OAuth接続アカウントを更新\n対象: OAuth接続アカウント (acct-01)\n実行者: ops\n詳細: OAuth connected account updated" {
+		t.Fatalf("admin audit summary is not readable: %q", notificationIncident.SummaryJA)
+	}
+	if notificationIncident.SourceSummary != "OAuth connected account updated / oauth_account acct-01 / actor=ops" {
+		t.Fatalf("admin audit source summary was not preserved: %q", notificationIncident.SourceSummary)
+	}
+	if notificationIncident.UpdatedAt.Format(time.RFC3339) != "2026-07-18T01:32:00Z" {
+		t.Fatalf("admin audit occurrence timestamp was lost: %s", notificationIncident.UpdatedAt)
+	}
 	deliveries, err := st.ListNotificationDeliveries(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -818,11 +831,72 @@ func TestCreateNotificationEventAcceptsExactControlPanelPayload(t *testing.T) {
 	if delivery.EventType != "admin.audit" || delivery.IncidentID != "" || delivery.Status != "success" {
 		t.Fatalf("unexpected saved delivery: %#v", delivery)
 	}
-	if delivery.Metadata["severity"] != "info" || delivery.Metadata["rule"] != "oauth_accounts.update" {
+	if delivery.Metadata["severity"] != "info" || delivery.Metadata["action"] != "oauth_accounts.update" || delivery.Metadata["rule"] != "oauth_accounts.update" || delivery.Metadata["summary"] != notificationIncident.SummaryJA || delivery.Metadata["occurred_at"] != "2026-07-18T01:32:00Z" {
 		t.Fatalf("unexpected delivery metadata: %#v", delivery.Metadata)
 	}
 	if strings.Contains(res.Body.String(), "acct-01") || strings.Contains(res.Body.String(), "ops") {
 		t.Fatalf("notification event response should only include sanitized delivery results: %s", res.Body.String())
+	}
+}
+
+func TestNotificationIncidentPreservesSafeResourceTypeAndValidatesTimestamp(t *testing.T) {
+	for _, timestamp := range []string{"2026-07-18T10:32:00+09:00", "2026-07-18T01:32:00.123Z"} {
+		incident, err := notificationIncidentFromRequest(notificationEventRequest{
+			EventType:    "admin.audit",
+			Severity:     "warning",
+			Status:       "success",
+			Action:       "secrets.update",
+			ResourceType: "secret",
+			ResourceID:   "DISCORD_BOT_TOKEN",
+			Timestamp:    timestamp,
+		}, "observability")
+		if err != nil {
+			t.Fatalf("valid timestamp %q was rejected: %v", timestamp, err)
+		}
+		if !strings.Contains(incident.SummaryJA, "対象: シークレット") {
+			t.Fatalf("safe secret resource type was removed: %q", incident.SummaryJA)
+		}
+		if incident.UpdatedAt.IsZero() {
+			t.Fatalf("valid timestamp %q was lost", timestamp)
+		}
+	}
+	legacySecretSummary := "管理イベント: secrets.update / success"
+	incident, err := notificationIncidentFromRequest(notificationEventRequest{
+		EventType: "admin.audit",
+		Status:    "success",
+		Action:    "secrets.update",
+		Summary:   legacySecretSummary,
+	}, "observability")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incident.SourceSummary != legacySecretSummary {
+		t.Fatalf("validated legacy admin summary was not preserved: %q", incident.SourceSummary)
+	}
+
+	if _, err := notificationIncidentFromRequest(notificationEventRequest{
+		EventType: "admin.audit",
+		Status:    "success",
+		Action:    "streams.start",
+		Timestamp: "18 July 2026 10:32 JST",
+	}, "observability"); err == nil {
+		t.Fatal("invalid notification timestamp was accepted")
+	}
+}
+
+func TestCreateNotificationEventRejectsInvalidTimestamp(t *testing.T) {
+	st := store.NewMemoryStore()
+	notifier := &eventRecordingNotifier{}
+	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), notifier, nil)
+	req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(`{"event_type":"admin.audit","severity":"info","status":"success","action":"streams.start","timestamp":"not-rfc3339"}`))
+	req.Header.Set("Authorization", "Bearer admin-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "invalid_notification_event") {
+		t.Fatalf("invalid timestamp status = %d body = %s", res.Code, res.Body.String())
+	}
+	if len(notifier.events) != 0 {
+		t.Fatalf("invalid timestamp must not send a notification: %#v", notifier.events)
 	}
 }
 
@@ -1645,6 +1719,35 @@ func TestNotificationDeliveryHistoryDoesNotExposeWebhookErrorSecrets(t *testing.
 	}
 }
 
+func TestNotificationDeliveryHistoryRedactsSecretsAfterSafeMarkers(t *testing.T) {
+	st := store.NewMemoryStore()
+	if _, err := st.SaveNotificationDelivery(t.Context(), store.NotificationDelivery{
+		EventType: "admin.audit",
+		Channel:   "discord",
+		Status:    "success",
+		Metadata: map[string]any{
+			"action":  "raw.secret.token",
+			"rule":    "secrets.ast_svc_raw_token",
+			"summary": "<redacted> / opaque-value-that-must-not-survive",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServerWithStoreAuthAndNotifier("observability", st, auth.NewVerifierFromRawTokens("service-token"), &eventRecordingNotifier{})
+	req := httptest.NewRequest(http.MethodGet, "/notification-deliveries", nil)
+	req.Header.Set("Authorization", "Bearer service-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("list status = %d body = %s", res.Code, res.Body.String())
+	}
+	for _, raw := range []string{"raw.secret.token", "ast_svc_raw_token", "opaque-value-that-must-not-survive"} {
+		if strings.Contains(res.Body.String(), raw) {
+			t.Fatalf("compound marker secret %q leaked in delivery history: %s", raw, res.Body.String())
+		}
+	}
+}
+
 func TestNotificationPartialFailureKeepsSuccessfulDeliveries(t *testing.T) {
 	st := store.NewMemoryStore()
 	handler := NewServerWithStoreAuthAndNotifier("observability", st, auth.NewVerifierFromRawTokens("service-token"), partialFailureNotifier{})
@@ -2111,7 +2214,8 @@ func (n *fakeNotifier) NotifyIncidentOpened(ctx context.Context, incident store.
 }
 
 type eventRecordingNotifier struct {
-	events []string
+	events    []string
+	incidents []store.Incident
 }
 
 func (n *eventRecordingNotifier) NotifyIncidentOpened(ctx context.Context, incident store.Incident) ([]notifications.DeliveryResult, error) {
@@ -2123,6 +2227,7 @@ func (n *eventRecordingNotifier) NotifyIncidentEvent(ctx context.Context, eventT
 		return nil, err
 	}
 	n.events = append(n.events, eventType)
+	n.incidents = append(n.incidents, incident)
 	return []notifications.DeliveryResult{{EventType: eventType, Channel: "slack", Target: "https://hooks.slack.com/<WEBHOOK_PATH>", Status: "success"}}, nil
 }
 

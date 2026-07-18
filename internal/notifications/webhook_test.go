@@ -34,9 +34,20 @@ func TestDiscordWebhookPayload(t *testing.T) {
 	if result.Status != "success" || strings.Contains(result.Target, "token") {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-	content, ok := got["content"].(string)
-	if !ok || !strings.Contains(content, "CRITICAL") || !strings.Contains(content, "enc-01") {
+	embeds, ok := got["embeds"].([]any)
+	if !ok || len(embeds) != 1 {
 		t.Fatalf("unexpected payload: %#v", got)
+	}
+	embed, ok := embeds[0].(map[string]any)
+	if !ok || embed["title"] != "インシデント発生: encoder_process_exited" || !strings.Contains(embed["description"].(string), "Encoder process stopped") {
+		t.Fatalf("Discord payload is missing its structured embed: %#v", got)
+	}
+	fields, ok := embed["fields"].([]any)
+	if !ok || len(fields) < 4 {
+		t.Fatalf("Discord embed is missing notification fields: %#v", embed)
+	}
+	if _, hasContent := got["content"]; hasContent {
+		t.Fatalf("Discord payload must use an embed instead of a plain content message: %#v", got)
 	}
 	allowedMentions, ok := got["allowed_mentions"].(map[string]any)
 	if !ok {
@@ -70,6 +81,124 @@ func TestSlackWebhookPayloadEscapesMentionsAndMarkup(t *testing.T) {
 	if strings.Contains(text, "<!channel>") || strings.Contains(text, "<@U123>") {
 		t.Fatalf("Slack payload retained active mention syntax: %#v", got)
 	}
+	blocks, ok := got["blocks"].([]any)
+	if !ok || len(blocks) < 3 {
+		t.Fatalf("Slack payload is missing Block Kit content: %#v", got)
+	}
+	header, ok := blocks[0].(map[string]any)
+	if !ok || header["type"] != "header" {
+		t.Fatalf("Slack payload is missing its structured header: %#v", got)
+	}
+}
+
+func TestAdminAuditNotificationUsesSpecificStructuredTitleAndContext(t *testing.T) {
+	occurredAt := time.Date(2026, 7, 18, 1, 32, 0, 0, time.UTC)
+	incident := store.Incident{
+		Rule:      "secrets.update",
+		Severity:  "warning",
+		Status:    "success",
+		SummaryJA: "シークレットを更新\n対象: secret\n実行者: ops",
+		ServiceID: "observability",
+		UpdatedAt: occurredAt,
+	}
+	payload := (WebhookNotifier{Type: "discord"}).payload("admin.audit", incident)
+	embeds, ok := payload["embeds"].([]map[string]any)
+	if !ok || len(embeds) != 1 {
+		t.Fatalf("admin audit Discord payload is missing an embed: %#v", payload)
+	}
+	embed := embeds[0]
+	if embed["title"] != "シークレットを更新" || embed["timestamp"] != occurredAt.Format(time.RFC3339) {
+		t.Fatalf("admin audit embed title or timestamp is unclear: %#v", embed)
+	}
+	description, _ := embed["description"].(string)
+	if !strings.Contains(description, "対象: secret") || !strings.Contains(description, "実行者: ops") {
+		t.Fatalf("admin audit embed lost its operation context: %#v", embed)
+	}
+	if subject := formatEmailSubject("admin.audit", incident); subject != "[AutoStream] WARNING secrets.update | シークレットを更新" {
+		t.Fatalf("admin audit email subject = %q", subject)
+	}
+	message := formatEmailMessage("admin.audit", incident, "autostream@example.jp", []string{"ops@example.jp"})
+	if !strings.Contains(message, "Subject: [AutoStream] WARNING secrets.update | =?UTF-8?") {
+		t.Fatalf("admin audit email subject lost its stable ASCII prefix or MIME encoding: %s", message)
+	}
+	text := formatIncidentText("admin.audit", incident)
+	for _, want := range []string{"シークレットを更新", "重要度: 警告", "結果: 成功", "操作コード: secrets.update", "対象: secret", "実行者: ops", occurredAt.Format(time.RFC3339)} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("structured admin audit text is missing %q: %s", want, text)
+		}
+	}
+}
+
+func TestNotificationActionLabelsCoverControlPanelAuditVocabulary(t *testing.T) {
+	actions := []string{
+		"api_tokens.create",
+		"app.settings.test_email",
+		"archive.artifact.share.create",
+		"auth.change_password",
+		"auth.oauth.provision_user",
+		"integrations.drive_destination.update",
+		"integrations.oauth_account.connect",
+		"integrations.oauth_provider.update",
+		"mfa.recovery_codes.regenerate",
+		"passkeys.registration.start",
+		"security.settings.update",
+		"services.runtime_config.preview",
+		"streams.discord_youtube_notify",
+		"streams.retry_upload",
+		"streams.worker_event_test",
+		"users.email_welcome",
+		"users.force_password_change",
+		"users.oauth_link.delete",
+		"workers.unassign",
+	}
+	for _, action := range actions {
+		if label := NotificationActionLabel(action); label == action || label == "" {
+			t.Fatalf("control-panel audit action %q has no readable label", action)
+		}
+	}
+}
+
+func TestDiscordEmbedStaysWithinTotalCharacterLimit(t *testing.T) {
+	incident := store.Incident{
+		Rule:      strings.Repeat("r", 5000),
+		Severity:  "critical",
+		Status:    "open",
+		SummaryJA: strings.Repeat("詳", 10000),
+		ServiceID: strings.Repeat("s", 5000),
+		StreamID:  strings.Repeat("t", 5000),
+	}
+	payload := (WebhookNotifier{Type: "discord"}).payload("incident.opened", incident)
+	embeds, ok := payload["embeds"].([]map[string]any)
+	if !ok || len(embeds) != 1 {
+		t.Fatalf("Discord payload is missing an embed: %#v", payload)
+	}
+	if total := discordEmbedCharacterCount(embeds[0]); total > 6000 {
+		t.Fatalf("Discord embed exceeds the 6000-character total limit: %d", total)
+	}
+}
+
+func discordEmbedCharacterCount(embed map[string]any) int {
+	total := 0
+	for _, key := range []string{"title", "description"} {
+		if value, ok := embed[key].(string); ok {
+			total += len([]rune(value))
+		}
+	}
+	if footer, ok := embed["footer"].(map[string]any); ok {
+		if value, ok := footer["text"].(string); ok {
+			total += len([]rune(value))
+		}
+	}
+	if fields, ok := embed["fields"].([]map[string]any); ok {
+		for _, field := range fields {
+			for _, key := range []string{"name", "value"} {
+				if value, ok := field[key].(string); ok {
+					total += len([]rune(value))
+				}
+			}
+		}
+	}
+	return total
 }
 
 func TestGenericWebhookPayload(t *testing.T) {
@@ -88,6 +217,27 @@ func TestGenericWebhookPayload(t *testing.T) {
 	}
 	if got["event_type"] != "incident.opened" || got["rule"] != "gdrive_upload_failed" || got["summary"] != "Google Drive upload failed. A&B <raw>" {
 		t.Fatalf("unexpected payload: %#v", got)
+	}
+}
+
+func TestGenericWebhookPreservesAdminAuditSummaryContract(t *testing.T) {
+	incident := store.Incident{
+		Rule:          "integrations.oauth_account.update",
+		Severity:      "info",
+		Status:        "success",
+		SummaryJA:     "OAuth接続アカウントを更新\n対象: OAuth接続アカウント (acct-01)\n実行者: ops",
+		SourceSummary: "管理イベント: integrations.oauth_account.update / success / oauth_account acct-01 / actor=ops",
+		ServiceID:     "observability",
+	}
+	payload := (WebhookNotifier{Type: "generic"}).payload("admin.audit", incident)
+	if payload["summary"] != incident.SourceSummary {
+		t.Fatalf("generic webhook source summary contract changed: %#v", payload)
+	}
+	if _, exists := payload["display_summary"]; exists {
+		t.Fatalf("generic webhook payload shape changed: %#v", payload)
+	}
+	if len(payload) != 8 {
+		t.Fatalf("generic webhook field set changed: %#v", payload)
 	}
 }
 
@@ -644,7 +794,7 @@ func TestEmailNotifierUsesGlobalSMTPRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if relay.attempts != 1 || len(relay.recipients) != 1 || relay.recipients[0] != "ops@example.com" || relay.subject != "[AutoStream] CRITICAL encoder_down" || !strings.Contains(relay.text, "Encoder process stopped.") {
+	if relay.attempts != 1 || len(relay.recipients) != 1 || relay.recipients[0] != "ops@example.com" || relay.subject != "[AutoStream] CRITICAL encoder_down | インシデント発生: encoder_down" || !strings.Contains(relay.text, "Encoder process stopped.") {
 		t.Fatalf("unexpected global email relay call: %#v", relay)
 	}
 	if len(results) != 1 || results[0].Status != "success" || results[0].Target != "o***s@<EMAIL_DOMAIN>" {

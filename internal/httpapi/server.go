@@ -41,6 +41,7 @@ var standaloneSecretPatterns = []*regexp.Regexp{
 }
 
 var notificationActionPattern = regexp.MustCompile(`^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*$`)
+var notificationResourceTypePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 type Server struct {
 	serviceType string
@@ -610,34 +611,66 @@ func notificationIncidentFromRequest(body notificationEventRequest, fallbackServ
 	if !validNotificationAction(action) {
 		return store.Incident{}, errors.New("action is required")
 	}
-	resourceType := safeNotificationField(body.ResourceType, 80)
+	resourceType := safeNotificationResourceType(body.ResourceType)
 	resourceID := safeNotificationField(body.ResourceID, 160)
 	actor := safeNotificationField(body.ActorUsername, 80)
 	status := safeNotificationStatus(body.Status)
 	severity := safeNotificationSeverity(body.Severity)
-	summary := safeNotificationField(body.Summary, 240)
-	if summary == "" {
-		summary = "管理イベント: " + action + " / " + status
+	callerSummary := safeNotificationField(body.Summary, 240)
+	sourceSummary := callerSummary
+	legacySummary := "管理イベント: " + action + " / " + status
+	if sourceSummary == "" {
+		sourceSummary = legacySummary
 	}
-	if resourceType != "" {
-		summary += " / " + resourceType
+	legacyResourceType := safeNotificationField(body.ResourceType, 80)
+	if legacyResourceType != "" {
+		sourceSummary += " / " + legacyResourceType
 		if resourceID != "" {
-			summary += " " + resourceID
+			sourceSummary += " " + resourceID
 		}
 	}
 	if actor != "" {
-		summary += " / actor=" + actor
+		sourceSummary += " / actor=" + actor
+	}
+	summary := sourceSummary
+	if strings.TrimSpace(body.EventType) == "admin.audit" {
+		actionLabel := notifications.NotificationActionLabel(action)
+		parts := []string{actionLabel}
+		if resourceType != "" {
+			target := notifications.NotificationResourceLabel(resourceType)
+			if resourceID != "" {
+				target += " (" + resourceID + ")"
+			}
+			parts = append(parts, "対象: "+target)
+		}
+		if actor != "" {
+			parts = append(parts, "実行者: "+actor)
+		}
+		if callerSummary != "" && callerSummary != legacySummary && callerSummary != parts[0] {
+			parts = append(parts, "詳細: "+callerSummary)
+		}
+		summary = strings.Join(parts, "\n")
 	}
 	serviceID := strings.TrimSpace(fallbackService)
 	if serviceID == "" {
 		serviceID = "observability"
 	}
+	var occurredAt time.Time
+	if timestamp := strings.TrimSpace(body.Timestamp); timestamp != "" {
+		parsed, err := time.Parse(time.RFC3339, timestamp)
+		if err != nil {
+			return store.Incident{}, errors.New("timestamp must be RFC3339")
+		}
+		occurredAt = parsed.UTC()
+	}
 	return store.Incident{
-		Rule:      action,
-		Severity:  severity,
-		Status:    status,
-		SummaryJA: summary,
-		ServiceID: serviceID,
+		Rule:          action,
+		Severity:      severity,
+		Status:        status,
+		SummaryJA:     summary,
+		SourceSummary: sourceSummary,
+		ServiceID:     serviceID,
+		UpdatedAt:     occurredAt,
 	}, nil
 }
 
@@ -664,6 +697,14 @@ func safeNotificationField(value string, maxLen int) string {
 	}
 	if maxLen > 0 && len(value) > maxLen {
 		return value[:maxLen]
+	}
+	return value
+}
+
+func safeNotificationResourceType(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 80 || !notificationResourceTypePattern.MatchString(value) {
+		return ""
 	}
 	return value
 }
@@ -1359,6 +1400,17 @@ func (s *Server) deliverNotificationEvent(r *http.Request, eventType string, inc
 		if result.EventType == "" {
 			result.EventType = eventType
 		}
+		metadata := map[string]any{
+			"severity": incident.Severity,
+			"rule":     incident.Rule,
+			"summary":  incident.SummaryJA,
+		}
+		if result.EventType == "admin.audit" {
+			metadata["action"] = incident.Rule
+		}
+		if !incident.UpdatedAt.IsZero() {
+			metadata["occurred_at"] = incident.UpdatedAt.UTC().Format(time.RFC3339)
+		}
 		_, _ = s.store.SaveNotificationDelivery(r.Context(), store.NotificationDelivery{
 			EventType:  result.EventType,
 			Channel:    result.Channel,
@@ -1366,10 +1418,7 @@ func (s *Server) deliverNotificationEvent(r *http.Request, eventType string, inc
 			IncidentID: incident.ID,
 			Status:     status,
 			Error:      errorText,
-			Metadata: map[string]any{
-				"severity": incident.Severity,
-				"rule":     incident.Rule,
-			},
+			Metadata:   metadata,
 		})
 	}
 	return results

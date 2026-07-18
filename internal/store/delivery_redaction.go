@@ -2,13 +2,32 @@ package store
 
 import (
 	"net/url"
+	"regexp"
 	"strings"
 )
+
+var deliveryAuditActionPattern = regexp.MustCompile(`^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$`)
+
+var deliverySensitiveAuditActions = map[string]struct{}{
+	"api_tokens.create":                   {},
+	"api_tokens.revoke":                   {},
+	"api_tokens.rotate":                   {},
+	"auth.change_password":                {},
+	"integrations.runtime_secret.read":    {},
+	"integrations.runtime_secret.resolve": {},
+	"nodes.configure_token.rotate":        {},
+	"nodes.registration_token.create":     {},
+	"nodes.runtime_token.rotate":          {},
+	"secrets.update":                      {},
+	"services.runtime_secret.resolve":     {},
+	"users.force_password_change":         {},
+	"users.reset_password":                {},
+}
 
 func sanitizeNotificationDelivery(delivery NotificationDelivery) NotificationDelivery {
 	delivery.Target = sanitizeDeliveryTarget(delivery.Target)
 	delivery.Error = sanitizeDeliveryErrorText(delivery.Error)
-	delivery.Metadata = sanitizeDeliveryMetadata(delivery.Metadata)
+	delivery.Metadata = sanitizeDeliveryMetadata(delivery.Metadata, delivery.EventType == "admin.audit")
 	if delivery.Metadata == nil {
 		delivery.Metadata = map[string]any{}
 	}
@@ -39,12 +58,19 @@ func sanitizeDeliveryErrorText(value string) string {
 	return value
 }
 
-func sanitizeDeliveryMetadata(metadata map[string]any) map[string]any {
+func sanitizeDeliveryMetadata(metadata map[string]any, preserveAuditAction bool) map[string]any {
 	if metadata == nil {
 		return nil
 	}
 	out := make(map[string]any, len(metadata))
 	for key, value := range metadata {
+		normalizedKey := strings.ToLower(strings.TrimSpace(key))
+		if preserveAuditAction && (normalizedKey == "action" || normalizedKey == "rule") {
+			if action, ok := safeDeliveryAuditActionIdentifier(value); ok {
+				out[key] = action
+				continue
+			}
+		}
 		if deliverySecretLikeKey(key) {
 			out[key] = "<redacted>"
 			continue
@@ -70,10 +96,26 @@ func sanitizeDeliveryMetadataValue(value any) any {
 		}
 		return out
 	case map[string]any:
-		return sanitizeDeliveryMetadata(typed)
+		return sanitizeDeliveryMetadata(typed, false)
 	default:
 		return nil
 	}
+}
+
+func safeDeliveryAuditActionIdentifier(value any) (string, bool) {
+	action, ok := value.(string)
+	if !ok {
+		return "", false
+	}
+	action = strings.TrimSpace(action)
+	if action == "" || len(action) > 128 || !deliveryAuditActionPattern.MatchString(action) {
+		return "", false
+	}
+	if !deliverySecretLikeValue(action) {
+		return action, true
+	}
+	_, allowed := deliverySensitiveAuditActions[action]
+	return action, allowed
 }
 
 func deliverySecretLikeKey(key string) bool {
@@ -88,8 +130,11 @@ func deliverySecretLikeKey(key string) bool {
 
 func deliverySecretLikeValue(value string) bool {
 	trimmed := strings.TrimSpace(value)
-	if trimmed == "" || strings.Contains(trimmed, "<WEBHOOK_PATH>") || strings.Contains(trimmed, "<redacted>") || strings.Contains(trimmed, "****") {
+	if trimmed == "" || trimmed == "<redacted>" || trimmed == "****" {
 		return false
+	}
+	if strings.Contains(trimmed, "<redacted>") || strings.Contains(trimmed, "<WEBHOOK_PATH>") {
+		return true
 	}
 	lower := strings.ToLower(trimmed)
 	for _, pattern := range []string{

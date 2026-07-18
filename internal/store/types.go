@@ -23,18 +23,19 @@ type Signal struct {
 }
 
 type Incident struct {
-	ID         string             `json:"id"`
-	Rule       string             `json:"rule"`
-	Severity   string             `json:"severity"`
-	Status     string             `json:"status"`
-	SummaryJA  string             `json:"summary_ja"`
-	ServiceID  string             `json:"service_id"`
-	StreamID   string             `json:"stream_id,omitempty"`
-	SignalID   string             `json:"signal_id"`
-	Report     diagnostics.Report `json:"diagnostic_report"`
-	OpenedAt   time.Time          `json:"opened_at"`
-	UpdatedAt  time.Time          `json:"updated_at"`
-	ResolvedAt *time.Time         `json:"resolved_at,omitempty"`
+	ID            string             `json:"id"`
+	Rule          string             `json:"rule"`
+	Severity      string             `json:"severity"`
+	Status        string             `json:"status"`
+	SummaryJA     string             `json:"summary_ja"`
+	SourceSummary string             `json:"-"`
+	ServiceID     string             `json:"service_id"`
+	StreamID      string             `json:"stream_id,omitempty"`
+	SignalID      string             `json:"signal_id"`
+	Report        diagnostics.Report `json:"diagnostic_report"`
+	OpenedAt      time.Time          `json:"opened_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
+	ResolvedAt    *time.Time         `json:"resolved_at,omitempty"`
 }
 
 type NotificationDelivery struct {
