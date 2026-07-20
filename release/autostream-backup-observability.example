@@ -4,12 +4,20 @@ umask 077
 
 readonly DEFAULTS_FILE=/etc/autostream/mariadb-backup.cnf
 readonly BACKUP_DIR=/var/backups/autostream/observability
-readonly DATABASE=autostream_observability
+readonly DEFAULT_DATABASE=autostream_observability
 
 fail() {
   printf 'autostream-backup-observability: %s\n' "$*" >&2
   exit 1
 }
+
+if (( $# > 1 )); then
+  fail "usage: ${0##*/} [database_name]"
+fi
+readonly DATABASE="${1-$DEFAULT_DATABASE}"
+if [[ ! "$DATABASE" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+  fail "invalid database name: use 1-64 ASCII letters, digits, underscores, or hyphens, starting with a letter or digit"
+fi
 
 require_private_root_file() {
   local path="$1" owner mode

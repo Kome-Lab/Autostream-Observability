@@ -110,23 +110,50 @@ user=autostream_backup
 password=replace-with-a-long-random-password
 ```
 
-From an interactive MariaDB root session, create the account if necessary and
-grant only the Observability database privileges (replace the password before
-executing the `CREATE USER` statement):
+From an interactive MariaDB root session, create the account if necessary.
+Replace the password before executing the `CREATE USER` statement; do not put
+the real password in a shell command or shell history:
 
 ```sql
 CREATE USER IF NOT EXISTS 'autostream_backup'@'127.0.0.1' IDENTIFIED BY 'replace-with-a-long-random-password';
-GRANT SELECT, SHOW VIEW, TRIGGER ON `autostream_observability`.* TO 'autostream_backup'@'127.0.0.1';
 ```
 
-Test ownership, mode, credentials, and a real dump before adding
-`/usr/local/sbin/autostream-backup-observability` to `backup_argv`:
+The script defaults to `autostream_observability`. If `DATABASE_URL` uses a
+different database, pass its exact name as the single fixed argument. The name
+must contain 1-64 ASCII letters, digits, underscores, or hyphens and must start
+with a letter or digit.
+
+Select the database name once below, then keep the same shell open. The same
+exact `DATABASE_NAME` must be used for the MariaDB grant, the real dump, and the
+second `backup_argv` item. In this example, replace the default with the final
+path component of the real `DATABASE_URL` when they differ:
 
 ```bash
 set -euo pipefail
+DATABASE_NAME='autostream_observability'
+if [[ ! "$DATABASE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+  echo "Invalid DATABASE_NAME" >&2
+  exit 1
+fi
+
+sudo mariadb <<SQL
+GRANT SELECT, SHOW VIEW, TRIGGER ON \`${DATABASE_NAME}\`.* TO 'autostream_backup'@'127.0.0.1';
+SQL
+
 test "$(sudo stat -c '%u:%a' /etc/autostream/mariadb-backup.cnf)" = "0:600"
 test "$(sudo stat -c '%u:%a' /usr/local/sbin/autostream-backup-observability)" = "0:700"
-sudo /usr/local/sbin/autostream-backup-observability
+sudo /usr/local/sbin/autostream-backup-observability "$DATABASE_NAME"
+printf 'Use this exact database name as the second backup_argv item: %s\n' "$DATABASE_NAME"
+```
+
+Copy the value printed by that command into the root-owned host policy. It is
+never supplied by an update job or the browser:
+
+```json
+"backup_argv": [
+  "/usr/local/sbin/autostream-backup-observability",
+  "replace-with-the-exact-DATABASE_NAME-printed-above"
+]
 ```
 
 The script uses `umask 077` and atomically renames a timestamped, non-empty
