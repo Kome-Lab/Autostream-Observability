@@ -20,7 +20,34 @@ import (
 	"github.com/example/autostream-observability/internal/control"
 	"github.com/example/autostream-observability/internal/notifications"
 	"github.com/example/autostream-observability/internal/store"
+	"github.com/example/autostream-observability/internal/version"
 )
+
+func TestUpdaterVersionIsUnauthenticatedAndUsesEmbeddedVersion(t *testing.T) {
+	previousVersion := version.Version
+	version.Version = "v1.1.1"
+	t.Setenv("SERVICE_VERSION", "v9.9.9")
+	t.Cleanup(func() { version.Version = previousVersion })
+	handler := NewServerWithStoreAndAuth("observability", store.NewMemoryStore(), auth.NewVerifierFromRawTokens("service-token"))
+	req := httptest.NewRequest(http.MethodGet, "/updater/version", nil)
+	res := httptest.NewRecorder()
+
+	handler.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	if got := res.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("content type = %q", got)
+	}
+	var response map[string]string
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response) != 1 || response["version"] != version.Current() {
+		t.Fatalf("response = %#v, want only embedded version %q", response, version.Current())
+	}
+}
 
 func TestSignalIngestRequiresAuthorization(t *testing.T) {
 	handler := NewServerWithStoreAndAuth("observability", store.NewMemoryStore(), auth.NewVerifierFromRawTokens("service-token"))

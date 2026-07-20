@@ -25,6 +25,7 @@ import (
 	"github.com/example/autostream-observability/internal/notifications"
 	"github.com/example/autostream-observability/internal/remediation"
 	"github.com/example/autostream-observability/internal/store"
+	"github.com/example/autostream-observability/internal/version"
 )
 
 type Status struct {
@@ -185,6 +186,7 @@ func NewServerWithStoreAuthzNotifierExecutorAndEmailRelay(serviceType string, st
 	mux.HandleFunc("GET /{$}", s.root)
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("GET /status", s.status)
+	mux.HandleFunc("GET /updater/version", s.updaterVersion)
 	mux.HandleFunc("POST /heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /signals", s.ingestSignal)
 	mux.HandleFunc("GET /signals", s.listSignals)
@@ -229,6 +231,10 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, Status{ServiceType: s.serviceType, ServiceID: observabilityServiceID(), Status: "ready", CheckedAt: time.Now().UTC()})
+}
+
+func (s *Server) updaterVersion(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"version": version.Current()})
 }
 
 func observabilityServiceID() string {

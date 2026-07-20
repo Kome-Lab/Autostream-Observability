@@ -25,7 +25,7 @@ TZ=Asia/Tokyo
 
 Control Panel calls Observability with the Node Runtime Token stored in the Panel-generated `AUTOSTREAM_NODE_CONFIG`. Do not configure a separate Observability admin token or direct ingest token.
 
-The Observability service does not serve a browser UI. `GET /` and `GET /status` return safe operator status JSON, while API data such as `GET /metrics` is token protected and is normally read through the Control Panel `/observability/metrics` proxy. A browser request to `/metrics` without the Node Runtime Token should return an authorization error.
+The Observability service does not serve a browser UI. `GET /` and `GET /status` return safe operator status JSON. `GET /updater/version` returns only the embedded release version for the loopback update helper. API data such as `GET /metrics` is token protected and is normally read through the Control Panel `/observability/metrics` proxy. A browser request to `/metrics` without the Node Runtime Token should return an authorization error.
 
 ## Platform and Metrics Reporting
 
