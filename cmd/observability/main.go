@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,9 +39,20 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	addr := os.Getenv("OBSERVABILITY_BIND_ADDR")
-	if addr == "" {
-		addr = "127.0.0.1:8080"
+	addr, err := observabilityBindAddrFromEnv()
+	if err != nil {
+		log.Fatalf("invalid OBSERVABILITY_BIND_ADDR: %v", err)
+	}
+	if _, err := httpapi.ConfigRevisionFromEnv(); err != nil {
+		log.Fatalf("invalid AUTOSTREAM_CONFIG_REVISION: %v", err)
+	}
+	updaterIdentity := httpapi.NewUpdaterIdentityLatch(control.ServiceType)
+	if _, err := updaterIdentity.ResolveFromEnv(); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
+		log.Fatalf("invalid updater identity: %v", err)
+	}
+	controlClient := control.FromEnv()
+	if err := requireMatchingUpdaterIdentity(updaterIdentity, controlClient.ServiceID); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
+		log.Fatalf("invalid updater identity: %v", err)
 	}
 	if os.Getenv("DATABASE_URL") == "" {
 		log.Fatal("DATABASE_URL is required; observability does not support production memory storage")
@@ -57,7 +71,7 @@ func main() {
 		log.Fatalf("run migrations failed: %v", err)
 	}
 	st := store.MariaDBStore{DB: db, SecretKey: os.Getenv("AUTOSTREAM_SECRET_ENCRYPTION_KEY")}
-	go runControlPanelRegistrationLoop(ctx)
+	go runControlPanelRegistrationLoop(ctx, updaterIdentity)
 	ingestVerifier := auth.Verifier{}
 	adminVerifier := auth.Verifier{}
 	if nodeToken := control.NodeRuntimeTokenFromEnv(); nodeToken != "" {
@@ -66,7 +80,7 @@ func main() {
 	log.Printf("autostream-observability listening on %s", addr)
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.NewServerWithStoreAuthz("observability", st, ingestVerifier, adminVerifier),
+		Handler:           httpapi.NewServerWithStoreAuthzAndUpdaterIdentity(control.ServiceType, st, ingestVerifier, adminVerifier, updaterIdentity),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -85,13 +99,51 @@ func main() {
 	}
 }
 
-func runControlPanelRegistrationLoop(ctx context.Context) {
+func observabilityBindAddrFromEnv() (string, error) {
+	const defaultAddr = "127.0.0.1:8080"
+
+	addr := strings.TrimSpace(os.Getenv("OBSERVABILITY_BIND_ADDR"))
+	if addr == "" {
+		addr = defaultAddr
+	}
+	_, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("must be host:port: %w", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return "", fmt.Errorf("port must be an integer: %w", err)
+	}
+	if port < 1024 || port > 65535 {
+		return "", fmt.Errorf("port %d is outside the supported range 1024-65535", port)
+	}
+	return addr, nil
+}
+
+func runControlPanelRegistrationLoop(ctx context.Context, updaterIdentity *httpapi.UpdaterIdentityLatch) {
 	lastState := ""
 	registeredServiceID := ""
 	for {
 		client := control.FromEnv()
 		wait := controlPanelRegistrationInterval(client)
 		state := ""
+		if err := requireMatchingUpdaterIdentity(updaterIdentity, client.ServiceID); err != nil {
+			if errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
+				state = "pending:" + control.NodeConfigPathFromEnv()
+				logRegistrationStateChange(&lastState, state, "node config pending: waiting for %s", control.NodeConfigPathFromEnv())
+				registeredServiceID = ""
+			} else {
+				log.Fatalf("updater identity invalid: %v", err)
+			}
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			continue
+		}
 		switch {
 		case strings.TrimSpace(client.ConfigError) != "":
 			state = "invalid:" + client.ConfigError
@@ -138,6 +190,17 @@ func runControlPanelRegistrationLoop(ctx context.Context) {
 		case <-timer.C:
 		}
 	}
+}
+
+func requireMatchingUpdaterIdentity(latch *httpapi.UpdaterIdentityLatch, serviceID string) error {
+	identity, err := latch.ResolveFromEnv()
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(serviceID) != identity.ServiceID {
+		return fmt.Errorf("%w: control client service id does not match the updater identity", httpapi.ErrUpdaterIdentityDrift)
+	}
+	return nil
 }
 
 func controlPanelRegistrationInterval(client control.Client) time.Duration {

@@ -46,15 +46,16 @@ var notificationActionPattern = regexp.MustCompile(`^[A-Za-z0-9_]+(?:\.[A-Za-z0-
 var notificationResourceTypePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 type Server struct {
-	serviceType string
-	store       store.Store
-	ingestAuth  auth.Verifier
-	adminAuth   auth.Verifier
-	notifier    notifications.Notifier
-	emailRelay  notifications.EmailRelay
-	executor    controlExecutor
-	rateLimiter *rateLimiter
-	logger      *log.Logger
+	serviceType     string
+	updaterIdentity *UpdaterIdentityLatch
+	store           store.Store
+	ingestAuth      auth.Verifier
+	adminAuth       auth.Verifier
+	notifier        notifications.Notifier
+	emailRelay      notifications.EmailRelay
+	executor        controlExecutor
+	rateLimiter     *rateLimiter
+	logger          *log.Logger
 }
 
 const maxJSONBodyBytes = 64 << 10
@@ -159,7 +160,11 @@ func NewServerWithStoreAuthNotifierAndExecutor(serviceType string, st store.Stor
 }
 
 func NewServerWithStoreAuthz(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier) http.Handler {
-	return NewServerWithStoreAuthzNotifierAndExecutor(serviceType, st, ingestVerifier, adminVerifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: notificationWebhookTimeout, EmailTimeout: notificationEmailTimeout, RetryMax: 3, RetryBaseDelay: time.Second}, envControlExecutor{})
+	return NewServerWithStoreAuthzAndUpdaterIdentity(serviceType, st, ingestVerifier, adminVerifier, NewUpdaterIdentityLatch(serviceType))
+}
+
+func NewServerWithStoreAuthzAndUpdaterIdentity(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, updaterIdentity *UpdaterIdentityLatch) http.Handler {
+	return NewServerWithStoreAuthzNotifierExecutorEmailRelayAndUpdaterIdentity(serviceType, st, ingestVerifier, adminVerifier, notifications.ChannelNotifier{Store: st, Fallback: notifications.FromEnv(), Timeout: notificationWebhookTimeout, EmailTimeout: notificationEmailTimeout, RetryMax: 3, RetryBaseDelay: time.Second}, envControlExecutor{}, envEmailRelay{}, updaterIdentity)
 }
 
 func NewServerWithStoreAuthzNotifierAndExecutor(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor) http.Handler {
@@ -167,8 +172,18 @@ func NewServerWithStoreAuthzNotifierAndExecutor(serviceType string, st store.Sto
 }
 
 func NewServerWithStoreAuthzNotifierExecutorAndEmailRelay(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor, emailRelay notifications.EmailRelay) http.Handler {
+	return NewServerWithStoreAuthzNotifierExecutorEmailRelayAndUpdaterIdentity(serviceType, st, ingestVerifier, adminVerifier, notifier, executor, emailRelay, NewUpdaterIdentityLatch(serviceType))
+}
+
+func NewServerWithStoreAuthzNotifierExecutorEmailRelayAndUpdaterIdentity(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor, emailRelay notifications.EmailRelay, updaterIdentity *UpdaterIdentityLatch) http.Handler {
 	if st == nil {
 		st = store.NewMemoryStore()
+	}
+	if updaterIdentity == nil {
+		panic("observability updater identity latch is required")
+	}
+	if _, err := updaterIdentity.ResolveFromEnv(); err != nil && !errors.Is(err, ErrUpdaterIdentityPending) {
+		panic(err)
 	}
 	switch configured := notifier.(type) {
 	case notifications.ChannelNotifier:
@@ -181,7 +196,7 @@ func NewServerWithStoreAuthzNotifierExecutorAndEmailRelay(serviceType string, st
 			configured.EmailRelay = emailRelay
 		}
 	}
-	s := &Server{serviceType: serviceType, store: st, ingestAuth: ingestVerifier, adminAuth: adminVerifier, notifier: notifier, emailRelay: emailRelay, executor: executor, rateLimiter: rateLimiterFromEnv(st), logger: log.Default()}
+	s := &Server{serviceType: serviceType, updaterIdentity: updaterIdentity, store: st, ingestAuth: ingestVerifier, adminAuth: adminVerifier, notifier: notifier, emailRelay: emailRelay, executor: executor, rateLimiter: rateLimiterFromEnv(st), logger: log.Default()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.root)
 	mux.HandleFunc("GET /health", s.health)
@@ -234,7 +249,49 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) updaterVersion(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"version": version.Current()})
+	identity, err := s.updaterIdentity.ResolveFromEnv()
+	if err != nil {
+		code := "updater_identity_invalid"
+		if errors.Is(err, ErrUpdaterIdentityPending) {
+			code = "updater_identity_pending"
+		}
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": code})
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Version        string `json:"version"`
+		ServiceID      string `json:"service_id"`
+		ServiceType    string `json:"service_type"`
+		ConfigRevision int64  `json:"config_revision"`
+	}{
+		Version:        version.Current(),
+		ServiceID:      identity.ServiceID,
+		ServiceType:    identity.ServiceType,
+		ConfigRevision: identity.ConfigRevision,
+	})
+}
+
+func ConfigRevisionFromEnv() (int64, error) {
+	raw := os.Getenv("AUTOSTREAM_CONFIG_REVISION")
+	if raw == "" {
+		return 1, nil
+	}
+	if raw != strings.TrimSpace(raw) {
+		return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must be an unpadded positive integer")
+	}
+	if raw[0] == '0' {
+		return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must not contain leading zeroes")
+	}
+	for _, char := range raw {
+		if char < '0' || char > '9' {
+			return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must contain decimal digits only")
+		}
+	}
+	revision, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || revision < 1 {
+		return 0, errors.New("AUTOSTREAM_CONFIG_REVISION must be an integer greater than or equal to 1")
+	}
+	return revision, nil
 }
 
 func observabilityServiceID() string {

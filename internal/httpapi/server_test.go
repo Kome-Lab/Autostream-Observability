@@ -23,12 +23,35 @@ import (
 	"github.com/example/autostream-observability/internal/version"
 )
 
-func TestUpdaterVersionIsUnauthenticatedAndUsesEmbeddedVersion(t *testing.T) {
+func TestUpdaterVersionIsUnauthenticatedAndIdentityBound(t *testing.T) {
 	previousVersion := version.Version
 	version.Version = "v1.1.1"
 	t.Setenv("SERVICE_VERSION", "v9.9.9")
+	t.Setenv("SERVICE_ID", "wrong-fallback")
+	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "9")
 	t.Cleanup(func() { version.Version = previousVersion })
-	handler := NewServerWithStoreAndAuth("observability", store.NewMemoryStore(), auth.NewVerifierFromRawTokens("service-token"))
+
+	path := filepath.Join(t.TempDir(), "config.yml")
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
+	body := `panel:
+  url: "https://panel.example.jp"
+node:
+  id: "observability-probe-01"
+  name: "Observability Probe"
+  type: "observability"
+api:
+  host: "127.0.0.1"
+  port: 8082
+  ssl_enabled: false
+auth:
+  token_id: "token-id"
+  token: "runtime-secret"
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewServerWithStoreAndAuth(control.ServiceType, store.NewMemoryStore(), auth.NewVerifierFromRawTokens("service-token"))
 	req := httptest.NewRequest(http.MethodGet, "/updater/version", nil)
 	res := httptest.NewRecorder()
 
@@ -40,13 +63,64 @@ func TestUpdaterVersionIsUnauthenticatedAndUsesEmbeddedVersion(t *testing.T) {
 	if got := res.Header().Get("Content-Type"); got != "application/json" {
 		t.Fatalf("content type = %q", got)
 	}
-	var response map[string]string
+	var response map[string]any
 	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response) != 1 || response["version"] != version.Current() {
-		t.Fatalf("response = %#v, want only embedded version %q", response, version.Current())
+	if len(response) != 4 ||
+		response["version"] != version.Current() ||
+		response["service_id"] != "observability-probe-01" ||
+		response["service_type"] != control.ServiceType ||
+		response["config_revision"] != float64(9) {
+		t.Fatalf("unexpected updater identity response: %#v", response)
 	}
+}
+
+func TestConfigRevisionFromEnvValidatesPositiveInteger(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		value   string
+		want    int64
+		wantErr bool
+	}{
+		{name: "default", value: "", want: 1},
+		{name: "one", value: "1", want: 1},
+		{name: "higher", value: "27", want: 27},
+		{name: "zero", value: "0", wantErr: true},
+		{name: "leading zero", value: "01", wantErr: true},
+		{name: "negative", value: "-1", wantErr: true},
+		{name: "fraction", value: "1.5", wantErr: true},
+		{name: "padded", value: " 1 ", wantErr: true},
+		{name: "text", value: "next", wantErr: true},
+		{name: "overflow", value: "9223372036854775808", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AUTOSTREAM_CONFIG_REVISION", tt.value)
+			got, err := ConfigRevisionFromEnv()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ConfigRevisionFromEnv() accepted %q", tt.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("revision = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewServerFailsClosedOnInvalidConfigRevision(t *testing.T) {
+	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "0")
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewServer must reject an invalid AUTOSTREAM_CONFIG_REVISION")
+		}
+	}()
+	_ = NewServerWithStoreAndAuth(control.ServiceType, store.NewMemoryStore(), auth.Verifier{})
 }
 
 func TestSignalIngestRequiresAuthorization(t *testing.T) {

@@ -33,11 +33,17 @@ func TestFromEnvRejectsWrongNodeType(t *testing.T) {
 func TestFromEnvTreatsMissingNodeConfigAsPending(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing", "config.yml")
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
-	t.Setenv("CONTROL_PANEL_URL", "")
-	t.Setenv("CONTROL_PANEL_TOKEN", "")
+	t.Setenv("CONTROL_PANEL_URL", "https://legacy-panel.example.jp")
+	t.Setenv("CONTROL_PANEL_TOKEN", "legacy-token")
+	t.Setenv("SERVICE_ID", "legacy-observability")
+	t.Setenv("SERVICE_NAME", "Legacy Observability")
+	t.Setenv("SERVICE_PUBLIC_URL", "https://legacy-observability.example.jp")
 	client := FromEnv()
 	if client.ConfigError != "" {
 		t.Fatalf("missing node config should not be fatal: %#v", client)
+	}
+	if client.BaseURL != "" || client.Token != "" || client.ServiceID != "" || client.ServiceName != "" || client.ServicePublicURL != "" {
+		t.Fatalf("configured node path must clear legacy panel identity while pending: %#v", client)
 	}
 	if client.Enabled() {
 		t.Fatalf("missing node config must not enable client: %#v", client)

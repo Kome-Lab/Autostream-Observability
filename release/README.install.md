@@ -162,26 +162,50 @@ off-host copying separately. The updater rejects a missing backup executable,
 a symlink, or a path that is not root-owned or is writable by group/other
 users; a nonzero dump exit aborts the update before stopping Observability.
 
-Edit `/etc/autostream/observability.env` with real environment-specific values, then run:
+Edit `/etc/autostream/observability.env` with real environment-specific values.
+`OBSERVABILITY_BIND_ADDR` accepts an arbitrary unprivileged port from `1024`
+through `65535`; the shipped systemd env uses the standard IPv4 loopback value
+`127.0.0.1:8082`. The binary retains the legacy `127.0.0.1:8080` fallback only
+when the variable is absent, so upgrading an older installation does not move
+its port. The systemd unit does not hard-code a port. An invalid address or an
+out-of-range port makes the service fail closed before it connects to MariaDB.
+
+Keep this root-owned file at mode `0640` and include
+`AUTOSTREAM_CONFIG_REVISION=1`. The revision must be a positive integer;
+increment it after applying a new service configuration. Invalid values stop
+Observability before it connects to MariaDB or starts serving HTTP.
+
+Set `OBSERVABILITY_PORT` below to the port component of
+`OBSERVABILITY_BIND_ADDR`, then run:
 
 ```bash
 set -euo pipefail
 VERSION="${VERSION:?export VERSION=vX.Y.Z before continuing}"
+OBSERVABILITY_PORT="${OBSERVABILITY_PORT:-8082}"
+PROBE_HOST="${PROBE_HOST:-127.0.0.1}"
+[[ "$OBSERVABILITY_PORT" =~ ^[0-9]+$ ]]
+(( OBSERVABILITY_PORT >= 1024 && OBSERVABILITY_PORT <= 65535 ))
 sudo systemctl daemon-reload
 sudo systemctl enable autostream-observability
 sudo systemctl restart autostream-observability
 PID="$(sudo systemctl show --property=MainPID --value autostream-observability)"
 EXPECTED="$(sudo readlink -f /opt/autostream/observability/current/bin/autostream-observability)"
 test "$(sudo readlink -f "/proc/$PID/exe")" = "$EXPECTED"
-curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8082/health >/dev/null
+curl --fail --silent --show-error --max-time 10 \
+  "http://${PROBE_HOST}:${OBSERVABILITY_PORT}/health" >/dev/null
 test "$(curl --fail --silent --show-error --max-time 10 \
-  http://127.0.0.1:8082/updater/version | jq -r '.version')" = "$VERSION"
+  "http://${PROBE_HOST}:${OBSERVABILITY_PORT}/updater/version" | jq -r '.version')" = "$VERSION"
 ```
 
-Use the host's configured loopback port if it differs from `8082`.
-`/updater/version` is the unauthenticated, minimal endpoint used only to prove
-the running binary's embedded release version to the update helper. Block this
-exact path at any public reverse proxy.
+The standard systemd/local-executor profile uses IPv4 loopback. For an explicit
+IPv6 loopback bind such as `OBSERVABILITY_BIND_ADDR=[::1]:18082`, run the smoke
+check with `PROBE_HOST='[::1]' OBSERVABILITY_PORT=18082`; the brackets are
+required in the URL.
+
+`/updater/version` is the unauthenticated, identity-bound local executor probe.
+Its exact response fields are version, service_id, service_type, and config_revision.
+The service ID comes from the same Control Panel node config used by
+registration. Block this exact path at any public reverse proxy.
 
 Do not fabricate `.artifact-sha256` or `.version` from an unverified local
 binary. Releases without `release-manifest.json` remain manual-only; publish a

@@ -26,6 +26,11 @@ func applyNodeConfigFromEnv(client *Client, expectedType string) {
 	if path == "" {
 		return
 	}
+	client.BaseURL = ""
+	client.Token = ""
+	client.ServiceID = ""
+	client.ServiceName = ""
+	client.ServicePublicURL = ""
 	nodeCfg, err := loadNodeAgentConfig(path)
 	if err != nil {
 		if os.IsNotExist(err) {
