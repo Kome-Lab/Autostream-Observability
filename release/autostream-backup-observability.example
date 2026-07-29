@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-readonly DEFAULTS_FILE=/etc/autostream/mariadb-backup.cnf
+readonly DEFAULTS_FILE=/etc/autostream-local-executor/mariadb-backup.cnf
 readonly BACKUP_DIR=/var/backups/autostream/observability
 readonly DEFAULT_DATABASE=autostream_observability
 

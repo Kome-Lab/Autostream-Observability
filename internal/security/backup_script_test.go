@@ -9,6 +9,8 @@ import (
 	"testing"
 )
 
+const observabilityBackupDefaultsFile = "/etc/autostream-local-executor/mariadb-backup.cnf"
+
 func TestObservabilityBackupScriptRejectsUnsafeDatabaseArguments(t *testing.T) {
 	script := filepath.Join("..", "..", "release", "autostream-backup-observability.example")
 
@@ -45,6 +47,7 @@ func TestObservabilityBackupScriptDeclaresDefaultAndQuotedDatabaseArgument(t *te
 	}
 	script := string(body)
 	for _, want := range []string{
+		"readonly DEFAULTS_FILE=" + observabilityBackupDefaultsFile,
 		"readonly DEFAULT_DATABASE=autostream_observability",
 		`readonly DATABASE="${1-$DEFAULT_DATABASE}"`,
 		`--databases "$DATABASE"`,
@@ -52,6 +55,9 @@ func TestObservabilityBackupScriptDeclaresDefaultAndQuotedDatabaseArgument(t *te
 		if !strings.Contains(script, want) {
 			t.Fatalf("Observability backup script is missing %q", want)
 		}
+	}
+	if strings.Contains(script, "/etc/autostream/mariadb-backup.cnf") {
+		t.Fatal("Observability backup script must not read MariaDB credentials from the service configuration directory")
 	}
 
 }
@@ -63,23 +69,47 @@ func TestObservabilityInstallGuidePassesConfiguredDatabaseName(t *testing.T) {
 	}
 	guide := string(body)
 	for _, want := range []string{
+		"sudo install -d -o root -g root -m 0700 /etc/autostream-local-executor",
+		observabilityBackupDefaultsFile,
 		"DATABASE_NAME='autostream_observability'",
 		"exact `DATABASE_NAME` must be used for the MariaDB grant, the real dump, and the",
 		"GRANT SELECT, SHOW VIEW, TRIGGER ON \\`${DATABASE_NAME}\\`.*",
 		`sudo /usr/local/sbin/autostream-backup-observability "$DATABASE_NAME"`,
-		`"backup_argv": [`,
-		`"/usr/local/sbin/autostream-backup-observability",`,
-		`"replace-with-the-exact-DATABASE_NAME-printed-above"`,
+		"Database name to save in System Updates",
+		"Application Info > System Updates",
+		"Do not edit `/etc/autostream-local-executor/policy.json`",
 	} {
 		if !strings.Contains(guide, want) {
 			t.Fatalf("Observability install guide is missing %q", want)
 		}
 	}
+	if strings.Contains(guide, "/etc/autostream/mariadb-backup.cnf") {
+		t.Fatal("Observability install guide must not place Local Executor credentials in the service configuration directory")
+	}
 	grant := strings.Index(guide, "GRANT SELECT, SHOW VIEW, TRIGGER")
 	dump := strings.Index(guide, `sudo /usr/local/sbin/autostream-backup-observability "$DATABASE_NAME"`)
-	policy := strings.Index(guide, `"replace-with-the-exact-DATABASE_NAME-printed-above"`)
-	if grant < 0 || dump <= grant || policy <= dump {
-		t.Fatal("Observability install guide must use one selected database name for grant, real dump, then backup_argv")
+	settings := strings.Index(guide, "Database name to save in System Updates")
+	if grant < 0 || dump <= grant || settings <= dump {
+		t.Fatal("Observability install guide must use one selected database name for grant, real dump, then saved settings")
+	}
+}
+
+func TestObservabilityRootBackupSmokeUsesLocalExecutorDefaultsFile(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("testdata", "run-backup-script-root-smoke.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	smoke := string(body)
+	for _, want := range []string{
+		observabilityBackupDefaultsFile,
+		`"--defaults-extra-file=/etc/autostream-local-executor/mariadb-backup.cnf"`,
+	} {
+		if !strings.Contains(smoke, want) {
+			t.Fatalf("Observability root backup smoke is missing %q", want)
+		}
+	}
+	if strings.Contains(smoke, "/etc/autostream/mariadb-backup.cnf") {
+		t.Fatal("Observability root backup smoke must exercise the Local Executor credential directory")
 	}
 }
 

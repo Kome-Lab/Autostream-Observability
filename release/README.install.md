@@ -87,19 +87,21 @@ RELEASE_DIR="$(readlink -f /opt/autostream/observability/current)"
 test -x "$RELEASE_DIR/backup/autostream-backup-observability"
 sudo install -d -o root -g root -m 0700 /var/backups/autostream/observability
 sudo install -o root -g root -m 0700 "$RELEASE_DIR/backup/autostream-backup-observability" /usr/local/sbin/autostream-backup-observability
-sudo install -d -o root -g root -m 0750 /etc/autostream
-if ! sudo test -e /etc/autostream/mariadb-backup.cnf; then
-  sudo install -o root -g root -m 0600 /dev/null /etc/autostream/mariadb-backup.cnf
+sudo install -d -o root -g root -m 0700 /etc/autostream-local-executor
+if ! sudo test -e /etc/autostream-local-executor/mariadb-backup.cnf; then
+  sudo install -o root -g root -m 0600 /dev/null /etc/autostream-local-executor/mariadb-backup.cnf
 else
-  echo "preserving existing /etc/autostream/mariadb-backup.cnf"
+  echo "preserving existing /etc/autostream-local-executor/mariadb-backup.cnf"
 fi
-sudo chown root:root /etc/autostream/mariadb-backup.cnf
-sudo chmod 0600 /etc/autostream/mariadb-backup.cnf
+sudo chown root:root /etc/autostream-local-executor/mariadb-backup.cnf
+sudo chmod 0600 /etc/autostream-local-executor/mariadb-backup.cnf
 ```
 
-Set the root-only defaults file to a dedicated backup account. A shared host
-may reuse the same account/file used by the Control Panel if that account also
-has the Observability grant:
+Set the root-only Local Executor defaults file to a dedicated backup account.
+Keep it separate from the service environment under `/etc/autostream`; never
+copy a service `DATABASE_URL` or application database credentials into it. A
+shared host may reuse this account/file for the Control Panel if that account
+also has the Observability grant:
 
 ```ini
 [client]
@@ -125,8 +127,8 @@ with a letter or digit.
 
 Select the database name once below, then keep the same shell open. The same
 exact `DATABASE_NAME` must be used for the MariaDB grant, the real dump, and the
-second `backup_argv` item. In this example, replace the default with the final
-path component of the real `DATABASE_URL` when they differ:
+server-owned target setting. In this example, replace the default with the
+final path component of the real `DATABASE_URL` when they differ:
 
 ```bash
 set -euo pipefail
@@ -140,21 +142,17 @@ sudo mariadb <<SQL
 GRANT SELECT, SHOW VIEW, TRIGGER ON \`${DATABASE_NAME}\`.* TO 'autostream_backup'@'127.0.0.1';
 SQL
 
-test "$(sudo stat -c '%u:%a' /etc/autostream/mariadb-backup.cnf)" = "0:600"
+test "$(sudo stat -c '%u:%a' /etc/autostream-local-executor/mariadb-backup.cnf)" = "0:600"
 test "$(sudo stat -c '%u:%a' /usr/local/sbin/autostream-backup-observability)" = "0:700"
 sudo /usr/local/sbin/autostream-backup-observability "$DATABASE_NAME"
-printf 'Use this exact database name as the second backup_argv item: %s\n' "$DATABASE_NAME"
+printf 'Database name to save in System Updates: %s\n' "$DATABASE_NAME"
 ```
 
-Copy the value printed by that command into the root-owned host policy. It is
-never supplied by an update job or the browser:
-
-```json
-"backup_argv": [
-  "/usr/local/sbin/autostream-backup-observability",
-  "replace-with-the-exact-DATABASE_NAME-printed-above"
-]
-```
+Save the printed value for the Observability target in **Application Info > System Updates**.
+It is persisted as the server-owned `database_name` and
+combined only with the compiled fixed backup executable. Do not edit `/etc/autostream-local-executor/policy.json`;
+rerun the Host Agent configure flow after saving so it can stage the canonical
+root policy.
 
 The script uses `umask 077` and atomically renames a timestamped, non-empty
 dump only after `mariadb-dump` succeeds. Configure retention and encrypted

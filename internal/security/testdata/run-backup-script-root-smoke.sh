@@ -22,13 +22,15 @@ for database in "$DEFAULT_DATABASE" "$CUSTOM_DATABASE"; do
   }
 done
 
-mkdir -p /etc/autostream "$BACKUP_DIR" /usr/local/sbin
+mkdir -p "$BACKUP_DIR" /usr/local/sbin
+install -d -o root -g root -m 0700 /etc/autostream-local-executor
 install -m 0700 "$SOURCE_SCRIPT" "$INSTALLED_SCRIPT"
-printf '[client]\nuser=smoke\npassword=not-used\n' > /etc/autostream/mariadb-backup.cnf
-chmod 0600 /etc/autostream/mariadb-backup.cnf
+printf '[client]\nuser=smoke\npassword=not-used\n' > /etc/autostream-local-executor/mariadb-backup.cnf
+chmod 0600 /etc/autostream-local-executor/mariadb-backup.cnf
 chmod 0700 "$BACKUP_DIR"
 [[ "$(stat -c '%u:%g:%a' "$INSTALLED_SCRIPT")" == "0:0:700" ]]
-[[ "$(stat -c '%u:%g:%a' /etc/autostream/mariadb-backup.cnf)" == "0:0:600" ]]
+[[ "$(stat -c '%u:%g:%a' /etc/autostream-local-executor)" == "0:0:700" ]]
+[[ "$(stat -c '%u:%g:%a' /etc/autostream-local-executor/mariadb-backup.cnf)" == "0:0:600" ]]
 [[ "$(stat -c '%u:%g:%a' "$BACKUP_DIR")" == "0:0:700" ]]
 
 cat > /usr/bin/mariadb-dump <<'DUMP'
@@ -44,7 +46,7 @@ assert_dump() {
   shift
   local output content partials
   local -a argv=() expected_argv=(
-    "--defaults-extra-file=/etc/autostream/mariadb-backup.cnf"
+    "--defaults-extra-file=/etc/autostream-local-executor/mariadb-backup.cnf"
     "--single-transaction"
     "--quick"
     "--skip-lock-tables"
