@@ -183,7 +183,13 @@ func TestObservabilityInstallerIntegrationFixtureCoversPrivilegedTransitions(t *
 		`fresh installer did not create the autostream account`,
 		`fresh installer unexpectedly started the service`,
 		`fresh installer unexpectedly enabled the service`,
+		`legacy_unit_file_state="$(systemctl is-enabled "${UNIT}" 2>/dev/null || true)"`,
+		`legacy fixture must begin disabled`,
 		`systemctl show --property MainPID`,
+		`normalize_boundary_directory /opt 0755`,
+		`normalize_boundary_directory /usr/local/bin 0755`,
+		`if ! restore_normalized_boundary_directories; then`,
+		`$(stat -c '%d:%i' -- "${path}") == "${original_identity}"`,
 		`/var/backups/autostream/install-migrations/observability`,
 		`published_at: "2026-07-29T00:00:00Z"`,
 		`minimum_agent_version: "v2.0.0"`,
@@ -194,5 +200,12 @@ func TestObservabilityInstallerIntegrationFixtureCoversPrivilegedTransitions(t *
 		if !strings.Contains(fixture, marker) {
 			t.Fatalf("Observability installer integration fixture is missing %q", marker)
 		}
+	}
+	const safeAccountReset = "userdel autostream\nif getent group autostream >/dev/null 2>&1; then\n  groupdel autostream\nfi"
+	if count := strings.Count(fixture, safeAccountReset); count != 2 {
+		t.Fatalf("expected two account resets that tolerate userdel removing the private group, got %d", count)
+	}
+	if count := strings.Count(fixture, "[Install]\nWantedBy=multi-user.target"); count != 2 {
+		t.Fatalf("integration fixture must define two enable-capable but disabled units, got %d", count)
 	}
 }
