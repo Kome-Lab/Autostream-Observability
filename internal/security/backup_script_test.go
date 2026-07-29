@@ -69,7 +69,8 @@ func TestObservabilityInstallGuidePassesConfiguredDatabaseName(t *testing.T) {
 	}
 	guide := string(body)
 	for _, want := range []string{
-		"sudo install -d -o root -g root -m 0700 /etc/autostream-local-executor",
+		"The installer places the verified backup executable",
+		"safely creates an empty",
 		observabilityBackupDefaultsFile,
 		"DATABASE_NAME='autostream_observability'",
 		"exact `DATABASE_NAME` must be used for the MariaDB grant, the real dump, and the",
@@ -85,6 +86,23 @@ func TestObservabilityInstallGuidePassesConfiguredDatabaseName(t *testing.T) {
 	}
 	if strings.Contains(guide, "/etc/autostream/mariadb-backup.cnf") {
 		t.Fatal("Observability install guide must not place Local Executor credentials in the service configuration directory")
+	}
+
+	installerBody, err := os.ReadFile(filepath.Join("..", "..", "release", "install-autostream-observability"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(installerBody)
+	for _, want := range []string{
+		`readonly BACKUP_CONFIG_DIR="/etc/autostream-local-executor"`,
+		`readonly BACKUP_CONFIG_DEST="${BACKUP_CONFIG_DIR}/mariadb-backup.cnf"`,
+		`ensure_safe_root_directory "${BACKUP_CONFIG_DIR}" 0700 "${BACKUP_CONFIG_DIR}"`,
+		`install -o root -g root -m 0600 /dev/null "${backup_config_stage}"`,
+		`backup_config_sha_before=$(sha256sum -- "${BACKUP_CONFIG_DEST}"`,
+	} {
+		if !strings.Contains(installer, want) {
+			t.Fatalf("Observability installer is missing automatic backup-config handling %q", want)
+		}
 	}
 	grant := strings.Index(guide, "GRANT SELECT, SHOW VIEW, TRIGGER")
 	dump := strings.Index(guide, `sudo /usr/local/sbin/autostream-backup-observability "$DATABASE_NAME"`)

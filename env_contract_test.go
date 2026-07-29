@@ -54,8 +54,10 @@ func TestHostBindContractIsConfigurableAndUnprivileged(t *testing.T) {
 	for _, required := range []string{
 		"AUTOSTREAM_CONFIG_REVISION=1",
 		"version, service_id, service_type, and config_revision",
-		`PROBE_HOST="${PROBE_HOST:-127.0.0.1}"`,
-		"PROBE_HOST='[::1]'",
+		"sudo vi /etc/autostream/observability.env",
+		"sudo systemctl enable --now autostream-observability",
+		"sudo systemctl restart autostream-observability",
+		"http://[::1]:18082/health",
 	} {
 		if !strings.Contains(install, required) {
 			t.Errorf("release install guide is missing %q", required)

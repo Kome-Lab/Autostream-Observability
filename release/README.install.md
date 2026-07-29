@@ -5,97 +5,84 @@ This archive contains the Linux binary, systemd example, and placeholder environ
 ## Requirements
 
 - Linux amd64 or arm64 matching the archive name.
-- A dedicated `autostream` user and group.
-- Authenticated `gh`, `jq`, `sha256sum`, and `curl` for release verification, plus
-  `/usr/bin/mariadb-dump` for the required pre-update backup.
+- Root access through `sudo`; the installer creates the `autostream` system
+  account when it is absent.
+- `jq`, `sha256sum`, `tar`, systemd, and `/usr/bin/mariadb-dump`. `curl` is used
+  by the post-start health check.
+- Authenticated GitHub CLI (`gh`) on the server for the required
+  release-manifest attestation check.
 - Database and notification provider settings supplied outside Git.
 - Network access to the Control Panel and monitored services.
 
 ## Install a verified managed release
 
-The systemd unit runs the binary through
-`/opt/autostream/observability/current`. Seed that link from the same immutable
-release manifest and checksum that supplied the archive. `autostream-updater`
-refuses an unseeded target because it would have no verified rollback release.
-When replacing an existing Observability service manually, record the current
-link and complete a database backup before running the switch below.
+Download these four assets from the same authenticated official GitHub Release
+to `/tmp`:
+
+- `autostream-observability_vX.Y.Z_linux_amd64.tar.gz`
+- `autostream-observability_vX.Y.Z_linux_amd64.tar.gz.sha256`
+- `release-manifest.json`
+- `release-manifest.json.sha256`
+
+Copy them into a root-owned staging directory:
 
 ```bash
-set -euo pipefail
-VERSION="${VERSION:?export VERSION=vX.Y.Z before continuing}"
-ARCH="${ARCH:-amd64}"
-ASSET="autostream-observability_${VERSION}_linux_${ARCH}.tar.gz"
-ARTIFACT_ROOT=/opt/autostream/releases
-
-sudo install -d -o root -g root -m 0755 "$ARTIFACT_ROOT"
-sudo install -d -o "$USER" -g "$USER" -m 0755 "$ARTIFACT_ROOT/artifacts"
-gh release download "$VERSION" \
-  --repo Kome-Lab/Autostream-Observability \
-  --pattern "$ASSET" \
-  --pattern "$ASSET.sha256" \
-  --pattern release-manifest.json \
-  --pattern release-manifest.json.sha256 \
-  --dir "$ARTIFACT_ROOT/artifacts" \
-  --clobber
-(cd "$ARTIFACT_ROOT/artifacts" && sha256sum --check --strict "$ASSET.sha256")
-(cd "$ARTIFACT_ROOT/artifacts" && sha256sum --check --strict release-manifest.json.sha256)
-
-DIGEST="$(awk 'NR == 1 { print $1 }' "$ARTIFACT_ROOT/artifacts/$ASSET.sha256")"
-[[ "$DIGEST" =~ ^[0-9a-f]{64}$ ]]
-jq -e --arg version "$VERSION" --arg asset "$ASSET" --arg sha "$DIGEST" \
-  '.schema_version == 1 and .release_id == $version and .channel == "host" and
-   ([.components[] | select(.service == "observability" and .source_version == $version) |
-     .artifacts[] | select(.name == $asset and .sha256 == $sha)] | length == 1)' \
-  "$ARTIFACT_ROOT/artifacts/release-manifest.json"
-
-RELEASE_ROOT=/opt/autostream/observability/releases
-RELEASE_DIR="$RELEASE_ROOT/${VERSION}-${DIGEST:0:12}"
-CURRENT_LINK=/opt/autostream/observability/current
-sudo test ! -e "$RELEASE_DIR"
-sudo install -d -o root -g root -m 0755 "$RELEASE_DIR"
-sudo tar --no-same-owner --strip-components=1 -xzf "$ARTIFACT_ROOT/artifacts/$ASSET" -C "$RELEASE_DIR"
-(cd "$RELEASE_DIR" && sha256sum --check --strict checksums.txt)
-printf '%s\n' "$DIGEST" | sudo tee "$RELEASE_DIR/.artifact-sha256" >/dev/null
-printf '%s\n' "$VERSION" | sudo tee "$RELEASE_DIR/.version" >/dev/null
-sudo chown root:root "$RELEASE_DIR/.artifact-sha256" "$RELEASE_DIR/.version"
-sudo chmod 0444 "$RELEASE_DIR/.artifact-sha256" "$RELEASE_DIR/.version"
-sudo /usr/sbin/runuser -u autostream -- "$RELEASE_DIR/bin/autostream-observability" --version | grep -F -- "$VERSION"
-
-sudo ln -s "$RELEASE_DIR" "${CURRENT_LINK}.next"
-sudo mv -Tf "${CURRENT_LINK}.next" "$CURRENT_LINK"
-sudo ln -sfn "$CURRENT_LINK/bin/autostream-observability" /usr/local/bin/autostream-observability
-sudo ln -sfn /usr/local/bin/autostream-observability /usr/local/bin/observability
-sudo install -d -o autostream -g autostream /var/lib/autostream/observability
-sudo install -d -o root -g root -m 0750 /etc/autostream
-sudo install -o root -g root -m 0644 "$RELEASE_DIR/systemd/autostream-observability.service.example" /etc/systemd/system/autostream-observability.service
-if ! sudo test -e /etc/autostream/observability.env; then
-  sudo install -o root -g root -m 0640 "$RELEASE_DIR/.env.example" /etc/autostream/observability.env
-else
-  echo "preserving existing /etc/autostream/observability.env; review .env.example for new settings"
-fi
+sudo install -d -o root -g root -m 0755 /opt/autostream/releases
+sudo install -d -o root -g root -m 0755 /opt/autostream/releases/artifacts
+sudo install -o root -g root -m 0644 /tmp/autostream-observability_vX.Y.Z_linux_amd64.tar.gz /opt/autostream/releases/artifacts/autostream-observability_vX.Y.Z_linux_amd64.tar.gz
+sudo install -o root -g root -m 0644 /tmp/autostream-observability_vX.Y.Z_linux_amd64.tar.gz.sha256 /opt/autostream/releases/artifacts/autostream-observability_vX.Y.Z_linux_amd64.tar.gz.sha256
+sudo install -o root -g root -m 0644 /tmp/release-manifest.json /opt/autostream/releases/artifacts/release-manifest.json
+sudo install -o root -g root -m 0644 /tmp/release-manifest.json.sha256 /opt/autostream/releases/artifacts/release-manifest.json.sha256
+cd /opt/autostream/releases/artifacts
 ```
 
-## Prepare the updater backup command
-
-An Observability target is fail-closed unless its fixed backup command exists
-and succeeds. Install the verified script from this release and prepare its
-private directory and MariaDB client defaults:
+As the ordinary login user, verify both the root-owned archive and manifest
+copies. Do not continue if either command fails:
 
 ```bash
-set -euo pipefail
-RELEASE_DIR="$(readlink -f /opt/autostream/observability/current)"
-test -x "$RELEASE_DIR/backup/autostream-backup-observability"
-sudo install -d -o root -g root -m 0700 /var/backups/autostream/observability
-sudo install -o root -g root -m 0700 "$RELEASE_DIR/backup/autostream-backup-observability" /usr/local/sbin/autostream-backup-observability
-sudo install -d -o root -g root -m 0700 /etc/autostream-local-executor
-if ! sudo test -e /etc/autostream-local-executor/mariadb-backup.cnf; then
-  sudo install -o root -g root -m 0600 /dev/null /etc/autostream-local-executor/mariadb-backup.cnf
-else
-  echo "preserving existing /etc/autostream-local-executor/mariadb-backup.cnf"
-fi
-sudo chown root:root /etc/autostream-local-executor/mariadb-backup.cnf
-sudo chmod 0600 /etc/autostream-local-executor/mariadb-backup.cnf
+gh attestation verify autostream-observability_vX.Y.Z_linux_amd64.tar.gz --repo Kome-Lab/Autostream-Observability --signer-workflow Kome-Lab/Autostream-Observability/.github/workflows/release-host.yml --deny-self-hosted-runners
+gh attestation verify release-manifest.json --repo Kome-Lab/Autostream-Observability --signer-workflow Kome-Lab/Autostream-Observability/.github/workflows/release-host.yml --deny-self-hosted-runners
 ```
+
+The direct archive attestation authenticates the installer before root executes
+it. The separately attested manifest binds that same archive by name, size,
+digest, version, service, and architecture. Extract the root-owned archive,
+then run its bundled installer:
+
+```bash
+sudo test ! -e autostream-observability_vX.Y.Z_linux_amd64
+sudo test ! -L autostream-observability_vX.Y.Z_linux_amd64
+sudo tar --no-same-owner --no-same-permissions -xzf autostream-observability_vX.Y.Z_linux_amd64.tar.gz
+cd autostream-observability_vX.Y.Z_linux_amd64
+sudo ./install-autostream-observability
+```
+
+The installer verifies the archive checksum, release-manifest tuple, archive
+layout, inner checksums, architecture, and embedded binary version. It creates
+the `autostream` system account when needed, prepares the state and backup
+directories, preserves an existing `/etc/autostream/observability.env`
+byte-for-byte, installs the systemd unit, and runs `systemctl daemon-reload`.
+It does not enable, start, or restart the service.
+
+`/usr/local/bin/autostream-observability` and `/usr/local/bin/observability`
+remain the stable operator-facing commands. The verified releases, markers,
+and `current` link under `/opt/autostream/observability` are installer-owned
+rollback state; do not create or edit them manually.
+
+When migrating a direct installation, the installer retains the replaced
+regular binaries, unit, and backup executable under the root-only
+`/var/backups/autostream/install-migrations/observability` tree, outside the
+service-writable state directory. Its final message prints `restart` for a
+service that was already active, or `enable --now` for a fresh or inactive
+installation; it never runs either command automatically.
+
+## Configure the updater backup command
+
+The installer places the verified backup executable at
+`/usr/local/sbin/autostream-backup-observability`, prepares
+`/var/backups/autostream/observability`, and safely creates an empty
+`/etc/autostream-local-executor/mariadb-backup.cnf` only when it is absent.
+Existing credentials are preserved byte-for-byte.
 
 Set the root-only Local Executor defaults file to a dedicated backup account.
 Keep it separate from the service environment under `/etc/autostream`; never
@@ -173,40 +160,39 @@ Keep this root-owned file at mode `0640` and include
 increment it after applying a new service configuration. Invalid values stop
 Observability before it connects to MariaDB or starts serving HTTP.
 
-Set `OBSERVABILITY_PORT` below to the port component of
-`OBSERVABILITY_BIND_ADDR`, then run:
+For a fresh or currently stopped installation, edit the environment file and
+start the service:
 
 ```bash
-set -euo pipefail
-VERSION="${VERSION:?export VERSION=vX.Y.Z before continuing}"
-OBSERVABILITY_PORT="${OBSERVABILITY_PORT:-8082}"
-PROBE_HOST="${PROBE_HOST:-127.0.0.1}"
-[[ "$OBSERVABILITY_PORT" =~ ^[0-9]+$ ]]
-(( OBSERVABILITY_PORT >= 1024 && OBSERVABILITY_PORT <= 65535 ))
-sudo systemctl daemon-reload
-sudo systemctl enable autostream-observability
-sudo systemctl restart autostream-observability
-PID="$(sudo systemctl show --property=MainPID --value autostream-observability)"
-EXPECTED="$(sudo readlink -f /opt/autostream/observability/current/bin/autostream-observability)"
-test "$(sudo readlink -f "/proc/$PID/exe")" = "$EXPECTED"
-curl --fail --silent --show-error --max-time 10 \
-  "http://${PROBE_HOST}:${OBSERVABILITY_PORT}/health" >/dev/null
-test "$(curl --fail --silent --show-error --max-time 10 \
-  "http://${PROBE_HOST}:${OBSERVABILITY_PORT}/updater/version" | jq -r '.version')" = "$VERSION"
+sudo vi /etc/autostream/observability.env
+sudo systemctl enable --now autostream-observability
+sudo systemctl status --no-pager autostream-observability
+autostream-observability --version
+curl --fail --silent --show-error http://127.0.0.1:8082/health
+curl --fail --silent --show-error http://127.0.0.1:8082/updater/version | jq .
 ```
 
-The standard systemd/local-executor profile uses IPv4 loopback. For an explicit
-IPv6 loopback bind such as `OBSERVABILITY_BIND_ADDR=[::1]:18082`, run the smoke
-check with `PROBE_HOST='[::1]' OBSERVABILITY_PORT=18082`; the brackets are
-required in the URL.
+When replacing a service that is already running, use these commands after
+editing the environment file:
+
+```bash
+sudo systemctl restart autostream-observability
+sudo systemctl status --no-pager autostream-observability
+```
+
+The curl examples use the default IPv4 loopback port. If
+`OBSERVABILITY_BIND_ADDR` uses another port, use that configured port in both
+URLs. For an IPv6 loopback such as `[::1]:18082`, use brackets in the URL:
+`http://[::1]:18082/health`.
 
 `/updater/version` is the unauthenticated, identity-bound local executor probe.
 Its exact response fields are version, service_id, service_type, and config_revision.
 The service ID comes from the same Control Panel node config used by
 registration. Block this exact path at any public reverse proxy.
 
-Do not fabricate `.artifact-sha256` or `.version` from an unverified local
-binary. Releases without `release-manifest.json` remain manual-only; publish a
+Do not fabricate `.artifact-sha256` or `.version` from a local binary. The
+installer creates those markers only after verifying the immutable release
+inputs. Releases without `release-manifest.json` remain manual-only; publish a
 new release instead of modifying an existing release asset.
 
 Do not commit real `.env` files, provider credentials, tokens, logs, screenshots, or verification record.
