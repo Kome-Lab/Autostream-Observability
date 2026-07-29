@@ -61,9 +61,13 @@ password=observability-installer-integration-preserve-exactly"
 created_autostream_user=false
 created_mariadb_dump=false
 old_pid=""
+usr_local_bin_mode_captured=false
+usr_local_bin_original_mode=""
+usr_local_bin_original_identity=""
 
 cleanup() {
   local exit_code=$?
+  local cleanup_failed=false
   set +e
   systemctl stop "${UNIT}" >/dev/null 2>&1
   systemctl disable "${UNIT}" >/dev/null 2>&1
@@ -100,9 +104,49 @@ cleanup() {
     userdel autostream >/dev/null 2>&1
     groupdel autostream >/dev/null 2>&1
   fi
+  if [[ ${usr_local_bin_mode_captured} == true ]]; then
+    if [[ -d /usr/local/bin &&
+      ! -L /usr/local/bin &&
+      $(readlink -f -- /usr/local/bin) == "/usr/local/bin" &&
+      $(stat -c '%U:%G' -- /usr/local/bin) == "root:root" &&
+      $(stat -c '%d:%i' -- /usr/local/bin) == "${usr_local_bin_original_identity}" ]] &&
+      chmod "${usr_local_bin_original_mode}" /usr/local/bin &&
+      [[ $(stat -c '%U:%G:%a' -- /usr/local/bin) == \
+        "root:root:${usr_local_bin_original_mode}" ]]; then
+      :
+    else
+      printf '%s\n' \
+        "observability installer integration test: failed to restore /usr/local/bin mode ${usr_local_bin_original_mode}" \
+        >&2
+      cleanup_failed=true
+    fi
+  fi
+  if [[ ${cleanup_failed} == true && ${exit_code} -eq 0 ]]; then
+    exit_code=1
+  fi
   exit "${exit_code}"
 }
 trap cleanup EXIT
+
+[[ -d /usr/local/bin && ! -L /usr/local/bin ]] || \
+  die "/usr/local/bin must be a real directory"
+[[ $(readlink -f -- /usr/local/bin) == "/usr/local/bin" ]] || \
+  die "/usr/local/bin must resolve to its canonical path"
+[[ $(stat -c '%U:%G' -- /usr/local/bin) == "root:root" ]] || \
+  die "/usr/local/bin must be owned by root:root"
+usr_local_bin_original_mode=$(stat -c '%a' -- /usr/local/bin) || \
+  die "could not capture /usr/local/bin mode"
+[[ ${usr_local_bin_original_mode} =~ ^[0-7]{3,4}$ ]] || \
+  die "/usr/local/bin mode is invalid"
+usr_local_bin_original_identity=$(stat -c '%d:%i' -- /usr/local/bin) || \
+  die "could not capture /usr/local/bin identity"
+[[ ${usr_local_bin_original_identity} =~ ^[0-9]+:[0-9]+$ ]] || \
+  die "/usr/local/bin identity is invalid"
+usr_local_bin_mode_captured=true
+chmod 0755 /usr/local/bin
+[[ $(stat -c '%U:%G:%a' -- /usr/local/bin) == "root:root:755" ]] || \
+  die "failed to normalize /usr/local/bin to root:root mode 0755"
+
 chmod 0755 "${WORK_DIR}"
 
 for path in \
@@ -292,6 +336,11 @@ set -e
 [[ ${mktemp_failure_status} -ne 0 ]] || die "mktemp failure injection unexpectedly succeeded"
 grep -Fx -- "mounted" "${MKTEMP_MOUNT_MARKER}" >/dev/null || \
   die "mktemp failure injection did not mount the wrapper"
+if [[ ! -f ${MKTEMP_CALL_LOG} || -L ${MKTEMP_CALL_LOG} ]]; then
+  printf '%s\n' "mktemp failure injection exited before the production mktemp call:" >&2
+  cat "${WORK_DIR}/mktemp-failure.out" >&2
+  die "mktemp failure injection did not reach the staging call"
+fi
 [[ $(wc -l < "${MKTEMP_CALL_LOG}") -eq 1 ]] || \
   die "mktemp failure injection did not reach exactly the staging call"
 grep -Fx -- "-d /opt/autostream/observability/.install.XXXXXX" \

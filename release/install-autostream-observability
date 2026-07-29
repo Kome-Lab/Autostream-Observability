@@ -145,6 +145,8 @@ ensure_exact_directory() {
   local mode=$4
   local label=$5
   local existing_mode
+  local expected_mode=${mode#0}
+  [[ ${expected_mode} =~ ^[0-7]{3,4}$ ]] || die "${label} requested mode is invalid"
   if [[ -e ${path} || -L ${path} ]]; then
     [[ -d ${path} && ! -L ${path} ]] || die "${label} must be a non-symlink directory"
     [[ $(stat -c '%U:%G' -- "${path}") == "${owner}:${group}" ]] || \
@@ -157,7 +159,7 @@ ensure_exact_directory() {
   fi
   install -d -o "${owner}" -g "${group}" -m "${mode}" -- "${path}"
   [[ -d ${path} && ! -L ${path} ]] || die "${label} was not created safely"
-  [[ $(stat -c '%U:%G:%a' -- "${path}") == "${owner}:${group}:${mode}" ]] || \
+  [[ $(stat -c '%U:%G:%a' -- "${path}") == "${owner}:${group}:${expected_mode}" ]] || \
     die "${label} owner or mode is invalid"
   [[ $(readlink -f -- "${path}") == "${path}" ]] || \
     die "${label} must resolve to its exact canonical path"
