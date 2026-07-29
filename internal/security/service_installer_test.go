@@ -186,10 +186,16 @@ func TestObservabilityInstallerIntegrationFixtureCoversPrivilegedTransitions(t *
 		`legacy_unit_file_state="$(systemctl is-enabled "${UNIT}" 2>/dev/null || true)"`,
 		`legacy fixture must begin disabled`,
 		`systemctl show --property MainPID`,
-		`normalize_boundary_directory /opt 0755`,
-		`normalize_boundary_directory /usr/local/bin 0755`,
-		`if ! restore_normalized_boundary_directories; then`,
-		`$(stat -c '%d:%i' -- "${path}") == "${original_identity}"`,
+		`AUTOSTREAM_OBSERVABILITY_INSTALLER_TEST_MOUNT_NS`,
+		`autostream-observability-installer-test-bin /usr/local/bin`,
+		`autostream-observability-installer-test-sbin /usr/local/sbin`,
+		`autostream-observability-installer-test-opt /opt`,
+		`isolated /usr/local/bin mount is missing`,
+		`isolated /usr/local/sbin mount is missing`,
+		`isolated /opt mount is missing`,
+		`could not create an isolated safe /usr/local/bin fixture`,
+		`could not create an isolated safe /usr/local/sbin fixture`,
+		`could not create an isolated safe /opt fixture`,
 		`/var/backups/autostream/install-migrations/observability`,
 		`published_at: "2026-07-29T00:00:00Z"`,
 		`minimum_agent_version: "v2.0.0"`,
@@ -200,6 +206,14 @@ func TestObservabilityInstallerIntegrationFixtureCoversPrivilegedTransitions(t *
 		if !strings.Contains(fixture, marker) {
 			t.Fatalf("Observability installer integration fixture is missing %q", marker)
 		}
+	}
+	namespaceIndex := strings.Index(
+		fixture,
+		`if [[ ${AUTOSTREAM_OBSERVABILITY_INSTALLER_TEST_MOUNT_NS:-} != "1" ]]; then`,
+	)
+	workDirIndex := strings.Index(fixture, `readonly WORK_DIR="$(mktemp`)
+	if namespaceIndex < 0 || workDirIndex < 0 || namespaceIndex >= workDirIndex {
+		t.Fatal("installer integration fixture must enter its isolated mount namespace before creating mutable state")
 	}
 	const safeAccountReset = "userdel autostream\nif getent group autostream >/dev/null 2>&1; then\n  groupdel autostream\nfi"
 	if count := strings.Count(fixture, safeAccountReset); count != 2 {

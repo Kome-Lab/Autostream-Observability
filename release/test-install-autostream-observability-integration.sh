@@ -13,6 +13,30 @@ die() {
 [[ ${EUID} -eq 0 ]] || die "must run as root"
 [[ $(uname -m) == "x86_64" ]] || die "this integration fixture requires an amd64 Linux runner"
 
+if [[ ${AUTOSTREAM_OBSERVABILITY_INSTALLER_TEST_MOUNT_NS:-} != "1" ]]; then
+  exec unshare --mount --propagation private bash -c '
+    mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
+      autostream-observability-installer-test-bin /usr/local/bin
+    mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
+      autostream-observability-installer-test-sbin /usr/local/sbin
+    mount -t tmpfs -o nodev,nosuid,mode=0755,uid=0,gid=0 \
+      autostream-observability-installer-test-opt /opt
+    exec env AUTOSTREAM_OBSERVABILITY_INSTALLER_TEST_MOUNT_NS=1 bash "$1"
+  ' autostream-observability-installer-test-mount "$0"
+fi
+grep -Eq ' /usr/local/bin .* - tmpfs autostream-observability-installer-test-bin ' \
+  /proc/self/mountinfo || die "isolated /usr/local/bin mount is missing"
+grep -Eq ' /usr/local/sbin .* - tmpfs autostream-observability-installer-test-sbin ' \
+  /proc/self/mountinfo || die "isolated /usr/local/sbin mount is missing"
+grep -Eq ' /opt .* - tmpfs autostream-observability-installer-test-opt ' \
+  /proc/self/mountinfo || die "isolated /opt mount is missing"
+[[ $(stat -c '%U:%G:%a' -- /usr/local/bin) == "root:root:755" ]] || \
+  die "could not create an isolated safe /usr/local/bin fixture"
+[[ $(stat -c '%U:%G:%a' -- /usr/local/sbin) == "root:root:755" ]] || \
+  die "could not create an isolated safe /usr/local/sbin fixture"
+[[ $(stat -c '%U:%G:%a' -- /opt) == "root:root:755" ]] || \
+  die "could not create an isolated safe /opt fixture"
+
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly INSTALLER_SOURCE="${SCRIPT_DIR}/install-autostream-observability"
 readonly VERSION="v9.9.9"
@@ -61,77 +85,9 @@ password=observability-installer-integration-preserve-exactly"
 created_autostream_user=false
 created_mariadb_dump=false
 old_pid=""
-declare -a normalized_boundary_paths=()
-declare -a normalized_boundary_original_modes=()
-declare -a normalized_boundary_original_identities=()
-
-normalize_boundary_directory() {
-  local path=$1
-  local normalized_mode=$2
-  local expected_mode=${normalized_mode#0}
-  local original_mode
-  local original_identity
-
-  [[ -d ${path} && ! -L ${path} ]] || \
-    die "${path} must be a real directory"
-  [[ $(readlink -f -- "${path}") == "${path}" ]] || \
-    die "${path} must resolve to its canonical path"
-  [[ $(stat -c '%U:%G' -- "${path}") == "root:root" ]] || \
-    die "${path} must be owned by root:root"
-  original_mode=$(stat -c '%a' -- "${path}") || \
-    die "could not capture ${path} mode"
-  [[ ${original_mode} =~ ^[0-7]{3,4}$ ]] || \
-    die "${path} mode is invalid"
-  original_identity=$(stat -c '%d:%i' -- "${path}") || \
-    die "could not capture ${path} identity"
-  [[ ${original_identity} =~ ^[0-9]+:[0-9]+$ ]] || \
-    die "${path} identity is invalid"
-
-  normalized_boundary_paths+=("${path}")
-  normalized_boundary_original_modes+=("${original_mode}")
-  normalized_boundary_original_identities+=("${original_identity}")
-
-  chmod "${normalized_mode}" -- "${path}" || \
-    die "failed to normalize ${path} to root:root mode ${normalized_mode}"
-  [[ $(stat -c '%U:%G:%a' -- "${path}") == "root:root:${expected_mode}" ]] || \
-    die "failed to normalize ${path} to root:root mode ${normalized_mode}"
-}
-
-restore_normalized_boundary_directories() {
-  local index
-  local path
-  local original_mode
-  local original_identity
-  local restore_failed=false
-
-  for ((index=${#normalized_boundary_paths[@]} - 1; index >= 0; index--)); do
-    path=${normalized_boundary_paths[index]}
-    original_mode=${normalized_boundary_original_modes[index]}
-    original_identity=${normalized_boundary_original_identities[index]}
-
-    if [[ -d ${path} &&
-      ! -L ${path} &&
-      $(readlink -f -- "${path}") == "${path}" &&
-      $(stat -c '%U:%G' -- "${path}") == "root:root" &&
-      $(stat -c '%d:%i' -- "${path}") == "${original_identity}" ]] &&
-      chmod "${original_mode}" -- "${path}" &&
-      [[ $(stat -c '%U:%G:%a' -- "${path}") == "root:root:${original_mode}" ]]; then
-      :
-    else
-      printf 'observability installer integration test: failed to restore %s mode %s\n' \
-        "${path}" \
-        "${original_mode}" \
-        >&2
-      restore_failed=true
-    fi
-  done
-
-  [[ ${restore_failed} == false ]]
-}
 
 cleanup() {
   local exit_code=$?
-  local cleanup_failed=false
   set +e
   systemctl stop "${UNIT}" >/dev/null 2>&1
   systemctl disable "${UNIT}" >/dev/null 2>&1
@@ -168,18 +124,9 @@ cleanup() {
     userdel autostream >/dev/null 2>&1
     groupdel autostream >/dev/null 2>&1
   fi
-  if ! restore_normalized_boundary_directories; then
-    cleanup_failed=true
-  fi
-  if [[ ${cleanup_failed} == true && ${exit_code} -eq 0 ]]; then
-    exit_code=1
-  fi
   exit "${exit_code}"
 }
 trap cleanup EXIT
-
-normalize_boundary_directory /opt 0755
-normalize_boundary_directory /usr/local/bin 0755
 
 chmod 0755 "${WORK_DIR}"
 
