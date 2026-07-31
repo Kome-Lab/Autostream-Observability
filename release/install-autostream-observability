@@ -1135,15 +1135,23 @@ rollback_created_managed_release() {
 }
 
 rollback_journaled_directories() {
-  local index path current_mode failed=false
+  local index path current_owner current_mode failed=false
   for ((index=${#journaled_directory_paths[@]} - 1; index >= 0; index--)); do
     path="${journaled_directory_paths[index]}"
     if [[ ${directory_existed["${path}"]} == true ]]; then
       if [[ -d ${path} && ! -L ${path} &&
         $(readlink -f -- "${path}") == "${path}" &&
         $(stat -c '%d:%i' -- "${path}") == "${directory_original_identity["${path}"]}" ]]; then
-        chown -- "${directory_original_owner["${path}"]}" "${path}" || failed=true
-        chmod -- "${directory_original_mode["${path}"]}" "${path}" || failed=true
+        if ! current_owner=$(stat -c '%u:%g' -- "${path}"); then
+          failed=true
+        elif [[ ${current_owner} != "${directory_original_owner["${path}"]}" ]]; then
+          chown -- "${directory_original_owner["${path}"]}" "${path}" || failed=true
+        fi
+        if ! current_mode=$(stat -c '%a' -- "${path}"); then
+          failed=true
+        elif [[ ${current_mode} != "${directory_original_mode["${path}"]}" ]]; then
+          chmod -- "${directory_original_mode["${path}"]}" "${path}" || failed=true
+        fi
         [[ $(stat -c '%d:%i:%u:%g:%a' -- "${path}") == \
           "${directory_original_identity["${path}"]}:${directory_original_owner["${path}"]}:${directory_original_mode["${path}"]}" ]] || \
           failed=true

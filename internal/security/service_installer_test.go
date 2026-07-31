@@ -852,3 +852,37 @@ func TestObservabilityDirectoryJournalPublishesCompleteSnapshotInsideSignalTrans
 		t.Fatal("directory journal must publish every keyed field and its order atomically before delivering a pending signal")
 	}
 }
+
+func TestObservabilityDirectoryRollbackLeavesMatchingPreexistingMetadataUntouched(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "release", "install-autostream-observability"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(body)
+
+	start := strings.Index(installer, "rollback_journaled_directories() {")
+	if start < 0 {
+		t.Fatal("installer is missing the directory journal rollback function")
+	}
+	endOffset := strings.Index(installer[start:], "\n}\n\nrollback_autostream_account()")
+	if endOffset < 0 {
+		t.Fatal("installer directory journal rollback function has no bounded end")
+	}
+	rollback := installer[start : start+endOffset]
+
+	ownerGuard := `elif [[ ${current_owner} != "${directory_original_owner["${path}"]}" ]]; then
+          chown -- "${directory_original_owner["${path}"]}" "${path}" || failed=true`
+	modeGuard := `elif [[ ${current_mode} != "${directory_original_mode["${path}"]}" ]]; then
+          chmod -- "${directory_original_mode["${path}"]}" "${path}" || failed=true`
+	if !strings.Contains(rollback, ownerGuard) || !strings.Contains(rollback, modeGuard) {
+		t.Fatal("directory rollback must avoid no-op chown/chmod calls that change pre-existing directory ctime")
+	}
+	if count := strings.Count(rollback,
+		`chown -- "${directory_original_owner["${path}"]}" "${path}"`); count != 1 {
+		t.Fatalf("expected one guarded pre-existing directory owner restoration, got %d", count)
+	}
+	if count := strings.Count(rollback,
+		`chmod -- "${directory_original_mode["${path}"]}" "${path}"`); count != 1 {
+		t.Fatalf("expected one guarded pre-existing directory mode restoration, got %d", count)
+	}
+}
