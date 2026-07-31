@@ -29,21 +29,34 @@ func TestObservabilityReleaseShipsManagedServiceInstaller(t *testing.T) {
 		`readonly LEGACY_BINARY_BACKUP="${INSTALL_BACKUP_DIR}/usr-local-bin-autostream-observability.pre-managed"`,
 		`readonly LEGACY_ALIAS_BACKUP="${INSTALL_BACKUP_DIR}/usr-local-bin-observability.pre-managed"`,
 		`ensure_exact_directory "${STATE_DIR}" autostream autostream 0750 "${STATE_DIR}"`,
+		`validate_exact_directory_candidate "${STATE_DIR}" autostream autostream 0750 "${STATE_DIR}"`,
+		`validate_safe_root_directory_candidate "${MANAGED_ROOT}" "${MANAGED_ROOT}"`,
+		`validate_root_only_directory_candidate /run/autostream-updater`,
+		`state_dir_original_identity=$(stat -c '%d:%i' -- "${STATE_DIR}")`,
+		`state_dir_touched=true`,
+		`if [[ ${installation_complete} == false && ${state_dir_touched} == true ]]`,
+		`chown -- "${state_dir_original_uid}:${state_dir_original_gid}" "${STATE_DIR}"`,
+		`chmod -- "${state_dir_original_mode}" "${STATE_DIR}"`,
+		`rmdir -- "${STATE_DIR}"`,
+		`existing managed release checksum inventory is incomplete or unsafe`,
+		`existing managed release contains a link or special entry`,
 		`ensure_root_only_directory "${INSTALL_BACKUP_DIR}"`,
-		`ensure_root_only_directory /run/autostream-updater`,
+		`ensure_permanent_lock_directory /run/autostream-updater`,
 		`readonly TARGET_LOCK="/run/autostream-updater/.autostream-updater-${TARGET_LOCK_ID}.lock"`,
 		`must resolve to its exact canonical path`,
 		"set +e",
 		"sha256sum --check --strict",
-		"release-manifest.json",
-		`["channel", "components", "minimum_agent_version", "published_at", "release_id", "schema_version"]`,
-		`["artifacts", "commit", "database_schema", "rollback_compatible", "service", "source_version"]`,
-		`(.components[0].artifacts | type == "array" and length == 2)`,
-		`(.components[0].database_schema == "backward_compatible")`,
+		"artifact-manifest.json",
+		`["archive", "build_date", "commit", "compatibility", "component", "platform",`,
+		`["database_schema", "minimum_agent_version", "minimum_panel_version",`,
+		`(.compatibility.minimum_agent_version == "v1.0.0")`,
+		`(.compatibility.minimum_panel_version == null)`,
+		`(.compatibility.database_schema == "backward_compatible")`,
 		".artifact-sha256",
 		".version",
-		`STAGE_DIR=$(mktemp -d "${MANAGED_ROOT}/.install.XXXXXX") ||`,
-		`[[ -n ${STAGE_DIR} &&`,
+		`create_bound_stage_directory`,
+		`/var/tmp/autostream-observability-install.XXXXXXXX`,
+		`"${MANAGED_ROOT}/.install.XXXXXX"`,
 		`retain_legacy_file`,
 		`ln -- "${destination}" "${backup}"`,
 		`mv -Tf -- "${binary_stage}" "${PUBLIC_BINARY}"`,
@@ -112,9 +125,9 @@ func TestObservabilityReleaseShipsManagedServiceInstaller(t *testing.T) {
 	for _, marker := range []string{
 		"sudo ./install-autostream-observability",
 		"gh attestation verify autostream-observability_vX.Y.Z_linux_amd64.tar.gz --repo Kome-Lab/Autostream-Observability --signer-workflow Kome-Lab/Autostream-Observability/.github/workflows/release-host.yml --deny-self-hosted-runners",
-		"gh attestation verify release-manifest.json --repo Kome-Lab/Autostream-Observability --signer-workflow Kome-Lab/Autostream-Observability/.github/workflows/release-host.yml --deny-self-hosted-runners",
-		"sudo install -o root -g root -m 0644 /tmp/release-manifest.json /opt/autostream/releases/artifacts/release-manifest.json",
-		"root-owned archive and manifest",
+		"sudo install -o root -g root -m 0644 /tmp/autostream-observability_vX.Y.Z_linux_amd64.tar.gz /opt/autostream/releases/artifacts/autostream-observability_vX.Y.Z_linux_amd64.tar.gz",
+		"only the archive",
+		"artifact-manifest.json",
 		"sudo tar --no-same-owner --no-same-permissions -xzf autostream-observability_vX.Y.Z_linux_amd64.tar.gz",
 		"/var/backups/autostream/install-migrations/observability",
 		"installer-owned",
@@ -125,6 +138,88 @@ func TestObservabilityReleaseShipsManagedServiceInstaller(t *testing.T) {
 	}
 }
 
+func TestObservabilityInstallerUsesOnlyAdjacentArchiveAndEmbeddedManifestBeforeMutation(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "release", "install-autostream-observability"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(body)
+
+	for _, marker := range []string{
+		`readonly ARTIFACT_MANIFEST_REL="artifact-manifest.json"`,
+		`ARCHIVE_SOURCE_SIZE=$(stat -c '%s' -- "${ARCHIVE_SOURCE}") ||`,
+		`${ARCHIVE_SOURCE_SIZE} -le 268435456 ]] ||`,
+		`create_bound_stage_directory`,
+		`/var/tmp/autostream-observability-install.XXXXXXXX`,
+		`ARCHIVE_DIGEST=$(sha256sum -- "${STAGED_ARCHIVE}" | awk 'NR == 1 { print $1 }') ||`,
+		`[[ ${ARCHIVE_SIZE} == "${ARCHIVE_SOURCE_SIZE}" ]] ||`,
+		`${entry} != *"//"*`,
+		`${entry} != *"/./"*`,
+		`${entry} != */.`,
+		`printf '%s\n' "${entry%/}" >>"${canonical_names}"`,
+		`duplicate_paths=$(sort "${canonical_names}" | uniq -d)`,
+		`validate_checksum_inventory`,
+		`die "release archive checksum inventory is incomplete or unsafe"`,
+		`die "managed release candidate checksum inventory is incomplete or unsafe"`,
+		`die "release artifact manifest does not bind the expected Observability archive"`,
+		`die "release binary identity does not match the artifact manifest"`,
+	} {
+		if !strings.Contains(installer, marker) {
+			t.Fatalf("archive-only installer is missing %q", marker)
+		}
+	}
+	for _, forbidden := range []string{
+		"ARCHIVE_SIDECAR_SOURCE",
+		"MANIFEST_SOURCE",
+		"MANIFEST_SIDECAR_SOURCE",
+		"verify_checksum_sidecar",
+		"release-manifest.json",
+	} {
+		if strings.Contains(installer, forbidden) {
+			t.Fatalf("manual installer must not depend on external release metadata %q", forbidden)
+		}
+	}
+
+	sourceSizeCheck := strings.Index(installer, `die "source archive size is invalid"`)
+	archiveCopy := strings.Index(installer, `copy_bound_source "${ARCHIVE_SOURCE}" "${STAGED_ARCHIVE}" "release archive"`)
+	stagedSizeCheck := strings.Index(installer, `die "staged archive size differs from its source"`)
+	inventoryCheck := strings.Index(installer, `die "release archive checksum inventory is incomplete or unsafe"`)
+	manifestCheck := strings.Index(installer, `die "release artifact manifest does not bind the expected Observability archive"`)
+	binaryCheck := strings.Index(installer, `die "release binary identity does not match the artifact manifest"`)
+	firstPersistentMutation := strings.Index(installer, `ensure_permanent_lock_directory /run/autostream-updater`)
+	if sourceSizeCheck < 0 || archiveCopy < 0 || stagedSizeCheck < 0 ||
+		inventoryCheck < 0 || manifestCheck < 0 || binaryCheck < 0 ||
+		firstPersistentMutation < 0 ||
+		sourceSizeCheck >= archiveCopy || archiveCopy >= stagedSizeCheck ||
+		stagedSizeCheck >= inventoryCheck || inventoryCheck >= manifestCheck ||
+		manifestCheck >= binaryCheck ||
+		binaryCheck >= firstPersistentMutation {
+		t.Fatal("archive, embedded manifest, and binary identity must be verified before persistent mutation")
+	}
+}
+
+func TestObservabilityInstallerDefersStateNormalizationUntilAfterExistingFilePreflight(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "release", "install-autostream-observability"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(body)
+
+	stateValidation := strings.Index(installer,
+		`validate_exact_directory_candidate "${STATE_DIR}" autostream autostream 0750 "${STATE_DIR}"`)
+	envValidation := strings.Index(installer,
+		`validate_secure_existing_file "${ENV_DEST}" "root:root:640" "${ENV_DEST}"`)
+	cleanupTrap := strings.Index(installer, `trap cleanup EXIT`)
+	stateNormalization := strings.Index(installer,
+		`ensure_exact_directory "${STATE_DIR}" autostream autostream 0750 "${STATE_DIR}"`)
+	if stateValidation < 0 || envValidation < 0 || cleanupTrap < 0 || stateNormalization < 0 ||
+		stateValidation >= envValidation ||
+		envValidation >= stateNormalization ||
+		cleanupTrap >= stateNormalization {
+		t.Fatal("existing state must be validated without mutation, then normalized only after later preflight and rollback are armed")
+	}
+}
+
 func TestObservabilityInstallerFailsClosedBeforeMutationWithoutMariaDBDump(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join("..", "..", "release", "install-autostream-observability"))
 	if err != nil {
@@ -132,7 +227,7 @@ func TestObservabilityInstallerFailsClosedBeforeMutationWithoutMariaDBDump(t *te
 	}
 	installer := string(body)
 	preflight := strings.Index(installer, `[[ -f /usr/bin/mariadb-dump &&`)
-	firstMutation := strings.Index(installer, `ensure_safe_root_directory /opt 0755 "/opt"`)
+	firstMutation := strings.Index(installer, `ensure_permanent_lock_directory /run/autostream-updater`)
 	if preflight < 0 || firstMutation < 0 || preflight >= firstMutation {
 		t.Fatal("mariadb-dump regular-file, non-symlink, executable preflight must fail before filesystem mutation")
 	}
@@ -152,9 +247,9 @@ func TestObservabilityInstallerRejectsVersionPrefixCollisions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const exactComparison = `== "autostream-observability ${VERSION}"`
-	if count := strings.Count(string(body), exactComparison); count != 2 {
-		t.Fatalf("expected exact first-line version checks before and after managed copy, got %d", count)
+	const exactComparison = `== "${EXPECTED_BINARY_IDENTITY}"`
+	if count := strings.Count(string(body), exactComparison); count != 3 {
+		t.Fatalf("expected exact three-line identity checks before and after managed copy, got %d", count)
 	}
 }
 
@@ -245,11 +340,50 @@ func TestObservabilityInstallerIntegrationFixtureCoversPrivilegedTransitions(t *
 		`could not create an isolated safe /usr/local/sbin fixture`,
 		`could not create an isolated safe /opt fixture`,
 		`/var/backups/autostream/install-migrations/observability`,
-		`published_at: "2026-07-29T00:00:00Z"`,
-		`minimum_agent_version: "v2.0.0"`,
-		`commit: "0123456789abcdef0123456789abcdef01234567"`,
+		`artifact-manifest.json`,
+		`minimum_agent_version: "v1.0.0"`,
+		`minimum_panel_version: null`,
+		`readonly FIXTURE_COMMIT="0123456789abcdef0123456789abcdef01234567"`,
+		`readonly FIXTURE_BUILD_DATE="2026-07-31T00:00:00Z"`,
 		`database_schema: "backward_compatible"`,
-		`arch: "arm64"`,
+		`archive-only fixture unexpectedly created`,
+		`--transform='s#bin/observability#bin//observability#'`,
+		`noncanonical archive path mutated the managed root`,
+		`noncanonical archive path created the autostream account`,
+		`not declared by checksums.txt`,
+		`incomplete embedded checksum inventory mutated the managed root`,
+		`incomplete embedded checksum inventory created the autostream account`,
+		`.component = "worker"`,
+		`mismatched embedded artifact manifest mutated the managed root`,
+		`mismatched embedded artifact manifest created the autostream account`,
+		`STATE_SENTINEL="${STATE_DIR}/rollback-sentinel"`,
+		`install -d -o autostream -g autostream -m 0700 "${STATE_DIR}"`,
+		`die "${label} changed existing state owner or mode"`,
+		`die "${label} changed existing state content"`,
+		`assert_state_preserved "daemon-reload failure"`,
+		`assert_state_preserved "sync failure"`,
+		`assert_state_preserved "existing release extra file validation"`,
+		`assert_state_preserved "existing release symlink validation"`,
+		`assert_state_preserved "existing release special-entry validation"`,
+		`fresh late preflight failure created the autostream account`,
+		`fresh late preflight failure created ${unexpected_path}`,
+		`groupadd-term-delivered`,
+		`useradd-term-delivered`,
+		`cleanup-second-term-delivered`,
+		`journal-field-term-delivered`,
+		`journal-order-term-delivered`,
+		`AUTOSTREAM_OBSERVABILITY_INSTALLER_TEST_JOURNAL_TERM_TARGET`,
+		`journal ${journal_term_target} TERM aborted cleanup through set -u`,
+		`journal ${journal_term_target} TERM changed the pre-existing /opt directory`,
+		`groupadd TERM transaction exited with ${groupadd_term_status}, expected 143`,
+		`useradd TERM transaction exited with ${useradd_term_status}, expected 143`,
+		`signal rollback exited with ${signal_rollback_status}, expected 143`,
+		`assert_signal_setup_paths_rolled_back "groupadd TERM transaction"`,
+		`assert_signal_setup_paths_rolled_back "useradd TERM transaction"`,
+		`assert_state_preserved "signal rollback"`,
+		`existing managed release checksum inventory is incomplete or unsafe`,
+		`existing managed release contains a link or special entry`,
+		`-d /var/tmp/autostream-observability-install.XXXXXXXX`,
 		`readonly RUNTIME_UNIT_PATH="/run/systemd/system/${UNIT}"`,
 		`systemd runtime unit directory is unsafe`,
 		`fixture_owns_paths=false`,
@@ -458,8 +592,8 @@ func TestObservabilityInstallerIntegrationFixtureCoversPrivilegedTransitions(t *
 		t.Fatal("installer integration fixture mount isolation and mutable-state ordering is incomplete")
 	}
 	const safeAccountReset = "userdel autostream\nif getent group autostream >/dev/null 2>&1; then\n  groupdel autostream\nfi"
-	if count := strings.Count(fixture, safeAccountReset); count != 2 {
-		t.Fatalf("expected two account resets that tolerate userdel removing the private group, got %d", count)
+	if count := strings.Count(fixture, safeAccountReset); count != 1 {
+		t.Fatalf("expected only the successful fresh-install reset to remove the account, got %d", count)
 	}
 	if count := strings.Count(fixture, "[Install]\nWantedBy=multi-user.target"); count != 3 {
 		t.Fatalf("integration fixture must define three enable-capable but disabled units, got %d", count)
@@ -492,5 +626,219 @@ func TestObservabilityInstallerIntegrationFixtureCoversPrivilegedTransitions(t *
 	if starttimeCheckIndex < 0 || fallbackKillIndex < 0 ||
 		starttimeCheckIndex >= fallbackKillIndex {
 		t.Fatal("raw PID fallback must verify the recorded /proc start time before kill")
+	}
+}
+
+func TestObservabilityInstallerArmsRollbackBeforeProvisioningAndBindsAccountLock(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "release", "install-autostream-observability"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(body)
+
+	cleanupTrap := strings.Index(installer, `trap cleanup EXIT`)
+	firstMutation := strings.Index(installer, `ensure_permanent_lock_directory /run/autostream-updater`)
+	if cleanupTrap < 0 || firstMutation < 0 || cleanupTrap >= firstMutation {
+		t.Fatal("Observability must arm complete rollback before the first persistent provisioning mutation")
+	}
+	groupValidation := strings.Index(installer, `autostream_group_gid=$(getent group autostream`)
+	userCreation := strings.Index(installer, `--gid "${autostream_group_gid}"`)
+	primaryGroupValidation := strings.Index(installer,
+		`[[ $(id -g autostream) == "${autostream_group_gid}" ]]`)
+	if groupValidation < 0 || userCreation < 0 || primaryGroupValidation < 0 ||
+		groupValidation >= userCreation || userCreation >= primaryGroupValidation {
+		t.Fatal("Observability must validate a non-root numeric service GID before user creation and bind the user to it")
+	}
+	for _, marker := range []string{
+		`trap 'handle_installer_signal 129' HUP`,
+		`trap 'handle_installer_signal 130' INT`,
+		`trap 'handle_installer_signal 143' TERM`,
+		`created_autostream_group=false`,
+		`created_autostream_user=false`,
+		`rollback_autostream_account`,
+		`journal_directory_before_mutation`,
+		`rollback_journaled_directories`,
+		`managed_release_created_identity`,
+		`snapshot_legacy_backup_path`,
+		`verify_bound_legacy_backups`,
+		`stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a'`,
+		`readonly SHARED_HOST_SETUP_LOCK="/run/autostream-updater/.autostream-runtime-host-setup.lock"`,
+		`exec 8<>"${SHARED_HOST_SETUP_LOCK}"`,
+		`shared runtime host-setup lock identity changed after acquisition`,
+		`exec 9<>"${TARGET_LOCK}"`,
+		`chmod 0600 /proc/self/fd/9`,
+		`chown root:root /proc/self/fd/9`,
+		`updater target lock identity changed after acquisition`,
+		`updater target lock is permanent installer coordination state`,
+	} {
+		if !strings.Contains(installer, marker) {
+			t.Fatalf("Observability installer is missing transactional account/lock marker %q", marker)
+		}
+	}
+	if strings.Contains(installer, `exec 9>"${TARGET_LOCK}"`) {
+		t.Fatal("Observability lock acquisition must not truncate the permanent lock inode")
+	}
+	sharedLock := strings.Index(installer, `exec 8<>"${SHARED_HOST_SETUP_LOCK}"`)
+	targetLock := strings.Index(installer, `exec 9<>"${TARGET_LOCK}"`)
+	firstSharedMutation := strings.Index(installer, `ensure_safe_root_directory /opt 0755 "/opt"`)
+	if sharedLock < 0 || targetLock < 0 || firstSharedMutation < 0 ||
+		sharedLock >= targetLock || targetLock >= firstSharedMutation {
+		t.Fatal("Observability must acquire the shared host-setup lock before per-target and shared provisioning")
+	}
+
+	fixtureBytes, err := os.ReadFile(filepath.Join("..", "..", "release",
+		"test-install-autostream-observability-integration.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := string(fixtureBytes)
+	for _, marker := range []string{
+		`lock_identity_after_rollback="$(stat -c '%d:%i' -- "${TARGET_LOCK}")"`,
+		`mktemp failure left installer-created residue`,
+		`sync failure changed pre-existing retained backup identity or metadata`,
+		`idempotent reinstall truncated or changed the permanent lock content`,
+		`exec 8<>"${TARGET_LOCK}"`,
+	} {
+		if !strings.Contains(fixture, marker) {
+			t.Fatalf("Observability integration fixture is missing rollback/lock proof %q", marker)
+		}
+	}
+}
+
+func TestObservabilityInstallerKeepsMutationJournalInParentShellAndDefersSignals(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "release", "install-autostream-observability"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(body)
+
+	for _, forbidden := range []string{
+		`=$(reserve_path `,
+		`=$(stage_symlink `,
+		`=$(backup_destination `,
+	} {
+		if strings.Contains(installer, forbidden) {
+			t.Fatalf("temporary-path journal helper must not run in a command-substitution subshell: %q", forbidden)
+		}
+	}
+
+	for _, marker := range []string{
+		`cleanup_in_progress=false`,
+		`signal_transaction_active=false`,
+		`deferred_termination_status=0`,
+		`handle_installer_signal()`,
+		`begin_installer_signal_transaction()`,
+		`finish_installer_signal_transaction()`,
+		`create_bound_stage_directory()`,
+		`create_journaled_directory()`,
+		`create_bound_stage_directory \
+  STAGE_DIR`,
+		`stage_symlink \
+  binary_stage`,
+		`backup_destination \
+  binary_backup`,
+		`cleanup_in_progress=true`,
+		`trap - EXIT`,
+		`trap '' HUP INT TERM`,
+	} {
+		if !strings.Contains(installer, marker) {
+			t.Fatalf("installer is missing parent-shell journal or deferred-signal marker %q", marker)
+		}
+	}
+
+	accountStart := strings.Index(installer, "ensure_autostream_account() {")
+	if accountStart < 0 {
+		t.Fatal("installer is missing the autostream account provisioning function")
+	}
+	accountEnd := strings.Index(installer[accountStart:], "\n}\n\ncopy_bound_source()")
+	if accountEnd < 0 {
+		t.Fatal("installer is missing the autostream account provisioning function")
+	}
+	account := installer[accountStart : accountStart+accountEnd]
+
+	groupTransaction := strings.Index(account, `begin_installer_signal_transaction`)
+	groupMutation := strings.Index(account, `groupadd --system autostream`)
+	groupJournal := strings.Index(account, `created_autostream_group_record=$(getent group autostream)`)
+	groupIdentity := strings.Index(account, `created_autostream_group_gid=$(printf '%s\n' "${created_autostream_group_record}"`)
+	groupFinish := strings.Index(account, `finish_installer_signal_transaction`)
+	if groupTransaction < 0 || groupMutation < 0 || groupJournal < 0 ||
+		groupIdentity < 0 || groupFinish < 0 ||
+		groupTransaction >= groupMutation || groupMutation >= groupJournal ||
+		groupJournal >= groupIdentity || groupIdentity >= groupFinish {
+		t.Fatal("group creation must begin a deferred-signal transaction before mutation and journal its identity")
+	}
+
+	userSearchStart := groupFinish + len(`finish_installer_signal_transaction`)
+	userTransaction := strings.Index(account[userSearchStart:],
+		`begin_installer_signal_transaction`)
+	if userTransaction >= 0 {
+		userTransaction += userSearchStart
+	}
+	userMutation := strings.Index(account, `useradd \`)
+	userJournal := strings.Index(account, `created_autostream_user_record=$(getent passwd autostream)`)
+	userFinish := strings.LastIndex(account, `finish_installer_signal_transaction`)
+	if userTransaction < 0 || userMutation < 0 || userJournal < 0 || userFinish < 0 ||
+		userTransaction >= userMutation || userMutation >= userJournal || userJournal >= userFinish {
+		t.Fatal("user creation must begin a deferred-signal transaction before mutation and journal its identity")
+	}
+}
+
+func TestObservabilityDirectoryJournalPublishesCompleteSnapshotInsideSignalTransaction(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "release", "install-autostream-observability"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(body)
+
+	start := strings.Index(installer, "journal_directory_before_mutation() {")
+	if start < 0 {
+		t.Fatal("installer is missing the directory journal function")
+	}
+	endOffset := strings.Index(installer[start:], "\n}\n\nrecord_created_directory_identity()")
+	if endOffset < 0 {
+		t.Fatal("installer directory journal function has no bounded end")
+	}
+	journal := installer[start : start+endOffset]
+
+	snapshotIdentity := strings.Index(journal, `snapshot_identity=$(stat -c '%d:%i' -- "${path}")`)
+	snapshotOwner := strings.Index(journal, `snapshot_owner=$(stat -c '%u:%g' -- "${path}")`)
+	snapshotMode := strings.Index(journal, `snapshot_mode=$(stat -c '%a' -- "${path}")`)
+	transaction := strings.Index(journal, `begin_installer_signal_transaction`)
+	firstPublication := strings.Index(journal, `directory_journaled["${path}"]=true`)
+	existedPublication := strings.Index(journal, `directory_existed["${path}"]="${snapshot_existed}"`)
+	identityPublication := strings.Index(journal, `directory_original_identity["${path}"]="${snapshot_identity}"`)
+	ownerPublication := strings.Index(journal, `directory_original_owner["${path}"]="${snapshot_owner}"`)
+	modePublication := strings.Index(journal, `directory_original_mode["${path}"]="${snapshot_mode}"`)
+	orderPublication := strings.Index(journal, `journaled_directory_paths+=("${path}")`)
+	finish := strings.Index(journal, `finish_installer_signal_transaction`)
+
+	for name, index := range map[string]int{
+		"snapshot identity":      snapshotIdentity,
+		"snapshot owner":         snapshotOwner,
+		"snapshot mode":          snapshotMode,
+		"signal transaction":     transaction,
+		"journal flag":           firstPublication,
+		"existence":              existedPublication,
+		"original identity":      identityPublication,
+		"original owner":         ownerPublication,
+		"original mode":          modePublication,
+		"journal order":          orderPublication,
+		"transaction completion": finish,
+	} {
+		if index < 0 {
+			t.Fatalf("directory journal is missing %s publication", name)
+		}
+	}
+	if snapshotIdentity >= transaction || snapshotOwner >= transaction || snapshotMode >= transaction {
+		t.Fatal("directory journal must finish the local filesystem snapshot before entering the signal transaction")
+	}
+	if transaction >= firstPublication ||
+		firstPublication >= existedPublication ||
+		existedPublication >= identityPublication ||
+		identityPublication >= ownerPublication ||
+		ownerPublication >= modePublication ||
+		modePublication >= orderPublication ||
+		orderPublication >= finish {
+		t.Fatal("directory journal must publish every keyed field and its order atomically before delivering a pending signal")
 	}
 }

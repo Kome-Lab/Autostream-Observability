@@ -9,47 +9,33 @@ This archive contains the Linux binary, systemd example, and placeholder environ
   account when it is absent.
 - `jq`, `sha256sum`, `tar`, systemd, and `/usr/bin/mariadb-dump`. `curl` is used
   by the post-start health check.
-- Authenticated GitHub CLI (`gh`) on the server for the required
-  release-manifest attestation check.
 - Database and notification provider settings supplied outside Git.
 - Network access to the Control Panel and monitored services.
 
 ## Install a verified managed release
 
-Download these four assets from the same authenticated official GitHub Release
-to `/tmp`:
+On an administrator workstation, download only the archive for the target
+architecture and verify its GitHub artifact attestation before uploading it.
+Do not upload an archive when this command fails:
 
-- `autostream-observability_vX.Y.Z_linux_amd64.tar.gz`
-- `autostream-observability_vX.Y.Z_linux_amd64.tar.gz.sha256`
-- `release-manifest.json`
-- `release-manifest.json.sha256`
+```bash
+gh attestation verify autostream-observability_vX.Y.Z_linux_amd64.tar.gz --repo Kome-Lab/Autostream-Observability --signer-workflow Kome-Lab/Autostream-Observability/.github/workflows/release-host.yml --deny-self-hosted-runners
+```
 
-Copy them into a root-owned staging directory:
+Upload only the archive to `/tmp` on the server. The server does not need
+GitHub CLI, an archive `.sha256` sidecar, `release-manifest.json`, or its
+sidecar. Those external metadata assets remain published for automatic updater
+compatibility, but the manual installer ignores them even when they are
+adjacent.
+
+Copy the uploaded archive into the root-owned staging directory, retain it next
+to the extracted directory, and extract it as root:
 
 ```bash
 sudo install -d -o root -g root -m 0755 /opt/autostream/releases
 sudo install -d -o root -g root -m 0755 /opt/autostream/releases/artifacts
 sudo install -o root -g root -m 0644 /tmp/autostream-observability_vX.Y.Z_linux_amd64.tar.gz /opt/autostream/releases/artifacts/autostream-observability_vX.Y.Z_linux_amd64.tar.gz
-sudo install -o root -g root -m 0644 /tmp/autostream-observability_vX.Y.Z_linux_amd64.tar.gz.sha256 /opt/autostream/releases/artifacts/autostream-observability_vX.Y.Z_linux_amd64.tar.gz.sha256
-sudo install -o root -g root -m 0644 /tmp/release-manifest.json /opt/autostream/releases/artifacts/release-manifest.json
-sudo install -o root -g root -m 0644 /tmp/release-manifest.json.sha256 /opt/autostream/releases/artifacts/release-manifest.json.sha256
 cd /opt/autostream/releases/artifacts
-```
-
-As the ordinary login user, verify both the root-owned archive and manifest
-copies. Do not continue if either command fails:
-
-```bash
-gh attestation verify autostream-observability_vX.Y.Z_linux_amd64.tar.gz --repo Kome-Lab/Autostream-Observability --signer-workflow Kome-Lab/Autostream-Observability/.github/workflows/release-host.yml --deny-self-hosted-runners
-gh attestation verify release-manifest.json --repo Kome-Lab/Autostream-Observability --signer-workflow Kome-Lab/Autostream-Observability/.github/workflows/release-host.yml --deny-self-hosted-runners
-```
-
-The direct archive attestation authenticates the installer before root executes
-it. The separately attested manifest binds that same archive by name, size,
-digest, version, service, and architecture. Extract the root-owned archive,
-then run its bundled installer:
-
-```bash
 sudo test ! -e autostream-observability_vX.Y.Z_linux_amd64
 sudo test ! -L autostream-observability_vX.Y.Z_linux_amd64
 sudo tar --no-same-owner --no-same-permissions -xzf autostream-observability_vX.Y.Z_linux_amd64.tar.gz
@@ -57,12 +43,16 @@ cd autostream-observability_vX.Y.Z_linux_amd64
 sudo ./install-autostream-observability
 ```
 
-The installer verifies the archive checksum, release-manifest tuple, archive
-layout, inner checksums, architecture, and embedded binary version. It creates
-the `autostream` system account when needed, prepares the state and backup
-directories, preserves an existing `/etc/autostream/observability.env`
-byte-for-byte, installs the systemd unit, and runs `systemctl daemon-reload`.
-It does not enable, start, or restart the service.
+The workstation attestation authenticates the complete archive before transfer.
+On the server, the installer makes a fixed root-owned copy of that adjacent
+archive, records its SHA-256, enforces the archive size limit and safe layout,
+and verifies the inner checksums, exact `artifact-manifest.json` contract,
+architecture, and embedded binary version, commit, and build date before it
+creates the service account or changes persistent installation paths. It then
+re-verifies the managed candidate, prepares the state and backup directories,
+preserves an existing `/etc/autostream/observability.env` byte-for-byte,
+installs the systemd unit, and runs `systemctl daemon-reload`. It does not
+enable, start, or restart the service.
 
 `/usr/local/bin/autostream-observability` and `/usr/local/bin/observability`
 remain the stable operator-facing commands. The verified releases, markers,
@@ -192,7 +182,7 @@ registration. Block this exact path at any public reverse proxy.
 
 Do not fabricate `.artifact-sha256` or `.version` from a local binary. The
 installer creates those markers only after verifying the immutable release
-inputs. Releases without `release-manifest.json` remain manual-only; publish a
-new release instead of modifying an existing release asset.
+archive and its embedded `artifact-manifest.json`. Do not modify a published
+release asset; publish a new version instead.
 
 Do not commit real `.env` files, provider credentials, tokens, logs, screenshots, or verification record.

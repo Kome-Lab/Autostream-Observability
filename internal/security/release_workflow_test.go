@@ -19,6 +19,15 @@ func TestHostReleaseWorkflowPublishesDeterministicNotesAndExactImmutableAssets(t
 		"permissions:\n  contents: read",
 		"outputs:",
 		"version: ${{ steps.meta.outputs.version }}",
+		`sed -i "s/vX\\.Y\\.Z/${version}/g" "${root}/README.install.md"`,
+		"Packaged install guide still contains the version placeholder.",
+		"minimum_panel_version: null",
+		`}' > "${root}/artifact-manifest.json"`,
+		`(.compatibility.minimum_panel_version == null)`,
+		`"${root}/artifact-manifest.json" > /dev/null`,
+		`find . -type f ! -path './checksums.txt'`,
+		`tar -C staging -czf "artifacts/${artifact}.tar.gz" "${artifact}"`,
+		`sha256sum "${artifact}.tar.gz" > "${artifact}.tar.gz.sha256"`,
 		"- uses: actions/upload-artifact@",
 		"publish-release:",
 		"needs: release-host",
@@ -118,5 +127,175 @@ func TestHostReleaseWorkflowPublishesDeterministicNotesAndExactImmutableAssets(t
 	stagingTagDelete := "gh api --method DELETE \"repos/${GITHUB_REPOSITORY}/git/refs/tags/${DRAFT_TAG}\""
 	if count := strings.Count(workflow, stagingTagDelete); count != 1 {
 		t.Fatalf("release workflow must delete the staging tag only during verified publication, got %d occurrences", count)
+	}
+}
+
+func TestHostReleaseWorkflowCrossChecksEmbeddedAndExternalManifests(t *testing.T) {
+	workflowPath := filepath.Join("..", "..", ".github", "workflows", "release-host.yml")
+	payload, err := os.ReadFile(workflowPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(payload)
+
+	for _, marker := range []string{
+		`tar -xOf \`,
+		`"${root}/artifact-manifest.json" \`,
+		`"${root}/checksums.txt" \`,
+		`embedded_manifest_digest="$(sha256sum "${embedded_manifest}" | awk '{ print $1 }')"`,
+		`grep -Fx -- "${embedded_manifest_digest}  ./artifact-manifest.json" "${embedded_checksums}"`,
+		`(( size > 268435456 ))`,
+		`(.size | type == "number" and . > 0 and . <= 268435456)`,
+		`--slurpfile release artifacts/release-manifest.json`,
+		`(.component == $component.service)`,
+		`(.source_version == $component.source_version)`,
+		`(.commit == $component.commit)`,
+		`(.compatibility.minimum_agent_version == $outer.minimum_agent_version)`,
+		`(.compatibility.minimum_panel_version == null)`,
+		`(.compatibility.rollback_compatible == $component.rollback_compatible)`,
+		`(.compatibility.database_schema == $component.database_schema)`,
+	} {
+		if !strings.Contains(workflow, marker) {
+			t.Fatalf("host release workflow is missing embedded manifest cross-check %q", marker)
+		}
+	}
+
+	externalManifest := strings.Index(workflow, `}' > artifacts/release-manifest.json`)
+	embeddedReadback := strings.Index(workflow, `tar -xOf \`)
+	checksumBinding := strings.Index(
+		workflow,
+		`grep -Fx -- "${embedded_manifest_digest}  ./artifact-manifest.json" "${embedded_checksums}"`,
+	)
+	crossCheck := strings.Index(workflow, `--slurpfile release artifacts/release-manifest.json`)
+	externalSidecar := strings.Index(
+		workflow,
+		`sha256sum release-manifest.json > release-manifest.json.sha256`,
+	)
+	if externalManifest < 0 || embeddedReadback < 0 || checksumBinding < 0 ||
+		crossCheck < 0 || externalSidecar < 0 ||
+		externalManifest >= embeddedReadback ||
+		embeddedReadback >= checksumBinding ||
+		checksumBinding >= crossCheck ||
+		crossCheck >= externalSidecar {
+		t.Fatal("workflow must create the external manifest, read back and checksum-bind embedded manifests, cross-check them, then create the external sidecar")
+	}
+}
+
+func TestHostReleaseVerifiesActualArchiveAndPinsExactLegacyAssets(t *testing.T) {
+	workflowPath := filepath.Join("..", "..", ".github", "workflows", "release-host.yml")
+	payload, err := os.ReadFile(workflowPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(payload)
+
+	const stableVersionGuard = `if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then`
+	if !strings.Contains(workflow, stableVersionGuard) {
+		t.Fatal("stable Host Release workflow must reject prerelease version suffixes")
+	}
+	for _, marker := range []string{
+		`bash -n .github/scripts/verify-release-archive.sh`,
+		`bash -n .github/scripts/test-verify-release-archive.sh`,
+		`bash .github/scripts/test-verify-release-archive.sh .github/scripts/verify-release-archive.sh`,
+		`bash .github/scripts/verify-release-archive.sh "artifacts/${artifact}.tar.gz" "${artifact}"`,
+	} {
+		if !strings.Contains(workflow, marker) {
+			t.Fatalf("Host Release workflow is missing archive verifier marker %q", marker)
+		}
+	}
+
+	assertExactExpectedReleaseAssets(t, workflow, []string{
+		"${ARTIFACT_PREFIX}_${RELEASE_VERSION}_linux_amd64.tar.gz",
+		"${ARTIFACT_PREFIX}_${RELEASE_VERSION}_linux_amd64.tar.gz.sha256",
+		"${ARTIFACT_PREFIX}_${RELEASE_VERSION}_linux_arm64.tar.gz",
+		"${ARTIFACT_PREFIX}_${RELEASE_VERSION}_linux_arm64.tar.gz.sha256",
+		"release-manifest.json",
+		"release-manifest.json.sha256",
+	})
+	assertReleaseArchiveVerifierCoverage(t)
+}
+
+func assertExactExpectedReleaseAssets(t *testing.T, workflow string, expected []string) {
+	t.Helper()
+
+	lines := strings.Split(workflow, "\n")
+	var actual []string
+	inExpectedNames := false
+	foundBlock := false
+	for _, line := range lines {
+		if strings.Contains(line, `cat > "${expected_names}" <<EOF`) {
+			if foundBlock {
+				t.Fatal("release workflow contains multiple expected_names heredocs")
+			}
+			foundBlock = true
+			inExpectedNames = true
+			continue
+		}
+		if !inExpectedNames {
+			continue
+		}
+		name := strings.TrimSpace(line)
+		if name == "EOF" {
+			inExpectedNames = false
+			continue
+		}
+		if name == "" {
+			t.Fatal("expected_names heredoc contains an empty asset name")
+		}
+		actual = append(actual, name)
+	}
+	if !foundBlock || inExpectedNames {
+		t.Fatal("release workflow expected_names heredoc is missing or unterminated")
+	}
+
+	seen := make(map[string]struct{}, len(actual))
+	for _, name := range actual {
+		if _, duplicate := seen[name]; duplicate {
+			t.Fatalf("release workflow expected_names contains duplicate %q", name)
+		}
+		seen[name] = struct{}{}
+	}
+	if got, want := strings.Join(actual, "\n"), strings.Join(expected, "\n"); got != want {
+		t.Fatalf("release workflow expected_names mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func assertReleaseArchiveVerifierCoverage(t *testing.T) {
+	t.Helper()
+
+	verifierPath := filepath.Join("..", "..", ".github", "scripts", "verify-release-archive.sh")
+	verifier, err := os.ReadFile(verifierPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{
+		`release archive contains a non-file/non-directory member`,
+		`release archive contains a non-canonical member name`,
+		`release archive contains duplicate canonical member names`,
+		`release checksums.txt does not cover the exact regular-file inventory`,
+		`sha256sum --check --strict checksums.txt`,
+	} {
+		if !strings.Contains(string(verifier), marker) {
+			t.Fatalf("release archive verifier is missing %q", marker)
+		}
+	}
+
+	fixturePath := filepath.Join("..", "..", ".github", "scripts", "test-verify-release-archive.sh")
+	fixture, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{
+		"extra-file",
+		"missing-checksum",
+		"stale-checksum",
+		"duplicate-member",
+		"symlink-entry",
+		"fifo-entry",
+		"canonical-alias",
+	} {
+		if !strings.Contains(string(fixture), marker) {
+			t.Fatalf("release archive verifier fixture is missing %q", marker)
+		}
 	}
 }

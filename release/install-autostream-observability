@@ -24,10 +24,128 @@ readonly BACKUP_DEST="/usr/local/sbin/autostream-backup-observability"
 readonly BACKUP_DIR="/var/backups/autostream/observability"
 readonly BACKUP_CONFIG_DIR="/etc/autostream-local-executor"
 readonly BACKUP_CONFIG_DEST="${BACKUP_CONFIG_DIR}/mariadb-backup.cnf"
+readonly ARTIFACT_MANIFEST_REL="artifact-manifest.json"
+
+STAGE_DIR=
+stage_dir_identity=
+MANAGED_STAGE_DIR=
+managed_stage_dir_identity=
+EXTRACT_DIR=
+RELEASE_DIR=
+INSTALL_BACKUP_DIR=
+binary_stage=
+alias_stage=
+unit_stage=
+backup_exec_stage=
+env_stage=
+backup_config_stage=
+current_stage=
+binary_backup=
+alias_backup=
+unit_backup=
+backup_exec_backup=
+binary_quiesced=false
+alias_quiesced=false
+unit_quiesced=false
+backup_exec_quiesced=false
+current_original_exists=false
+current_original_target=
+current_switched=false
+binary_activated=false
+alias_activated=false
+unit_activated=false
+backup_exec_activated=false
+env_created=false
+env_created_identity=
+env_created_digest=
+backup_config_created=false
+backup_config_created_identity=
+backup_config_created_digest=
+state_dir_existed=false
+state_dir_original_uid=
+state_dir_original_gid=
+state_dir_original_mode=
+state_dir_original_identity=
+state_dir_created_identity=
+state_dir_touched=false
+backup_dir_existed=false
+backup_dir_original_uid=
+backup_dir_original_gid=
+backup_dir_original_mode=
+backup_dir_original_identity=
+backup_dir_created_identity=
+backup_dir_touched=false
+commit_started=false
+installation_complete=false
+transaction_journal_active=false
+managed_release_created=false
+managed_release_created_identity=
+created_autostream_group=false
+created_autostream_group_gid=
+created_autostream_group_record=
+created_autostream_user=false
+created_autostream_user_uid=
+created_autostream_user_gid=
+created_autostream_user_record=
+lock_create_stage=
+shared_lock_create_stage=
+preserve_stage_directories=false
+cleanup_in_progress=false
+signal_transaction_active=false
+deferred_termination_status=0
+declare -a temporary_rollback_paths=()
+declare -a journaled_directory_paths=()
+declare -A directory_journaled=()
+declare -A directory_existed=()
+declare -A directory_original_identity=()
+declare -A directory_original_owner=()
+declare -A directory_original_mode=()
+declare -A directory_created_identity=()
+declare -A directory_retain_if_nonempty=()
+declare -A legacy_backup_existed_before=()
+declare -A preexisting_legacy_backup_identity=()
+declare -A preexisting_legacy_backup_digest=()
+declare -A created_legacy_backup_identity=()
+declare -A created_legacy_backup_digest=()
 
 die() {
   printf 'install-autostream-observability: %s\n' "$*" >&2
   exit 1
+}
+
+handle_installer_signal() {
+  local requested_status=$1
+  if [[ ${signal_transaction_active} == true ]]; then
+    deferred_termination_status=${requested_status}
+    return 0
+  fi
+  exit "${requested_status}"
+}
+
+restore_installer_signal_traps() {
+  if [[ ${cleanup_in_progress} == true ]]; then
+    trap '' HUP INT TERM
+    return
+  fi
+  trap 'handle_installer_signal 129' HUP
+  trap 'handle_installer_signal 130' INT
+  trap 'handle_installer_signal 143' TERM
+}
+
+begin_installer_signal_transaction() {
+  [[ ${signal_transaction_active} == false ]] || \
+    die "nested installer signal transaction is not allowed"
+  signal_transaction_active=true
+}
+
+finish_installer_signal_transaction() {
+  local requested_status
+  signal_transaction_active=false
+  requested_status=${deferred_termination_status}
+  deferred_termination_status=0
+  if (( requested_status != 0 )); then
+    exit "${requested_status}"
+  fi
 }
 
 if (( $# != 0 )); then
@@ -35,8 +153,9 @@ if (( $# != 0 )); then
 fi
 
 for command in \
-  awk basename chmod chown cmp dirname find flock getent grep groupadd head id install jq \
-  ln mktemp mv pwd readlink rm runuser sha256sum sort stat sync systemctl tar uname uniq useradd wc; do
+  awk basename chmod chown cmp dirname find flock getent grep groupadd groupdel head id install jq \
+  ln mkdir mktemp mv pwd readlink rm rmdir runuser sha256sum sort stat sync systemctl tar uname uniq \
+  useradd userdel wc; do
   command -v "${command}" >/dev/null 2>&1 || die "required command ${command} is unavailable"
 done
 
@@ -68,9 +187,6 @@ SOURCE_DIR=$(dirname -- "${SCRIPT_DIR}") || \
 readonly SOURCE_DIR
 readonly ASSET_NAME="${ARCHIVE_ROOT_NAME}.tar.gz"
 readonly ARCHIVE_SOURCE="${SOURCE_DIR}/${ASSET_NAME}"
-readonly ARCHIVE_SIDECAR_SOURCE="${ARCHIVE_SOURCE}.sha256"
-readonly MANIFEST_SOURCE="${SOURCE_DIR}/release-manifest.json"
-readonly MANIFEST_SIDECAR_SOURCE="${MANIFEST_SOURCE}.sha256"
 
 case "$(uname -m)" in
   x86_64)
@@ -108,17 +224,132 @@ validate_safe_root_directory() {
     die "${label} must resolve to its exact canonical path"
 }
 
+validate_safe_root_directory_candidate() {
+  local path=$1
+  local label=$2
+  if [[ -e ${path} || -L ${path} ]]; then
+    validate_safe_root_directory "${path}" "${label}"
+  fi
+}
+
+validate_root_sticky_tmp_directory() {
+  local path=$1
+  local label=$2
+  [[ -d ${path} && ! -L ${path} ]] || die "${label} must be a non-symlink directory"
+  [[ $(stat -c '%U:%G:%a' -- "${path}") == "root:root:1777" ]] || \
+    die "${label} must be owned by root:root with mode 1777"
+  [[ $(readlink -f -- "${path}") == "${path}" ]] || \
+    die "${label} must resolve to its exact canonical path"
+}
+
+register_temporary_rollback_path() {
+  local path=$1
+  local recorded
+  [[ -n ${path} && ${path} == /* ]] || die "temporary rollback path is empty or not absolute"
+  for recorded in "${temporary_rollback_paths[@]}"; do
+    [[ ${recorded} == "${path}" ]] && return 0
+  done
+  temporary_rollback_paths+=("${path}")
+}
+
+journal_directory_before_mutation() {
+  local path=$1
+  local retain_if_nonempty=${2-false}
+  local snapshot_existed=false
+  local snapshot_identity=""
+  local snapshot_owner=""
+  local snapshot_mode=""
+
+  [[ ${transaction_journal_active} == true ]] || return 0
+  [[ ${directory_journaled["${path}"]-false} != true ]] || return 0
+  if [[ -e ${path} || -L ${path} ]]; then
+    [[ -d ${path} && ! -L ${path} &&
+      $(readlink -f -- "${path}") == "${path}" ]] || \
+      die "directory path is unsafe before mutation: ${path}"
+    snapshot_existed=true
+    snapshot_identity=$(stat -c '%d:%i' -- "${path}") || \
+      die "could not snapshot directory identity before mutation: ${path}"
+    snapshot_owner=$(stat -c '%u:%g' -- "${path}") || \
+      die "could not snapshot directory ownership before mutation: ${path}"
+    snapshot_mode=$(stat -c '%a' -- "${path}") || \
+      die "could not snapshot directory mode before mutation: ${path}"
+  fi
+
+  begin_installer_signal_transaction
+  directory_journaled["${path}"]=true
+  directory_retain_if_nonempty["${path}"]="${retain_if_nonempty}"
+  directory_existed["${path}"]="${snapshot_existed}"
+  directory_original_identity["${path}"]="${snapshot_identity}"
+  directory_original_owner["${path}"]="${snapshot_owner}"
+  directory_original_mode["${path}"]="${snapshot_mode}"
+  directory_created_identity["${path}"]=""
+  journaled_directory_paths+=("${path}")
+  finish_installer_signal_transaction
+}
+
+record_created_directory_identity() {
+  local path=$1
+  local identity
+  if [[ ${transaction_journal_active} == true &&
+    ${directory_journaled["${path}"]-false} == true &&
+    ${directory_existed["${path}"]} == false ]]; then
+    identity=$(stat -c '%d:%i' -- "${path}") || return 1
+    directory_created_identity["${path}"]="${identity}"
+  fi
+}
+
+create_journaled_directory() {
+  local path=$1
+  local creation_failed=false
+
+  begin_installer_signal_transaction
+  if ! mkdir -- "${path}"; then
+    creation_failed=true
+  elif ! record_created_directory_identity "${path}"; then
+    creation_failed=true
+  fi
+  finish_installer_signal_transaction
+  [[ ${creation_failed} == false ]]
+}
+
 ensure_safe_root_directory() {
   local path=$1
   local mode=$2
   local label=$3
+  local retain_if_nonempty=${4-false}
+  local expected_mode=${mode#0}
+  journal_directory_before_mutation "${path}" "${retain_if_nonempty}"
   if [[ ! -e ${path} && ! -L ${path} ]]; then
-    install -d -o root -g root -m "${mode}" -- "${path}"
+    create_journaled_directory "${path}" || \
+      die "could not create or journal ${label}"
+    chown root:root "${path}"
+    chmod "${mode}" "${path}"
   fi
   validate_safe_root_directory "${path}" "${label}"
+  if [[ ${directory_existed["${path}"]} == false ]]; then
+    [[ $(stat -c '%U:%G:%a' -- "${path}") == "root:root:${expected_mode}" ]] || \
+      die "${label} owner or mode is invalid after creation"
+  fi
 }
 
 ensure_root_only_directory() {
+  local path=$1
+  local retain_if_nonempty=${2-false}
+  journal_directory_before_mutation "${path}" "${retain_if_nonempty}"
+  validate_root_only_directory_candidate "${path}"
+  if [[ ! -e ${path} && ! -L ${path} ]]; then
+    create_journaled_directory "${path}" || \
+      die "could not create or journal ${path}"
+  fi
+  chown root:root "${path}"
+  chmod 0700 "${path}"
+  [[ $(stat -c '%U:%G:%a' -- "${path}") == "root:root:700" ]] || \
+    die "${path} owner or mode is invalid"
+  [[ $(readlink -f -- "${path}") == "${path}" ]] || \
+    die "${path} must resolve to its exact canonical path"
+}
+
+validate_root_only_directory_candidate() {
   local path=$1
   local mode
   if [[ -e ${path} || -L ${path} ]]; then
@@ -131,14 +362,9 @@ ensure_root_only_directory() {
     [[ $(readlink -f -- "${path}") == "${path}" ]] || \
       die "${path} must resolve to its exact canonical path"
   fi
-  install -d -o root -g root -m 0700 -- "${path}"
-  [[ $(stat -c '%U:%G:%a' -- "${path}") == "root:root:700" ]] || \
-    die "${path} owner or mode is invalid"
-  [[ $(readlink -f -- "${path}") == "${path}" ]] || \
-    die "${path} must resolve to its exact canonical path"
 }
 
-ensure_exact_directory() {
+validate_exact_directory_candidate() {
   local path=$1
   local owner=$2
   local group=$3
@@ -157,7 +383,30 @@ ensure_exact_directory() {
     [[ $(readlink -f -- "${path}") == "${path}" ]] || \
       die "${label} must resolve to its exact canonical path"
   fi
-  install -d -o "${owner}" -g "${group}" -m "${mode}" -- "${path}"
+}
+
+ensure_exact_directory() {
+  local path=$1
+  local owner=$2
+  local group=$3
+  local mode=$4
+  local label=$5
+  local journal=${6-true}
+  local expected_mode=${mode#0}
+  if [[ ${journal} == true ]]; then
+    journal_directory_before_mutation "${path}"
+  fi
+  validate_exact_directory_candidate "${path}" "${owner}" "${group}" "${mode}" "${label}"
+  if [[ ! -e ${path} && ! -L ${path} ]]; then
+    create_journaled_directory "${path}" || \
+      die "could not create or journal ${label}"
+    if [[ ${journal} == true ]]; then
+      [[ -n ${directory_created_identity["${path}"]-} ]] || \
+        die "could not bind the created ${label} identity"
+    fi
+  fi
+  chown "${owner}:${group}" "${path}"
+  chmod "${mode}" "${path}"
   [[ -d ${path} && ! -L ${path} ]] || die "${label} was not created safely"
   [[ $(stat -c '%U:%G:%a' -- "${path}") == "${owner}:${group}:${expected_mode}" ]] || \
     die "${label} owner or mode is invalid"
@@ -165,25 +414,89 @@ ensure_exact_directory() {
     die "${label} must resolve to its exact canonical path"
 }
 
-ensure_autostream_account() {
-  if ! getent group autostream >/dev/null 2>&1; then
-    groupadd --system autostream
+preflight_autostream_account() {
+  local autostream_group_gid existing_uid existing_gid
+  if getent group autostream >/dev/null 2>&1; then
+    autostream_group_gid=$(getent group autostream | awk -F: 'NR == 1 { print $3 }')
+    [[ ${autostream_group_gid} =~ ^[0-9]+$ && ${autostream_group_gid} -ne 0 ]] || \
+      die "autostream service group must have a non-root numeric GID"
+  else
+    if getent passwd autostream >/dev/null 2>&1 || id autostream >/dev/null 2>&1; then
+      die "autostream service account exists without the autostream group"
+    fi
+    return 0
   fi
-  if ! getent passwd autostream >/dev/null 2>&1; then
-    useradd \
+
+  if getent passwd autostream >/dev/null 2>&1 || id autostream >/dev/null 2>&1; then
+    existing_uid=$(id -u autostream)
+    existing_gid=$(id -g autostream)
+    [[ ${existing_uid} =~ ^[0-9]+$ && ${existing_uid} -ne 0 ]] || \
+      die "autostream service account must have a non-root numeric UID"
+    [[ ${existing_gid} == "${autostream_group_gid}" ]] || \
+      die "autostream service account numeric primary GID does not match the autostream group"
+    [[ $(id -gn autostream) == "autostream" ]] || \
+      die "autostream service account must use the autostream primary group"
+  fi
+}
+
+ensure_autostream_account() {
+  local autostream_group_gid account_creation_failed=false
+  if ! getent group autostream >/dev/null 2>&1; then
+    begin_installer_signal_transaction
+    if ! groupadd --system autostream; then
+      account_creation_failed=true
+    else
+      created_autostream_group=true
+      if ! created_autostream_group_record=$(getent group autostream); then
+        account_creation_failed=true
+      elif ! created_autostream_group_gid=$(printf '%s\n' "${created_autostream_group_record}" |
+        awk -F: 'NR == 1 { print $3 }'); then
+        account_creation_failed=true
+      fi
+    fi
+    finish_installer_signal_transaction
+    [[ ${account_creation_failed} == false ]] || \
+      die "could not create and journal the autostream service group"
+  fi
+  autostream_group_gid=$(getent group autostream | awk -F: 'NR == 1 { print $3 }')
+  [[ ${autostream_group_gid} =~ ^[0-9]+$ && ${autostream_group_gid} -ne 0 ]] || \
+    die "autostream service group must have a non-root numeric GID"
+  if [[ ${created_autostream_group} == true ]]; then
+    [[ ${created_autostream_group_gid} == "${autostream_group_gid}" ]] || \
+      die "created autostream service group identity changed during provisioning"
+  fi
+  if ! id autostream >/dev/null 2>&1; then
+    account_creation_failed=false
+    begin_installer_signal_transaction
+    if ! useradd \
       --system \
-      --gid autostream \
+      --gid "${autostream_group_gid}" \
       --home-dir /var/lib/autostream \
       --no-create-home \
       --shell /usr/sbin/nologin \
-      autostream
+      autostream; then
+      account_creation_failed=true
+    else
+      created_autostream_user=true
+      if ! created_autostream_user_uid=$(id -u autostream); then
+        account_creation_failed=true
+      elif ! created_autostream_user_gid=$(id -g autostream); then
+        account_creation_failed=true
+      elif ! created_autostream_user_record=$(getent passwd autostream); then
+        account_creation_failed=true
+      fi
+    fi
+    finish_installer_signal_transaction
+    [[ ${account_creation_failed} == false ]] || \
+      die "could not create and journal the autostream service account"
   fi
 
-  local uid gid
-  uid=$(id -u autostream)
-  gid=$(getent group autostream | awk -F: 'NR == 1 { print $3 }')
-  [[ ${uid} =~ ^[0-9]+$ && ${uid} -ne 0 ]] || die "autostream user must have a non-root UID"
-  [[ ${gid} =~ ^[0-9]+$ && ${gid} -ne 0 ]] || die "autostream group must have a non-root GID"
+  [[ $(id -u autostream) =~ ^[0-9]+$ && $(id -u autostream) -ne 0 ]] || \
+    die "autostream service account must have a non-root numeric UID"
+  [[ $(id -g autostream) == "${autostream_group_gid}" ]] || \
+    die "autostream service account numeric primary GID does not match the autostream group"
+  [[ $(id -gn autostream) == "autostream" ]] || \
+    die "autostream service account must use the autostream primary group"
 }
 
 copy_bound_source() {
@@ -203,39 +516,27 @@ copy_bound_source() {
     die "staged ${label} does not match its source"
 }
 
-verify_checksum_sidecar() {
-  local directory=$1
-  local payload_name=$2
-  local sidecar_name=$3
-  local declared_digest declared_name
-  [[ $(wc -l < "${directory}/${sidecar_name}") -eq 1 ]] || die "${sidecar_name} must contain exactly one line"
-  declared_digest=$(awk 'NR == 1 { print $1 }' "${directory}/${sidecar_name}")
-  declared_name=$(awk 'NR == 1 { print $2 }' "${directory}/${sidecar_name}")
-  [[ ${declared_digest} =~ ^[0-9a-f]{64}$ ]] || die "${sidecar_name} contains an invalid SHA-256"
-  [[ ${declared_name} == "${payload_name}" ]] || die "${sidecar_name} names ${declared_name}, expected ${payload_name}"
-  grep -Fqx -- "${declared_digest}  ${payload_name}" "${directory}/${sidecar_name}" || \
-    die "${sidecar_name} has an invalid format"
-  (
-    cd -- "${directory}"
-    sha256sum --check --strict "${sidecar_name}"
-  ) || die "${payload_name} failed SHA-256 verification"
-}
-
 validate_archive_layout() {
   local archive=$1
   local names=$2
   local verbose=$3
+  local canonical_names="${names}.canonical"
   local duplicate_paths entry
 
   tar -tzf "${archive}" >"${names}"
   tar -tvzf "${archive}" >"${verbose}"
   [[ -s ${names} ]] || die "release archive is empty"
+  : >"${canonical_names}"
 
   while IFS= read -r entry; do
     [[ -n ${entry} ]] || die "release archive contains a blank path"
     [[ ${entry} =~ ^[A-Za-z0-9._/-]+$ ]] || die "release archive contains an unsafe path: ${entry}"
     [[ ${entry} != /* ]] || die "release archive contains an absolute path"
     [[ ! ${entry} =~ (^|/)\.\.(/|$) ]] || die "release archive contains a parent traversal"
+    [[ ${entry} != *"//"* &&
+      ${entry} != *"/./"* &&
+      ${entry} != */. ]] || \
+      die "release archive contains a noncanonical path: ${entry}"
     case "${entry}" in
       "${ARCHIVE_ROOT_NAME}"|"${ARCHIVE_ROOT_NAME}/"|"${ARCHIVE_ROOT_NAME}/"*)
         ;;
@@ -243,15 +544,112 @@ validate_archive_layout() {
         die "release archive must contain exactly the ${ARCHIVE_ROOT_NAME} root"
         ;;
     esac
+    printf '%s\n' "${entry%/}" >>"${canonical_names}"
   done <"${names}"
 
-  duplicate_paths=$(sort "${names}" | uniq -d)
+  duplicate_paths=$(sort "${canonical_names}" | uniq -d)
   if [[ -n ${duplicate_paths} ]]; then
     die "release archive contains duplicate paths"
   fi
   if awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { found=1 } END { exit found ? 0 : 1 }' "${verbose}"; then
     die "release archive contains a link or special file"
   fi
+}
+
+validate_checksum_inventory() {
+  local release_dir=$1
+  local scratch_prefix=$2
+  local managed_markers=${3:-false}
+  local checksums="${release_dir}/checksums.txt"
+  local declared="${scratch_prefix}.declared"
+  local declared_sorted="${scratch_prefix}.declared.sorted"
+  local duplicates="${scratch_prefix}.duplicates"
+  local actual="${scratch_prefix}.actual"
+  local checksum_pattern='^[0-9a-f]{64}  (\./[A-Za-z0-9._/-]+)$'
+  local line path
+
+  : >"${declared}"
+  while IFS= read -r line; do
+    [[ ${line} =~ ${checksum_pattern} ]] || return 1
+    path=${BASH_REMATCH[1]}
+    [[ ${path} != "./checksums.txt" &&
+      ${path} != *"//"* &&
+      ${path} != *"/./"* &&
+      ${path} != *"/../"* ]] || return 1
+    printf '%s\n' "${path}" >>"${declared}"
+  done <"${checksums}"
+  [[ -s ${declared} ]] || return 1
+
+  LC_ALL=C sort "${declared}" >"${declared_sorted}"
+  uniq -d "${declared_sorted}" >"${duplicates}"
+  [[ ! -s ${duplicates} ]] || return 1
+  case "${managed_markers}" in
+    false)
+      (
+        cd -- "${release_dir}"
+        find . -type f ! -path './checksums.txt' -print | LC_ALL=C sort
+      ) >"${actual}" || return 1
+      ;;
+    true)
+      (
+        cd -- "${release_dir}"
+        find . -type f \
+          ! -path './checksums.txt' \
+          ! -path './.artifact-sha256' \
+          ! -path './.version' \
+          -print | LC_ALL=C sort
+      ) >"${actual}" || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  cmp -s -- "${declared_sorted}" "${actual}"
+}
+
+validate_artifact_manifest() {
+  local manifest=$1
+  jq -e \
+    --arg version "${VERSION}" \
+    --arg service "${SERVICE_NAME}" \
+    --arg arch "${ARCH}" \
+    --arg asset "${ASSET_NAME}" \
+    --arg root "${ARCHIVE_ROOT_NAME}" \
+    '((keys | sort) ==
+       ["archive", "build_date", "commit", "compatibility", "component", "platform",
+        "schema_version", "source_version"]) and
+     (.schema_version == 1) and
+     (.component == $service) and
+     (.source_version == $version) and
+     (.commit | type == "string" and test("^[0-9a-f]{40}$")) and
+     (.build_date | type == "string" and
+       test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+     (.platform | type == "object") and
+     ((.platform | keys | sort) == ["arch", "os"]) and
+     (.platform.os == "linux") and
+     (.platform.arch == $arch) and
+     (.archive | type == "object") and
+     ((.archive | keys | sort) == ["name", "root"]) and
+     (.archive.name == $asset) and
+     (.archive.root == $root) and
+     (.compatibility | type == "object") and
+     ((.compatibility | keys | sort) ==
+       ["database_schema", "minimum_agent_version", "minimum_panel_version",
+        "rollback_compatible"]) and
+     (.compatibility.minimum_agent_version == "v1.0.0") and
+     (.compatibility.minimum_panel_version == null) and
+     (.compatibility.rollback_compatible == true) and
+     (.compatibility.database_schema == "backward_compatible")' \
+    "${manifest}" >/dev/null
+}
+
+expected_binary_identity() {
+  local manifest=$1
+  local commit build_date
+  commit=$(jq -r '.commit' "${manifest}") || return 1
+  build_date=$(jq -r '.build_date' "${manifest}") || return 1
+  printf 'autostream-observability %s\ncommit: %s\nbuild_date: %s' \
+    "${VERSION}" "${commit}" "${build_date}"
 }
 
 validate_marker() {
@@ -267,13 +665,21 @@ validate_marker() {
 validate_release_tree() {
   local release_dir=$1
   local trusted_checksums=$2
+  local scratch_prefix=$3
   [[ -d ${release_dir} && ! -L ${release_dir} ]] || die "managed release is missing or unsafe"
   [[ $(stat -c '%U:%G:%a' -- "${release_dir}") == "root:root:755" ]] || \
     die "managed release root owner or mode is invalid"
+  if find "${release_dir}" -mindepth 1 \
+    \( -type l -o \( ! -type d ! -type f \) \) \
+    -print -quit | grep -q .; then
+    die "existing managed release contains a link or special entry"
+  fi
   [[ -f ${release_dir}/checksums.txt && ! -L ${release_dir}/checksums.txt ]] || \
     die "managed release checksums are missing or unsafe"
   cmp -s -- "${trusted_checksums}" "${release_dir}/checksums.txt" || \
     die "existing managed release checksums do not match the verified archive"
+  validate_checksum_inventory "${release_dir}" "${scratch_prefix}" true || \
+    die "existing managed release checksum inventory is incomplete or unsafe"
   (
     cd -- "${release_dir}"
     sha256sum --check --strict checksums.txt
@@ -363,17 +769,99 @@ validate_public_path() {
   [[ -x ${path} ]] || die "${label} legacy binary is not executable"
 }
 
+create_bound_stage_directory() {
+  local output_path_variable=$1
+  local output_identity_variable=$2
+  local template=$3
+  local expected_prefix=$4
+  local expected_parent=$5
+  local path="" identity="" creation_failed=false
+
+  begin_installer_signal_transaction
+  if ! path=$(mktemp -d "${template}"); then
+    creation_failed=true
+  elif [[ -z ${path} ||
+    ${path} != "${expected_prefix}"* ||
+    $(dirname -- "${path}") != "${expected_parent}" ||
+    ! -d ${path} ||
+    -L ${path} ||
+    $(readlink -f -- "${path}") != "${path}" ||
+    $(stat -c '%U:%G:%a' -- "${path}") != "root:root:700" ]]; then
+    creation_failed=true
+  elif ! identity=$(stat -c '%d:%i' -- "${path}"); then
+    creation_failed=true
+  else
+    printf -v "${output_path_variable}" '%s' "${path}"
+    printf -v "${output_identity_variable}" '%s' "${identity}"
+  fi
+  if [[ ${creation_failed} == true &&
+    -n ${path} &&
+    ${path} == "${expected_prefix}"* &&
+    $(dirname -- "${path}") == "${expected_parent}" &&
+    -d ${path} &&
+    ! -L ${path} &&
+    $(readlink -f -- "${path}") == "${path}" ]]; then
+    rm -rf -- "${path}" || true
+  fi
+  finish_installer_signal_transaction
+  [[ ${creation_failed} == false ]]
+}
+
 reserve_path() {
-  local directory=$1
-  local template=$2
-  local reserved
-  reserved=$(mktemp "${directory}/${template}.XXXXXX") || return 1
-  [[ -n ${reserved} &&
+  local output_variable=$1
+  local directory=$2
+  local template=$3
+  local reserved="" reservation_failed=false
+
+  printf -v "${output_variable}" '%s' ""
+  begin_installer_signal_transaction
+  if ! reserved=$(mktemp "${directory}/${template}.XXXXXX"); then
+    reservation_failed=true
+  elif [[ -z ${reserved} ||
+    ${reserved} != "${directory}/${template}."* ||
+    $(dirname -- "${reserved}") != "${directory}" ||
+    ! -f ${reserved} ||
+    -L ${reserved} ]]; then
+    reservation_failed=true
+  else
+    register_temporary_rollback_path "${reserved}"
+    if ! rm -f -- "${reserved}"; then
+      reservation_failed=true
+    else
+      printf -v "${output_variable}" '%s' "${reserved}"
+    fi
+  fi
+  if [[ ${reservation_failed} == true &&
+    -n ${reserved} &&
     ${reserved} == "${directory}/${template}."* &&
+    $(dirname -- "${reserved}") == "${directory}" &&
     -f ${reserved} &&
-    ! -L ${reserved} ]] || return 1
-  rm -f -- "${reserved}" || return 1
-  printf '%s' "${reserved}"
+    ! -L ${reserved} ]]; then
+    rm -f -- "${reserved}" || true
+  fi
+  finish_installer_signal_transaction
+  [[ ${reservation_failed} == false ]]
+}
+
+ensure_permanent_lock_directory() {
+  local path=$1
+  # updater target lock is permanent installer coordination state.
+  if [[ -e ${path} || -L ${path} ]]; then
+    [[ -d ${path} &&
+      ! -L ${path} &&
+      $(readlink -f -- "${path}") == "${path}" &&
+      $(stat -c '%U:%G:%a' -- "${path}") == "root:root:700" ]] || \
+      die "permanent updater lock directory is unsafe: ${path}"
+  else
+    install -d -o root -g root -m 0700 -- "${path}"
+    [[ -d ${path} &&
+      ! -L ${path} &&
+      $(readlink -f -- "${path}") == "${path}" &&
+      $(stat -c '%U:%G:%a' -- "${path}") == "root:root:700" ]] || \
+      die "could not create the permanent updater lock directory"
+    sync -f -- "$(dirname -- "${path}")" || \
+      die "could not synchronize the permanent updater lock directory"
+  fi
 }
 
 sync_existing_directories_best_effort() {
@@ -428,6 +916,36 @@ sync_common_installation_parents_best_effort() {
     /run/autostream-updater
 }
 
+verify_legacy_backup_file() {
+  local backup_path=$1
+  local expected_digest=${2-}
+  validate_replaceable_regular_file "${backup_path}" "retained legacy backup"
+  if [[ -n ${expected_digest} &&
+    $(sha256sum -- "${backup_path}" | awk 'NR == 1 { print $1 }') != "${expected_digest}" ]]; then
+    die "retained legacy backup content conflicts with the live file: ${backup_path}"
+  fi
+  if [[ ${preexisting_legacy_backup_identity["${backup_path}"]+present} == present ]]; then
+    [[ $(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${backup_path}") == \
+      "${preexisting_legacy_backup_identity["${backup_path}"]}" ]] || \
+      die "pre-existing legacy backup identity or metadata changed during installation: ${backup_path}"
+    [[ $(sha256sum -- "${backup_path}" | awk 'NR == 1 { print $1 }') == \
+      "${preexisting_legacy_backup_digest["${backup_path}"]}" ]] || \
+      die "pre-existing legacy backup content changed during installation: ${backup_path}"
+  fi
+}
+
+snapshot_legacy_backup_path() {
+  local backup_path=$1
+  if [[ -e ${backup_path} || -L ${backup_path} ]]; then
+    verify_legacy_backup_file "${backup_path}"
+    legacy_backup_existed_before["${backup_path}"]=true
+    preexisting_legacy_backup_identity["${backup_path}"]="$(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${backup_path}")"
+    preexisting_legacy_backup_digest["${backup_path}"]="$(sha256sum -- "${backup_path}" | awk 'NR == 1 { print $1 }')"
+  else
+    legacy_backup_existed_before["${backup_path}"]=false
+  fi
+}
+
 retain_legacy_file() {
   local should_retain=$1
   local source=$2
@@ -441,6 +959,8 @@ retain_legacy_file() {
   [[ ${source_digest} =~ ^[0-9a-f]{64}$ ]] || die "failed to hash ${label}"
   source_mode=$(stat -c '%a' -- "${source}") || die "failed to inspect ${label}"
   if [[ -e ${destination} || -L ${destination} ]]; then
+    [[ ${legacy_backup_existed_before["${destination}"]-false} == true ]] || \
+      die "legacy backup path appeared after preflight: ${destination}"
     validate_replaceable_regular_file "${destination}" "retained ${label}"
     [[ $(stat -c '%a' -- "${destination}") == "${source_mode}" ]] || \
       die "retained ${label} mode conflicts with the live file"
@@ -448,7 +968,7 @@ retain_legacy_file() {
       die "retained ${label} content conflicts with the live file"
     return
   fi
-  staged=$(reserve_path "${INSTALL_BACKUP_DIR}" ".legacy.next") || \
+  reserve_path staged "${INSTALL_BACKUP_DIR}" ".legacy.next" || \
     die "failed to reserve ${label} retention path"
   install -o root -g root -m "${source_mode}" -- "${source}" "${staged}"
   [[ $(sha256sum -- "${source}" | awk 'NR == 1 { print $1 }') == "${source_digest}" ]] || \
@@ -457,41 +977,66 @@ retain_legacy_file() {
     die "retained ${label} differs from its source"
   mv -T -- "${staged}" "${destination}"
   validate_replaceable_regular_file "${destination}" "retained ${label}"
+  created_legacy_backup_identity["${destination}"]="$(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${destination}")"
+  created_legacy_backup_digest["${destination}"]="$(sha256sum -- "${destination}" | awk 'NR == 1 { print $1 }')"
   sync -f -- "${INSTALL_BACKUP_DIR}" || die "failed to synchronize retained ${label}"
 }
 
 stage_symlink() {
-  local target=$1
-  local directory=$2
-  local template=$3
-  local staged
-  staged=$(reserve_path "${directory}" "${template}") || return 1
-  ln -s -- "${target}" "${staged}" || return 1
-  [[ -L ${staged} && $(readlink -- "${staged}") == "${target}" ]] || return 1
-  printf '%s' "${staged}"
+  local output_variable=$1
+  local target=$2
+  local directory=$3
+  local template=$4
+  local staged="" staging_failed=false
+
+  reserve_path staged "${directory}" "${template}" || return 1
+  begin_installer_signal_transaction
+  if ! ln -s -- "${target}" "${staged}"; then
+    staging_failed=true
+  elif [[ ! -L ${staged} || $(readlink -- "${staged}") != "${target}" ]]; then
+    staging_failed=true
+  else
+    printf -v "${output_variable}" '%s' "${staged}"
+  fi
+  finish_installer_signal_transaction
+  [[ ${staging_failed} == false ]]
 }
 
 backup_destination() {
-  local destination=$1
-  local directory=$2
-  local template=$3
-  local backup= target
+  local output_variable=$1
+  local destination=$2
+  local directory=$3
+  local template=$4
+  local backup="" target="" backup_failed=false
+
+  printf -v "${output_variable}" '%s' ""
   if [[ -e ${destination} || -L ${destination} ]]; then
-    backup=$(reserve_path "${directory}" "${template}") || return 1
+    reserve_path backup "${directory}" "${template}" || return 1
+    begin_installer_signal_transaction
     if [[ -L ${destination} ]]; then
-      target=$(readlink -- "${destination}") || return 1
-      ln -s -- "${target}" "${backup}" || return 1
-      [[ -L ${backup} && $(readlink -- "${backup}") == "${target}" ]] || return 1
+      if ! target=$(readlink -- "${destination}"); then
+        backup_failed=true
+      elif ! ln -s -- "${target}" "${backup}"; then
+        backup_failed=true
+      elif [[ ! -L ${backup} || $(readlink -- "${backup}") != "${target}" ]]; then
+        backup_failed=true
+      fi
     elif [[ -f ${destination} ]]; then
-      ln -- "${destination}" "${backup}" || return 1
-      [[ -f ${backup} && ! -L ${backup} &&
-        $(stat -c '%d:%i' -- "${backup}") == "$(stat -c '%d:%i' -- "${destination}")" ]] || \
-        return 1
+      if ! ln -- "${destination}" "${backup}"; then
+        backup_failed=true
+      elif [[ ! -f ${backup} || -L ${backup} ||
+        $(stat -c '%d:%i' -- "${backup}") != "$(stat -c '%d:%i' -- "${destination}")" ]]; then
+        backup_failed=true
+      fi
     else
-      return 1
+      backup_failed=true
     fi
+    if [[ ${backup_failed} == false ]]; then
+      printf -v "${output_variable}" '%s' "${backup}"
+    fi
+    finish_installer_signal_transaction
   fi
-  printf '%s' "${backup}"
+  [[ ${backup_failed} == false ]]
 }
 
 restore_destination() {
@@ -505,59 +1050,511 @@ restore_destination() {
   [[ ${failed} == false ]]
 }
 
-for source_file in \
-  "${ARCHIVE_SOURCE}" \
-  "${ARCHIVE_SIDECAR_SOURCE}" \
-  "${MANIFEST_SOURCE}" \
-  "${MANIFEST_SIDECAR_SOURCE}"; do
-  validate_source_file "${source_file}" "release verification input"
+rollback_state_and_backup_directories() {
+  local failed=false
+  if [[ ${installation_complete} == false && ${state_dir_touched} == true ]]; then
+    if [[ ${state_dir_existed} == true ]]; then
+      if [[ -d ${STATE_DIR} && ! -L ${STATE_DIR} &&
+        $(stat -c '%d:%i' -- "${STATE_DIR}") == "${state_dir_original_identity}" ]]; then
+        chown -- "${state_dir_original_uid}:${state_dir_original_gid}" "${STATE_DIR}" || \
+          failed=true
+        chmod -- "${state_dir_original_mode}" "${STATE_DIR}" || failed=true
+        [[ $(stat -c '%d:%i:%u:%g:%a' -- "${STATE_DIR}") == \
+          "${state_dir_original_identity}:${state_dir_original_uid}:${state_dir_original_gid}:${state_dir_original_mode}" ]] || \
+          failed=true
+      else
+        failed=true
+      fi
+    elif [[ -e ${STATE_DIR} || -L ${STATE_DIR} ]]; then
+      if [[ -d ${STATE_DIR} && ! -L ${STATE_DIR} &&
+        -n ${state_dir_created_identity} &&
+        $(stat -c '%d:%i' -- "${STATE_DIR}") == "${state_dir_created_identity}" &&
+        -z $(find "${STATE_DIR}" -mindepth 1 -print -quit) ]]; then
+        rmdir -- "${STATE_DIR}" || failed=true
+      else
+        failed=true
+      fi
+      [[ ! -e ${STATE_DIR} && ! -L ${STATE_DIR} ]] || failed=true
+    fi
+  fi
+  if [[ ${installation_complete} == false && ${backup_dir_touched} == true ]]; then
+    if [[ ${backup_dir_existed} == true ]]; then
+      if [[ -d ${BACKUP_DIR} && ! -L ${BACKUP_DIR} &&
+        $(stat -c '%d:%i' -- "${BACKUP_DIR}") == "${backup_dir_original_identity}" ]]; then
+        chown -- "${backup_dir_original_uid}:${backup_dir_original_gid}" "${BACKUP_DIR}" || \
+          failed=true
+        chmod -- "${backup_dir_original_mode}" "${BACKUP_DIR}" || failed=true
+        [[ $(stat -c '%d:%i:%u:%g:%a' -- "${BACKUP_DIR}") == \
+          "${backup_dir_original_identity}:${backup_dir_original_uid}:${backup_dir_original_gid}:${backup_dir_original_mode}" ]] || \
+          failed=true
+      else
+        failed=true
+      fi
+    elif [[ -e ${BACKUP_DIR} || -L ${BACKUP_DIR} ]]; then
+      if [[ -d ${BACKUP_DIR} && ! -L ${BACKUP_DIR} &&
+        -n ${backup_dir_created_identity} &&
+        $(stat -c '%d:%i' -- "${BACKUP_DIR}") == "${backup_dir_created_identity}" &&
+        -z $(find "${BACKUP_DIR}" -mindepth 1 -print -quit) ]]; then
+        rmdir -- "${BACKUP_DIR}" || failed=true
+      else
+        failed=true
+      fi
+      [[ ! -e ${BACKUP_DIR} && ! -L ${BACKUP_DIR} ]] || failed=true
+    fi
+  fi
+  [[ ${failed} == false ]]
+}
+
+rollback_created_managed_release() {
+  local failed=false
+  local public_path
+  [[ ${managed_release_created} == true ]] || return 0
+  [[ -n ${RELEASE_DIR} ]] || return 1
+  if [[ ! -e ${RELEASE_DIR} && ! -L ${RELEASE_DIR} ]]; then
+    return 0
+  fi
+  [[ -d ${RELEASE_DIR} && ! -L ${RELEASE_DIR} &&
+    $(readlink -f -- "${RELEASE_DIR}") == "${RELEASE_DIR}" &&
+    $(stat -c '%d:%i' -- "${RELEASE_DIR}") == "${managed_release_created_identity}" ]] || \
+    return 1
+  if [[ -L ${CURRENT_LINK} && $(readlink -f -- "${CURRENT_LINK}") == "${RELEASE_DIR}" ]]; then
+    return 1
+  fi
+  for public_path in "${PUBLIC_BINARY}" "${PUBLIC_ALIAS}"; do
+    if [[ -L ${public_path} &&
+      $(readlink -f -- "${public_path}") == "${RELEASE_DIR}/${RELEASE_BINARY}" ]]; then
+      return 1
+    fi
+  done
+  rm -rf -- "${RELEASE_DIR}" || failed=true
+  [[ ! -e ${RELEASE_DIR} && ! -L ${RELEASE_DIR} ]] || failed=true
+  if [[ -d ${RELEASE_ROOT} && ! -L ${RELEASE_ROOT} ]]; then
+    sync -f -- "${RELEASE_ROOT}" || failed=true
+  fi
+  [[ ${failed} == false ]]
+}
+
+rollback_journaled_directories() {
+  local index path current_mode failed=false
+  for ((index=${#journaled_directory_paths[@]} - 1; index >= 0; index--)); do
+    path="${journaled_directory_paths[index]}"
+    if [[ ${directory_existed["${path}"]} == true ]]; then
+      if [[ -d ${path} && ! -L ${path} &&
+        $(readlink -f -- "${path}") == "${path}" &&
+        $(stat -c '%d:%i' -- "${path}") == "${directory_original_identity["${path}"]}" ]]; then
+        chown -- "${directory_original_owner["${path}"]}" "${path}" || failed=true
+        chmod -- "${directory_original_mode["${path}"]}" "${path}" || failed=true
+        [[ $(stat -c '%d:%i:%u:%g:%a' -- "${path}") == \
+          "${directory_original_identity["${path}"]}:${directory_original_owner["${path}"]}:${directory_original_mode["${path}"]}" ]] || \
+          failed=true
+      else
+        failed=true
+      fi
+    elif [[ -e ${path} || -L ${path} ]]; then
+      if [[ -d ${path} && ! -L ${path} &&
+        $(readlink -f -- "${path}") == "${path}" &&
+        -n ${directory_created_identity["${path}"]-} &&
+        $(stat -c '%d:%i' -- "${path}") == "${directory_created_identity["${path}"]}" ]]; then
+        if [[ -z $(find "${path}" -mindepth 1 -print -quit) ]]; then
+          rmdir -- "${path}" || failed=true
+          [[ ! -e ${path} && ! -L ${path} ]] || failed=true
+        else
+          current_mode=$(stat -c '%a' -- "${path}")
+          if [[ ${directory_retain_if_nonempty["${path}"]} == true &&
+            $(stat -c '%U:%G' -- "${path}") == "root:root" &&
+            ${current_mode} =~ ^[0-7]+$ ]] &&
+            (( (8#${current_mode} & 0022) == 0 )); then
+            printf 'install-autostream-observability: retaining non-empty durable backup directory after rollback: %s\n' \
+              "${path}" >&2
+          else
+            failed=true
+          fi
+        fi
+      else
+        failed=true
+      fi
+    fi
+  done
+  [[ ${failed} == false ]]
+}
+
+rollback_autostream_account() {
+  local failed=false current_group
+  if [[ ${created_autostream_user} == true ]]; then
+    if [[ $(getent passwd autostream 2>/dev/null || true) == "${created_autostream_user_record}" &&
+      $(id -u autostream 2>/dev/null || true) == "${created_autostream_user_uid}" &&
+      $(id -g autostream 2>/dev/null || true) == "${created_autostream_user_gid}" ]]; then
+      userdel autostream || failed=true
+      getent passwd autostream >/dev/null 2>&1 && failed=true
+    else
+      failed=true
+    fi
+  fi
+  if [[ ${created_autostream_group} == true ]]; then
+    current_group=$(getent group autostream 2>/dev/null || true)
+    if [[ -z ${current_group} ]]; then
+      :
+    elif [[ ${current_group} == "${created_autostream_group_record}" &&
+      $(printf '%s\n' "${current_group}" | awk -F: 'NR == 1 { print $3 }') == \
+        "${created_autostream_group_gid}" ]] &&
+      ! getent passwd autostream >/dev/null 2>&1; then
+      groupdel autostream || failed=true
+      getent group autostream >/dev/null 2>&1 && failed=true
+    else
+      failed=true
+    fi
+  fi
+  [[ ${failed} == false ]]
+}
+
+verify_bound_legacy_backups() {
+  local path failed=false
+  for path in "${!preexisting_legacy_backup_identity[@]}"; do
+    [[ -f ${path} && ! -L ${path} &&
+      $(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${path}") == \
+        "${preexisting_legacy_backup_identity["${path}"]}" &&
+      $(sha256sum -- "${path}" | awk 'NR == 1 { print $1 }') == \
+        "${preexisting_legacy_backup_digest["${path}"]}" ]] || failed=true
+  done
+  for path in "${!created_legacy_backup_identity[@]}"; do
+    [[ -f ${path} && ! -L ${path} &&
+      $(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${path}") == \
+        "${created_legacy_backup_identity["${path}"]}" &&
+      $(sha256sum -- "${path}" | awk 'NR == 1 { print $1 }') == \
+        "${created_legacy_backup_digest["${path}"]}" ]] || failed=true
+  done
+  [[ ${failed} == false ]]
+}
+
+cleanup_temporary_rollback_paths() {
+  local index path failed=false
+  for ((index=${#temporary_rollback_paths[@]} - 1; index >= 0; index--)); do
+    path="${temporary_rollback_paths[index]}"
+    if [[ -e ${path} || -L ${path} ]]; then
+      rm -f -- "${path}" || failed=true
+      [[ ! -e ${path} && ! -L ${path} ]] || failed=true
+    fi
+  done
+  [[ ${failed} == false ]]
+}
+
+remove_transaction_stage_directory() {
+  local path=$1
+  local expected_identity=$2
+  [[ -n ${path} ]] || return 0
+  if [[ ! -e ${path} && ! -L ${path} ]]; then
+    return 0
+  fi
+  [[ -n ${expected_identity} &&
+    -d ${path} &&
+    ! -L ${path} &&
+    $(readlink -f -- "${path}") == "${path}" &&
+    $(stat -c '%d:%i' -- "${path}") == "${expected_identity}" ]] || \
+    return 1
+  rm -rf -- "${path}" || return 1
+  [[ ! -e ${path} && ! -L ${path} ]]
+}
+
+cleanup() {
+  local status=$?
+  local cleanup_failed=false
+  local setup_rollback_safe=true
+  local restore_link
+  set +e
+  cleanup_in_progress=true
+  signal_transaction_active=false
+  deferred_termination_status=0
+  trap - EXIT
+  trap '' HUP INT TERM
+  if [[ ${installation_complete} == false && ${commit_started} == true ]]; then
+    [[ ${unit_quiesced} != true ]] ||
+      restore_destination "${UNIT_DEST}" "${unit_backup}" || {
+        cleanup_failed=true
+        setup_rollback_safe=false
+      }
+    [[ ${backup_exec_quiesced} != true ]] ||
+      restore_destination "${BACKUP_DEST}" "${backup_exec_backup}" || {
+        cleanup_failed=true
+        setup_rollback_safe=false
+      }
+    [[ ${alias_quiesced} != true ]] ||
+      restore_destination "${PUBLIC_ALIAS}" "${alias_backup}" || {
+        cleanup_failed=true
+        setup_rollback_safe=false
+      }
+    [[ ${binary_quiesced} != true ]] ||
+      restore_destination "${PUBLIC_BINARY}" "${binary_backup}" || {
+        cleanup_failed=true
+        setup_rollback_safe=false
+      }
+    if [[ ${env_created} == true ]]; then
+      if [[ -f ${ENV_DEST} && ! -L ${ENV_DEST} &&
+        $(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${ENV_DEST}") == "${env_created_identity}" &&
+        $(sha256sum -- "${ENV_DEST}" | awk 'NR == 1 { print $1 }') == "${env_created_digest}" ]]; then
+        rm -f -- "${ENV_DEST}" || {
+          cleanup_failed=true
+          setup_rollback_safe=false
+        }
+      else
+        cleanup_failed=true
+        setup_rollback_safe=false
+      fi
+    fi
+    if [[ ${backup_config_created} == true ]]; then
+      if [[ -f ${BACKUP_CONFIG_DEST} && ! -L ${BACKUP_CONFIG_DEST} &&
+        $(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${BACKUP_CONFIG_DEST}") == \
+          "${backup_config_created_identity}" &&
+        $(sha256sum -- "${BACKUP_CONFIG_DEST}" | awk 'NR == 1 { print $1 }') == \
+          "${backup_config_created_digest}" ]]; then
+        rm -f -- "${BACKUP_CONFIG_DEST}" || {
+          cleanup_failed=true
+          setup_rollback_safe=false
+        }
+      else
+        cleanup_failed=true
+        setup_rollback_safe=false
+      fi
+    fi
+    if [[ ${current_switched} == true ]]; then
+      if [[ ${current_original_exists} == true ]]; then
+        reserve_path restore_link "${MANAGED_ROOT}" ".current.restore" || {
+          cleanup_failed=true
+          setup_rollback_safe=false
+        }
+        if [[ -n ${restore_link} ]]; then
+          ln -s -- "${current_original_target}" "${restore_link}" || {
+            cleanup_failed=true
+            setup_rollback_safe=false
+          }
+          [[ ! -L ${restore_link} ]] ||
+            mv -Tf -- "${restore_link}" "${CURRENT_LINK}" || {
+              cleanup_failed=true
+              setup_rollback_safe=false
+            }
+        fi
+        [[ -L ${CURRENT_LINK} &&
+          $(readlink -- "${CURRENT_LINK}") == "${current_original_target}" ]] || \
+          {
+            cleanup_failed=true
+            setup_rollback_safe=false
+          }
+      else
+        rm -f -- "${CURRENT_LINK}" || {
+          cleanup_failed=true
+          setup_rollback_safe=false
+        }
+        [[ ! -e ${CURRENT_LINK} && ! -L ${CURRENT_LINK} ]] || {
+          cleanup_failed=true
+          setup_rollback_safe=false
+        }
+      fi
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || {
+      cleanup_failed=true
+      setup_rollback_safe=false
+    }
+  fi
+  if [[ ${installation_complete} == false ]]; then
+    remove_transaction_stage_directory \
+      "${MANAGED_STAGE_DIR}" "${managed_stage_dir_identity}" || {
+      cleanup_failed=true
+      setup_rollback_safe=false
+    }
+    rollback_state_and_backup_directories || {
+      cleanup_failed=true
+      setup_rollback_safe=false
+    }
+    rollback_created_managed_release || {
+      cleanup_failed=true
+      setup_rollback_safe=false
+    }
+    rollback_journaled_directories || {
+      cleanup_failed=true
+      setup_rollback_safe=false
+    }
+    if [[ ${setup_rollback_safe} == true ]]; then
+      rollback_autostream_account || cleanup_failed=true
+    else
+      printf 'install-autostream-observability: retaining the service account because setup rollback was incomplete\n' >&2
+    fi
+    verify_bound_legacy_backups || cleanup_failed=true
+  fi
+  cleanup_temporary_rollback_paths || cleanup_failed=true
+  if [[ -n ${lock_create_stage} && ( -e ${lock_create_stage} || -L ${lock_create_stage} ) ]]; then
+    rm -f -- "${lock_create_stage}" || cleanup_failed=true
+  fi
+  if [[ -n ${shared_lock_create_stage} &&
+    ( -e ${shared_lock_create_stage} || -L ${shared_lock_create_stage} ) ]]; then
+    rm -f -- "${shared_lock_create_stage}" || cleanup_failed=true
+  fi
+  if [[ ${installation_complete} == true ]]; then
+    remove_transaction_stage_directory \
+      "${MANAGED_STAGE_DIR}" "${managed_stage_dir_identity}" || cleanup_failed=true
+  fi
+  if [[ ${preserve_stage_directories} == false ]]; then
+    remove_transaction_stage_directory "${STAGE_DIR}" "${stage_dir_identity}" || cleanup_failed=true
+  fi
+  if [[ ${transaction_journal_active} == true ]]; then
+    sync_common_installation_parents_best_effort || cleanup_failed=true
+  fi
+  if [[ ${cleanup_failed} == true ]]; then
+    printf 'install-autostream-observability: cleanup or rollback was incomplete; inspect %s, %s, and retained backups before retrying\n' \
+      "${STAGE_DIR:-unset}" "${MANAGED_STAGE_DIR:-unset}" >&2
+    (( status != 0 )) || status=1
+  fi
+  exit "${status}"
+}
+
+validate_source_file "${ARCHIVE_SOURCE}" "release archive"
+validate_root_sticky_tmp_directory /var/tmp "/var/tmp"
+ARCHIVE_SOURCE_SIZE=$(stat -c '%s' -- "${ARCHIVE_SOURCE}") || \
+  die "failed to read the source archive size"
+[[ ${ARCHIVE_SOURCE_SIZE} =~ ^[1-9][0-9]*$ &&
+  ${ARCHIVE_SOURCE_SIZE} -le 268435456 ]] || \
+  die "source archive size is invalid"
+readonly ARCHIVE_SOURCE_SIZE
+
+STAGE_DIR=
+trap cleanup EXIT
+restore_installer_signal_traps
+create_bound_stage_directory \
+  STAGE_DIR \
+  stage_dir_identity \
+  /var/tmp/autostream-observability-install.XXXXXXXX \
+  /var/tmp/autostream-observability-install. \
+  /var/tmp || \
+  die "failed to create archive preflight directory"
+[[ -n ${STAGE_DIR} &&
+  ${STAGE_DIR} == /var/tmp/autostream-observability-install.* &&
+  -d ${STAGE_DIR} &&
+  ! -L ${STAGE_DIR} ]] || \
+  die "archive preflight directory path is invalid"
+[[ $(readlink -f -- "${STAGE_DIR}") == "${STAGE_DIR}" &&
+  $(stat -c '%U:%G:%a' -- "${STAGE_DIR}") == "root:root:700" ]] || \
+  die "archive preflight directory is invalid"
+readonly STAGE_DIR
+readonly STAGED_ARCHIVE="${STAGE_DIR}/${ASSET_NAME}"
+readonly PREFLIGHT_EXTRACT_DIR="${STAGE_DIR}/release"
+
+copy_bound_source "${ARCHIVE_SOURCE}" "${STAGED_ARCHIVE}" "release archive"
+ARCHIVE_DIGEST=$(sha256sum -- "${STAGED_ARCHIVE}" | awk 'NR == 1 { print $1 }') || \
+  die "failed to hash the release archive"
+[[ ${ARCHIVE_DIGEST} =~ ^[0-9a-f]{64}$ ]] || die "archive digest is invalid"
+readonly ARCHIVE_DIGEST
+ARCHIVE_SIZE=$(stat -c '%s' -- "${STAGED_ARCHIVE}") || \
+  die "failed to read the archive size"
+[[ ${ARCHIVE_SIZE} == "${ARCHIVE_SOURCE_SIZE}" ]] || \
+  die "staged archive size differs from its source"
+readonly ARCHIVE_SIZE
+
+validate_archive_layout \
+  "${STAGED_ARCHIVE}" \
+  "${STAGE_DIR}/archive.names" \
+  "${STAGE_DIR}/archive.verbose"
+install -d -o root -g root -m 0700 "${PREFLIGHT_EXTRACT_DIR}"
+tar \
+  --extract \
+  --gzip \
+  --file "${STAGED_ARCHIVE}" \
+  --directory "${PREFLIGHT_EXTRACT_DIR}" \
+  --strip-components=1 \
+  --no-same-owner \
+  --no-same-permissions \
+  --delay-directory-restore
+
+if find "${PREFLIGHT_EXTRACT_DIR}" -type l -print -quit | grep -q .; then
+  die "release archive contains a symlink"
+fi
+for required in \
+  "${RELEASE_BINARY}" \
+  "bin/observability" \
+  "${BACKUP_SOURCE_REL}" \
+  ".env.example" \
+  "systemd/autostream-observability.service.example" \
+  "README.install.md" \
+  "${ARTIFACT_MANIFEST_REL}" \
+  "checksums.txt" \
+  "install-autostream-observability"; do
+  [[ -f ${PREFLIGHT_EXTRACT_DIR}/${required} &&
+    ! -L ${PREFLIGHT_EXTRACT_DIR}/${required} ]] || \
+    die "release archive is missing ${required}"
 done
+[[ ! -e ${PREFLIGHT_EXTRACT_DIR}/.artifact-sha256 &&
+  ! -L ${PREFLIGHT_EXTRACT_DIR}/.artifact-sha256 ]] || \
+  die "release archive must not provide .artifact-sha256"
+[[ ! -e ${PREFLIGHT_EXTRACT_DIR}/.version &&
+  ! -L ${PREFLIGHT_EXTRACT_DIR}/.version ]] || \
+  die "release archive must not provide .version"
+validate_checksum_inventory \
+  "${PREFLIGHT_EXTRACT_DIR}" \
+  "${STAGE_DIR}/preflight-checksums" || \
+  die "release archive checksum inventory is incomplete or unsafe"
+(
+  cd -- "${PREFLIGHT_EXTRACT_DIR}"
+  sha256sum --check --strict checksums.txt
+) || die "release archive content verification failed"
+validate_artifact_manifest "${PREFLIGHT_EXTRACT_DIR}/${ARTIFACT_MANIFEST_REL}" || \
+  die "release artifact manifest does not bind the expected Observability archive"
+
+chmod 0700 "${PREFLIGHT_EXTRACT_DIR}/${RELEASE_BINARY}"
+EXPECTED_BINARY_IDENTITY=$(expected_binary_identity \
+  "${PREFLIGHT_EXTRACT_DIR}/${ARTIFACT_MANIFEST_REL}") || \
+  die "could not read the expected release binary identity"
+readonly EXPECTED_BINARY_IDENTITY
+PREFLIGHT_BINARY_IDENTITY=$("${PREFLIGHT_EXTRACT_DIR}/${RELEASE_BINARY}" --version) || \
+  die "release binary identity probe failed"
+[[ ${PREFLIGHT_BINARY_IDENTITY} == "${EXPECTED_BINARY_IDENTITY}" ]] || \
+  die "release binary identity does not match the artifact manifest"
+readonly PREFLIGHT_BINARY_IDENTITY
 
 validate_safe_root_directory / "/"
 validate_safe_root_directory /usr "/usr"
 validate_safe_root_directory /etc "/etc"
 validate_safe_root_directory /var "/var"
 validate_safe_root_directory /run "/run"
-ensure_root_only_directory /run/autostream-updater
 TARGET_LOCK_ID=$(printf '%s' "${UNIT_NAME}" | sha256sum | awk 'NR == 1 { print substr($1, 1, 12) }') || \
   die "could not derive the updater target lock identifier"
 [[ ${TARGET_LOCK_ID} =~ ^[0-9a-f]{12}$ ]] || \
   die "could not derive the updater target lock identifier"
 readonly TARGET_LOCK_ID
 readonly TARGET_LOCK="/run/autostream-updater/.autostream-updater-${TARGET_LOCK_ID}.lock"
+readonly SHARED_HOST_SETUP_LOCK="/run/autostream-updater/.autostream-runtime-host-setup.lock"
+readonly INSTALL_BACKUP_DIR="${INSTALL_MIGRATION_SERVICE_ROOT}/${VERSION}-${ARCHIVE_DIGEST:0:12}"
+readonly LEGACY_BINARY_BACKUP="${INSTALL_BACKUP_DIR}/usr-local-bin-autostream-observability.pre-managed"
+readonly LEGACY_ALIAS_BACKUP="${INSTALL_BACKUP_DIR}/usr-local-bin-observability.pre-managed"
+readonly LEGACY_UNIT_BACKUP="${INSTALL_BACKUP_DIR}/etc-systemd-system-autostream-observability.service.pre-managed"
+readonly LEGACY_BACKUP_EXEC_BACKUP="${INSTALL_BACKUP_DIR}/usr-local-sbin-autostream-backup-observability.pre-managed"
+validate_safe_root_directory_candidate /opt "/opt"
+validate_safe_root_directory_candidate /opt/autostream "/opt/autostream"
+validate_safe_root_directory_candidate "${MANAGED_ROOT}" "${MANAGED_ROOT}"
+validate_safe_root_directory_candidate "${RELEASE_ROOT}" "${RELEASE_ROOT}"
+validate_safe_root_directory_candidate /usr/local "/usr/local"
+validate_safe_root_directory_candidate /usr/local/bin "/usr/local/bin"
+validate_safe_root_directory_candidate /usr/local/sbin "/usr/local/sbin"
+validate_safe_root_directory_candidate /etc/systemd "/etc/systemd"
+validate_safe_root_directory_candidate /etc/systemd/system "/etc/systemd/system"
+validate_safe_root_directory_candidate /etc/autostream "/etc/autostream"
+validate_safe_root_directory_candidate /var/lib "/var/lib"
+validate_safe_root_directory_candidate /var/lib/autostream "/var/lib/autostream"
+validate_safe_root_directory_candidate /var/backups "/var/backups"
+validate_root_only_directory_candidate /var/backups/autostream
+validate_root_only_directory_candidate "${INSTALL_MIGRATION_ROOT}"
+validate_root_only_directory_candidate "${INSTALL_MIGRATION_SERVICE_ROOT}"
+validate_root_only_directory_candidate "${INSTALL_BACKUP_DIR}"
+validate_safe_root_directory_candidate "${BACKUP_CONFIG_DIR}" "${BACKUP_CONFIG_DIR}"
+validate_root_only_directory_candidate /run/autostream-updater
+validate_exact_directory_candidate "${STATE_DIR}" autostream autostream 0750 "${STATE_DIR}"
+validate_exact_directory_candidate "${BACKUP_DIR}" root root 0700 "${BACKUP_DIR}"
 if [[ -e ${TARGET_LOCK} || -L ${TARGET_LOCK} ]]; then
   [[ -f ${TARGET_LOCK} && ! -L ${TARGET_LOCK} ]] || die "updater target lock path is unsafe"
-  [[ $(stat -c '%U:%G' -- "${TARGET_LOCK}") == "root:root" ]] || \
-    die "updater target lock must be owned by root:root"
-  target_lock_mode=$(stat -c '%a' -- "${TARGET_LOCK}")
-  (( (8#${target_lock_mode} & 0077) == 0 )) || \
-    die "updater target lock must not grant group or other permissions"
+  [[ $(stat -c '%U:%G:%a' -- "${TARGET_LOCK}") == "root:root:600" ]] || \
+    die "updater target lock must be owned by root:root with mode 0600"
 fi
-exec 9>"${TARGET_LOCK}"
-chown root:root "${TARGET_LOCK}"
-chmod 0600 "${TARGET_LOCK}"
-flock -n 9 || die "another privileged update is already active for ${UNIT_NAME}"
-
-ensure_safe_root_directory /opt 0755 "/opt"
-ensure_safe_root_directory /opt/autostream 0755 "/opt/autostream"
-ensure_safe_root_directory "${MANAGED_ROOT}" 0755 "${MANAGED_ROOT}"
-ensure_safe_root_directory "${RELEASE_ROOT}" 0755 "${RELEASE_ROOT}"
-ensure_safe_root_directory /usr/local 0755 "/usr/local"
-ensure_safe_root_directory /usr/local/bin 0755 "/usr/local/bin"
-ensure_safe_root_directory /usr/local/sbin 0755 "/usr/local/sbin"
-ensure_safe_root_directory /etc/systemd 0755 "/etc/systemd"
-ensure_safe_root_directory /etc/systemd/system 0755 "/etc/systemd/system"
-ensure_safe_root_directory /etc/autostream 0750 "/etc/autostream"
-ensure_safe_root_directory /var/lib 0755 "/var/lib"
-ensure_safe_root_directory /var/lib/autostream 0755 "/var/lib/autostream"
-ensure_safe_root_directory /var/backups 0755 "/var/backups"
-ensure_root_only_directory /var/backups/autostream
-ensure_root_only_directory "${INSTALL_MIGRATION_ROOT}"
-ensure_root_only_directory "${INSTALL_MIGRATION_SERVICE_ROOT}"
-ensure_safe_root_directory "${BACKUP_CONFIG_DIR}" 0700 "${BACKUP_CONFIG_DIR}"
-ensure_autostream_account
-ensure_exact_directory "${STATE_DIR}" autostream autostream 0750 "${STATE_DIR}"
-ensure_exact_directory "${BACKUP_DIR}" root root 0700 "${BACKUP_DIR}"
+if [[ -e ${SHARED_HOST_SETUP_LOCK} || -L ${SHARED_HOST_SETUP_LOCK} ]]; then
+  [[ -f ${SHARED_HOST_SETUP_LOCK} && ! -L ${SHARED_HOST_SETUP_LOCK} &&
+    $(stat -c '%U:%G:%a' -- "${SHARED_HOST_SETUP_LOCK}") == "root:root:600" ]] || \
+    die "shared runtime host-setup lock must be a root:root mode 0600 regular file"
+fi
 
 validate_current_release
 legacy_install_detected=false
@@ -604,189 +1601,174 @@ if [[ -e ${BACKUP_CONFIG_DEST} || -L ${BACKUP_CONFIG_DEST} ]]; then
   backup_config_sha_before=$(sha256sum -- "${BACKUP_CONFIG_DEST}" | awk 'NR == 1 { print $1 }')
 fi
 
+snapshot_legacy_backup_path "${LEGACY_BINARY_BACKUP}"
+snapshot_legacy_backup_path "${LEGACY_ALIAS_BACKUP}"
+snapshot_legacy_backup_path "${LEGACY_UNIT_BACKUP}"
+snapshot_legacy_backup_path "${LEGACY_BACKUP_EXEC_BACKUP}"
+preflight_autostream_account
+
+if [[ -e ${STATE_DIR} || -L ${STATE_DIR} ]]; then
+  state_dir_existed=true
+  state_dir_original_uid=$(stat -c '%u' -- "${STATE_DIR}")
+  state_dir_original_gid=$(stat -c '%g' -- "${STATE_DIR}")
+  state_dir_original_mode=$(stat -c '%a' -- "${STATE_DIR}")
+  state_dir_original_identity=$(stat -c '%d:%i' -- "${STATE_DIR}")
+fi
+if [[ -e ${BACKUP_DIR} || -L ${BACKUP_DIR} ]]; then
+  backup_dir_existed=true
+  backup_dir_original_uid=$(stat -c '%u' -- "${BACKUP_DIR}")
+  backup_dir_original_gid=$(stat -c '%g' -- "${BACKUP_DIR}")
+  backup_dir_original_mode=$(stat -c '%a' -- "${BACKUP_DIR}")
+  backup_dir_original_identity=$(stat -c '%d:%i' -- "${BACKUP_DIR}")
+fi
+
 service_was_active=false
 if systemctl is-active --quiet autostream-observability.service >/dev/null 2>&1; then
   service_was_active=true
 fi
 
-STAGE_DIR=
-STAGE_DIR=$(mktemp -d "${MANAGED_ROOT}/.install.XXXXXX") || \
+ensure_permanent_lock_directory /run/autostream-updater
+if [[ ! -e ${SHARED_HOST_SETUP_LOCK} && ! -L ${SHARED_HOST_SETUP_LOCK} ]]; then
+  reserve_path \
+    shared_lock_create_stage \
+    /run/autostream-updater \
+    ".host-lock-create" || \
+    die "could not create shared runtime host-setup lock candidate"
+  lock_creation_failed=false
+  begin_installer_signal_transaction
+  if ! install -o root -g root -m 0600 /dev/null "${shared_lock_create_stage}"; then
+    lock_creation_failed=true
+  elif [[ ! -f ${shared_lock_create_stage} || -L ${shared_lock_create_stage} ||
+    $(stat -c '%U:%G:%a' -- "${shared_lock_create_stage}") != "root:root:600" ]]; then
+    lock_creation_failed=true
+  elif ln -- "${shared_lock_create_stage}" "${SHARED_HOST_SETUP_LOCK}" 2>/dev/null; then
+    sync -f -- /run/autostream-updater || lock_creation_failed=true
+  elif [[ ! -e ${SHARED_HOST_SETUP_LOCK} && ! -L ${SHARED_HOST_SETUP_LOCK} ]]; then
+    lock_creation_failed=true
+  fi
+  rm -f -- "${shared_lock_create_stage}" || lock_creation_failed=true
+  shared_lock_create_stage=
+  finish_installer_signal_transaction
+  if [[ ${lock_creation_failed} == true ]]; then
+    die "could not atomically create the permanent shared runtime host-setup lock"
+  fi
+fi
+[[ -f ${SHARED_HOST_SETUP_LOCK} && ! -L ${SHARED_HOST_SETUP_LOCK} &&
+  $(stat -c '%U:%G:%a' -- "${SHARED_HOST_SETUP_LOCK}") == "root:root:600" ]] || \
+  die "shared runtime host-setup lock path is unsafe"
+exec 8<>"${SHARED_HOST_SETUP_LOCK}"
+chown root:root /proc/self/fd/8
+chmod 0600 /proc/self/fd/8
+shared_lock_fd_identity=$(stat -Lc '%d:%i' -- /proc/self/fd/8)
+[[ -f ${SHARED_HOST_SETUP_LOCK} && ! -L ${SHARED_HOST_SETUP_LOCK} &&
+  $(stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/8) == "regular file:root:root:600" &&
+  $(stat -c '%U:%G:%a' -- "${SHARED_HOST_SETUP_LOCK}") == "root:root:600" &&
+  ${shared_lock_fd_identity} == "$(stat -c '%d:%i' -- "${SHARED_HOST_SETUP_LOCK}")" ]] || \
+  die "shared runtime host-setup lock identity changed while being opened"
+flock -n 8 || die "another runtime installer is provisioning shared host state"
+[[ -f ${SHARED_HOST_SETUP_LOCK} && ! -L ${SHARED_HOST_SETUP_LOCK} &&
+  $(stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/8) == "regular file:root:root:600" &&
+  $(stat -c '%U:%G:%a' -- "${SHARED_HOST_SETUP_LOCK}") == "root:root:600" &&
+  ${shared_lock_fd_identity} == "$(stat -c '%d:%i' -- "${SHARED_HOST_SETUP_LOCK}")" ]] || \
+  die "shared runtime host-setup lock identity changed after acquisition"
+if [[ ! -e ${TARGET_LOCK} && ! -L ${TARGET_LOCK} ]]; then
+  reserve_path \
+    lock_create_stage \
+    /run/autostream-updater \
+    ".lock-create" || \
+    die "could not create updater target lock candidate"
+  lock_creation_failed=false
+  begin_installer_signal_transaction
+  if ! install -o root -g root -m 0600 /dev/null "${lock_create_stage}"; then
+    lock_creation_failed=true
+  elif [[ ! -f ${lock_create_stage} || -L ${lock_create_stage} ||
+    $(stat -c '%U:%G:%a' -- "${lock_create_stage}") != "root:root:600" ]]; then
+    lock_creation_failed=true
+  elif ln -- "${lock_create_stage}" "${TARGET_LOCK}" 2>/dev/null; then
+    sync -f -- /run/autostream-updater || lock_creation_failed=true
+  elif [[ ! -e ${TARGET_LOCK} && ! -L ${TARGET_LOCK} ]]; then
+    lock_creation_failed=true
+  fi
+  rm -f -- "${lock_create_stage}" || lock_creation_failed=true
+  lock_create_stage=
+  finish_installer_signal_transaction
+  if [[ ${lock_creation_failed} == true ]]; then
+    die "could not atomically create the permanent updater target lock"
+  fi
+fi
+[[ -f ${TARGET_LOCK} && ! -L ${TARGET_LOCK} &&
+  $(stat -c '%U:%G:%a' -- "${TARGET_LOCK}") == "root:root:600" ]] || \
+  die "updater target lock path is unsafe"
+exec 9<>"${TARGET_LOCK}"
+chown root:root /proc/self/fd/9
+chmod 0600 /proc/self/fd/9
+target_lock_fd_identity=$(stat -Lc '%d:%i' -- /proc/self/fd/9)
+[[ -f ${TARGET_LOCK} && ! -L ${TARGET_LOCK} &&
+  $(stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/9) == "regular file:root:root:600" &&
+  $(stat -c '%U:%G:%a' -- "${TARGET_LOCK}") == "root:root:600" &&
+  ${target_lock_fd_identity} == "$(stat -c '%d:%i' -- "${TARGET_LOCK}")" ]] || \
+  die "updater target lock identity changed while being opened"
+flock -n 9 || die "another privileged update is already active for ${UNIT_NAME}"
+[[ -f ${TARGET_LOCK} && ! -L ${TARGET_LOCK} &&
+  $(stat -Lc '%F:%U:%G:%a' -- /proc/self/fd/9) == "regular file:root:root:600" &&
+  $(stat -c '%U:%G:%a' -- "${TARGET_LOCK}") == "root:root:600" &&
+  ${target_lock_fd_identity} == "$(stat -c '%d:%i' -- "${TARGET_LOCK}")" ]] || \
+  die "updater target lock identity changed after acquisition"
+
+transaction_journal_active=true
+ensure_safe_root_directory /opt 0755 "/opt"
+ensure_safe_root_directory /opt/autostream 0755 "/opt/autostream"
+ensure_safe_root_directory "${MANAGED_ROOT}" 0755 "${MANAGED_ROOT}"
+ensure_safe_root_directory "${RELEASE_ROOT}" 0755 "${RELEASE_ROOT}"
+ensure_safe_root_directory /usr/local 0755 "/usr/local"
+ensure_safe_root_directory /usr/local/bin 0755 "/usr/local/bin"
+ensure_safe_root_directory /usr/local/sbin 0755 "/usr/local/sbin"
+ensure_safe_root_directory /etc/systemd 0755 "/etc/systemd"
+ensure_safe_root_directory /etc/systemd/system 0755 "/etc/systemd/system"
+ensure_safe_root_directory /etc/autostream 0750 "/etc/autostream"
+ensure_safe_root_directory /var/lib 0755 "/var/lib"
+ensure_safe_root_directory /var/lib/autostream 0755 "/var/lib/autostream"
+ensure_safe_root_directory /var/backups 0755 "/var/backups"
+ensure_root_only_directory /var/backups/autostream true
+ensure_root_only_directory "${INSTALL_MIGRATION_ROOT}" true
+ensure_root_only_directory "${INSTALL_MIGRATION_SERVICE_ROOT}" true
+ensure_safe_root_directory "${BACKUP_CONFIG_DIR}" 0700 "${BACKUP_CONFIG_DIR}"
+ensure_autostream_account
+
+MANAGED_STAGE_DIR=
+create_bound_stage_directory \
+  MANAGED_STAGE_DIR \
+  managed_stage_dir_identity \
+  "${MANAGED_ROOT}/.install.XXXXXX" \
+  "${MANAGED_ROOT}/.install." \
+  "${MANAGED_ROOT}" || \
   die "failed to create installer staging directory"
-[[ -n ${STAGE_DIR} &&
-  ${STAGE_DIR} == "${MANAGED_ROOT}/.install."* &&
-  -d ${STAGE_DIR} &&
-  ! -L ${STAGE_DIR} ]] || \
+[[ -n ${MANAGED_STAGE_DIR} &&
+  ${MANAGED_STAGE_DIR} == "${MANAGED_ROOT}/.install."* &&
+  -d ${MANAGED_STAGE_DIR} &&
+  ! -L ${MANAGED_STAGE_DIR} ]] || \
   die "installer staging directory is invalid"
-readonly STAGE_DIR
-chmod 0755 "${STAGE_DIR}"
-readonly STAGED_SOURCE_DIR="${STAGE_DIR}/source"
-readonly EXTRACT_DIR="${STAGE_DIR}/release"
-install -d -o root -g root -m 0700 "${STAGED_SOURCE_DIR}"
+readonly MANAGED_STAGE_DIR
+chmod 0755 "${MANAGED_STAGE_DIR}"
+readonly EXTRACT_DIR="${MANAGED_STAGE_DIR}/release"
 install -d -o root -g root -m 0755 "${EXTRACT_DIR}"
 
-binary_stage=
-alias_stage=
-unit_stage=
-backup_exec_stage=
-env_stage=
-backup_config_stage=
-current_stage=
-binary_backup=
-alias_backup=
-unit_backup=
-backup_exec_backup=
-binary_quiesced=false
-alias_quiesced=false
-unit_quiesced=false
-backup_exec_quiesced=false
-current_original_exists=false
-current_original_target=
-current_switched=false
-binary_activated=false
-alias_activated=false
-unit_activated=false
-backup_exec_activated=false
-env_created=false
-backup_config_created=false
-commit_started=false
-installation_complete=false
-
-cleanup() {
-  local status=$?
-  local cleanup_failed=false
-  set +e
-  trap - EXIT HUP INT TERM
-  if [[ ${installation_complete} == false && ${commit_started} == true ]]; then
-    if [[ ${unit_quiesced} == true ]]; then
-      restore_destination "${UNIT_DEST}" "${unit_backup}" || cleanup_failed=true
-    fi
-    if [[ ${backup_exec_quiesced} == true ]]; then
-      restore_destination "${BACKUP_DEST}" "${backup_exec_backup}" || cleanup_failed=true
-    fi
-    if [[ ${alias_quiesced} == true ]]; then
-      restore_destination "${PUBLIC_ALIAS}" "${alias_backup}" || cleanup_failed=true
-    fi
-    if [[ ${binary_quiesced} == true ]]; then
-      restore_destination "${PUBLIC_BINARY}" "${binary_backup}" || cleanup_failed=true
-    fi
-    if [[ ${env_created} == true ]]; then
-      rm -f -- "${ENV_DEST}" || cleanup_failed=true
-    fi
-    if [[ ${backup_config_created} == true ]]; then
-      rm -f -- "${BACKUP_CONFIG_DEST}" || cleanup_failed=true
-    fi
-    if [[ ${current_switched} == true ]]; then
-      if [[ ${current_original_exists} == true ]]; then
-        local restore_link
-        restore_link=$(reserve_path "${MANAGED_ROOT}" ".current.restore") || cleanup_failed=true
-        if [[ -n ${restore_link} ]]; then
-          ln -s -- "${current_original_target}" "${restore_link}" || cleanup_failed=true
-          if [[ -L ${restore_link} ]]; then
-            mv -Tf -- "${restore_link}" "${CURRENT_LINK}" || cleanup_failed=true
-          fi
-        fi
-        [[ -L ${CURRENT_LINK} &&
-          $(readlink -- "${CURRENT_LINK}") == "${current_original_target}" ]] || \
-          cleanup_failed=true
-      else
-        rm -f -- "${CURRENT_LINK}" || cleanup_failed=true
-        [[ ! -e ${CURRENT_LINK} && ! -L ${CURRENT_LINK} ]] || cleanup_failed=true
-      fi
-    fi
-    systemctl daemon-reload >/dev/null 2>&1 || cleanup_failed=true
+if [[ ${state_dir_existed} == false || ${state_dir_original_mode} != "750" ]]; then
+  state_dir_touched=true
+  ensure_exact_directory "${STATE_DIR}" autostream autostream 0750 "${STATE_DIR}"
+  if [[ ${state_dir_existed} == false ]]; then
+    state_dir_created_identity=$(stat -c '%d:%i' -- "${STATE_DIR}")
   fi
-  rm -f -- \
-    "${binary_stage}" "${alias_stage}" "${unit_stage}" "${backup_exec_stage}" \
-    "${env_stage}" "${backup_config_stage}" "${current_stage}" || cleanup_failed=true
-  if [[ ${installation_complete} == false && ${cleanup_failed} == false ]]; then
-    rm -f -- "${binary_backup}" "${alias_backup}" "${unit_backup}" "${backup_exec_backup}" || \
-      cleanup_failed=true
+fi
+if [[ ${backup_dir_existed} == false || ${backup_dir_original_mode} != "700" ]]; then
+  backup_dir_touched=true
+  ensure_exact_directory "${BACKUP_DIR}" root root 0700 "${BACKUP_DIR}"
+  if [[ ${backup_dir_existed} == false ]]; then
+    backup_dir_created_identity=$(stat -c '%d:%i' -- "${BACKUP_DIR}")
   fi
-  if [[ ${cleanup_failed} == false ]]; then
-    rm -rf -- "${STAGE_DIR}" || cleanup_failed=true
-  fi
-  if [[ ${installation_complete} == false && ${commit_started} == true ]]; then
-    sync_common_installation_parents_best_effort || cleanup_failed=true
-  fi
-  if [[ ${cleanup_failed} == true ]]; then
-    printf 'install-autostream-observability: cleanup or rollback was incomplete; inspect %s and any retained *.backup.* files before retrying\n' \
-      "${STAGE_DIR}" >&2
-    if (( status == 0 )); then
-      status=1
-    fi
-  fi
-  exit "${status}"
-}
-trap cleanup EXIT HUP INT TERM
+fi
 
-copy_bound_source "${ARCHIVE_SOURCE}" "${STAGED_SOURCE_DIR}/${ASSET_NAME}" "release archive"
-copy_bound_source "${ARCHIVE_SIDECAR_SOURCE}" "${STAGED_SOURCE_DIR}/${ASSET_NAME}.sha256" "archive checksum"
-copy_bound_source "${MANIFEST_SOURCE}" "${STAGED_SOURCE_DIR}/release-manifest.json" "release manifest"
-copy_bound_source \
-  "${MANIFEST_SIDECAR_SOURCE}" \
-  "${STAGED_SOURCE_DIR}/release-manifest.json.sha256" \
-  "release manifest checksum"
-
-verify_checksum_sidecar "${STAGED_SOURCE_DIR}" "${ASSET_NAME}" "${ASSET_NAME}.sha256"
-verify_checksum_sidecar "${STAGED_SOURCE_DIR}" "release-manifest.json" "release-manifest.json.sha256"
-ARCHIVE_DIGEST=$(awk 'NR == 1 { print $1 }' "${STAGED_SOURCE_DIR}/${ASSET_NAME}.sha256") || \
-  die "failed to read the archive digest"
-[[ ${ARCHIVE_DIGEST} =~ ^[0-9a-f]{64}$ ]] || die "archive digest is invalid"
-readonly ARCHIVE_DIGEST
-ARCHIVE_SIZE=$(stat -c '%s' -- "${STAGED_SOURCE_DIR}/${ASSET_NAME}") || \
-  die "failed to read the archive size"
-[[ ${ARCHIVE_SIZE} =~ ^[1-9][0-9]*$ ]] || die "archive size is invalid"
-readonly ARCHIVE_SIZE
-
-jq -e \
-  --arg version "${VERSION}" \
-  --arg prefix "${ARTIFACT_PREFIX}" \
-  --arg service "${SERVICE_NAME}" \
-  --arg arch "${ARCH}" \
-  --arg asset "${ASSET_NAME}" \
-  --arg digest "${ARCHIVE_DIGEST}" \
-  --argjson size "${ARCHIVE_SIZE}" \
-  '((keys | sort) ==
-     ["channel", "components", "minimum_agent_version", "published_at", "release_id", "schema_version"]) and
-   (.schema_version == 1) and
-   (.release_id == $version) and
-   (.channel == "host") and
-   (.published_at | type == "string" and
-     test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
-   (.minimum_agent_version | type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) and
-   (.components | type == "array" and length == 1) and
-   (.components[0] | type == "object") and
-   ((.components[0] | keys | sort) ==
-     ["artifacts", "commit", "database_schema", "rollback_compatible", "service", "source_version"]) and
-   (.components[0].service == $service) and
-   (.components[0].source_version == $version) and
-   (.components[0].commit | type == "string" and test("^[0-9a-f]{40}$")) and
-   (.components[0].rollback_compatible == true) and
-   (.components[0].database_schema == "backward_compatible") and
-   (.components[0].artifacts | type == "array" and length == 2) and
-   ([.components[0].artifacts[].arch] | sort == ["amd64", "arm64"]) and
-   (all(.components[0].artifacts[];
-     (type == "object") and
-     ((keys | sort) == ["arch", "name", "os", "sha256", "size"]) and
-     (.os == "linux") and
-     (.arch == "amd64" or .arch == "arm64") and
-     (.name == ($prefix + "_" + $version + "_linux_" + .arch + ".tar.gz")) and
-     (.size | type == "number" and . > 0 and . <= 268435456) and
-     (.sha256 | type == "string" and test("^[0-9a-f]{64}$")))) and
-   ([.components[0].artifacts[] |
-      select(.arch == $arch and
-             .name == $asset and
-             .sha256 == $digest and
-             .size == $size)] | length == 1)' \
-  "${STAGED_SOURCE_DIR}/release-manifest.json" >/dev/null || \
-  die "release manifest does not bind the expected Observability artifact"
-
-readonly INSTALL_BACKUP_DIR="${INSTALL_MIGRATION_SERVICE_ROOT}/${VERSION}-${ARCHIVE_DIGEST:0:12}"
-readonly LEGACY_BINARY_BACKUP="${INSTALL_BACKUP_DIR}/usr-local-bin-autostream-observability.pre-managed"
-readonly LEGACY_ALIAS_BACKUP="${INSTALL_BACKUP_DIR}/usr-local-bin-observability.pre-managed"
-readonly LEGACY_UNIT_BACKUP="${INSTALL_BACKUP_DIR}/etc-systemd-system-autostream-observability.service.pre-managed"
-readonly LEGACY_BACKUP_EXEC_BACKUP="${INSTALL_BACKUP_DIR}/usr-local-sbin-autostream-backup-observability.pre-managed"
-ensure_root_only_directory "${INSTALL_BACKUP_DIR}"
+ensure_root_only_directory "${INSTALL_BACKUP_DIR}" true
 retain_legacy_file \
   "${legacy_binary_regular}" "${PUBLIC_BINARY}" "${LEGACY_BINARY_BACKUP}" "legacy binary"
 retain_legacy_file \
@@ -797,14 +1779,10 @@ retain_legacy_file \
   "${legacy_backup_exec_regular}" "${BACKUP_DEST}" "${LEGACY_BACKUP_EXEC_BACKUP}" \
   "legacy backup executable"
 
-validate_archive_layout \
-  "${STAGED_SOURCE_DIR}/${ASSET_NAME}" \
-  "${STAGE_DIR}/archive.names" \
-  "${STAGE_DIR}/archive.verbose"
 tar \
   --extract \
   --gzip \
-  --file "${STAGED_SOURCE_DIR}/${ASSET_NAME}" \
+  --file "${STAGED_ARCHIVE}" \
   --directory "${EXTRACT_DIR}" \
   --strip-components=1 \
   --no-same-owner \
@@ -821,6 +1799,7 @@ for required in \
   ".env.example" \
   "systemd/autostream-observability.service.example" \
   "README.install.md" \
+  "${ARTIFACT_MANIFEST_REL}" \
   "checksums.txt" \
   "install-autostream-observability"; do
   [[ -f ${EXTRACT_DIR}/${required} && ! -L ${EXTRACT_DIR}/${required} ]] || \
@@ -830,10 +1809,24 @@ done
   die "release archive must not provide .artifact-sha256"
 [[ ! -e ${EXTRACT_DIR}/.version && ! -L ${EXTRACT_DIR}/.version ]] || \
   die "release archive must not provide .version"
+validate_checksum_inventory \
+  "${EXTRACT_DIR}" \
+  "${MANAGED_STAGE_DIR}/candidate-checksums" || \
+  die "managed release candidate checksum inventory is incomplete or unsafe"
 (
   cd -- "${EXTRACT_DIR}"
   sha256sum --check --strict checksums.txt
-) || die "release archive content verification failed"
+) || die "managed release candidate content verification failed"
+cmp -s \
+  "${PREFLIGHT_EXTRACT_DIR}/checksums.txt" \
+  "${EXTRACT_DIR}/checksums.txt" || \
+  die "managed release candidate checksums differ from the preflight release"
+cmp -s \
+  "${PREFLIGHT_EXTRACT_DIR}/${ARTIFACT_MANIFEST_REL}" \
+  "${EXTRACT_DIR}/${ARTIFACT_MANIFEST_REL}" || \
+  die "managed release candidate manifest differs from the preflight release"
+validate_artifact_manifest "${EXTRACT_DIR}/${ARTIFACT_MANIFEST_REL}" || \
+  die "managed release candidate artifact manifest is invalid"
 
 chown -R root:root "${EXTRACT_DIR}"
 find "${EXTRACT_DIR}" -type d -exec chmod 0755 {} +
@@ -844,9 +1837,10 @@ chmod 0755 \
   "${EXTRACT_DIR}/${BACKUP_SOURCE_REL}" \
   "${EXTRACT_DIR}/install-autostream-observability"
 
-version_output=$(runuser -u autostream -- "${EXTRACT_DIR}/${RELEASE_BINARY}" --version)
-[[ ${version_output%%$'\n'*} == "autostream-observability ${VERSION}" ]] || \
-  die "release binary version does not match ${VERSION}"
+version_output=$(runuser -u autostream -- "${EXTRACT_DIR}/${RELEASE_BINARY}" --version) || \
+  die "managed release candidate binary identity probe failed"
+[[ ${version_output} == "${EXPECTED_BINARY_IDENTITY}" ]] || \
+  die "managed release candidate binary identity does not match the artifact manifest"
 
 printf '%s\n' "${ARCHIVE_DIGEST}" >"${EXTRACT_DIR}/.artifact-sha256"
 printf '%s\n' "${VERSION}" >"${EXTRACT_DIR}/.version"
@@ -855,21 +1849,35 @@ chmod 0444 "${EXTRACT_DIR}/.artifact-sha256" "${EXTRACT_DIR}/.version"
 
 readonly RELEASE_DIR="${RELEASE_ROOT}/${VERSION}-${ARCHIVE_DIGEST:0:12}"
 if [[ -e ${RELEASE_DIR} || -L ${RELEASE_DIR} ]]; then
-  validate_release_tree "${RELEASE_DIR}" "${EXTRACT_DIR}/checksums.txt"
+  validate_release_tree \
+    "${RELEASE_DIR}" \
+    "${EXTRACT_DIR}/checksums.txt" \
+    "${MANAGED_STAGE_DIR}/existing-release-checksums"
 else
+  begin_installer_signal_transaction
   mv -T -- "${EXTRACT_DIR}" "${RELEASE_DIR}"
-  validate_release_tree "${RELEASE_DIR}" "${RELEASE_DIR}/checksums.txt"
+  managed_release_created=true
+  managed_release_created_identity=$(stat -c '%d:%i' -- "${RELEASE_DIR}")
+  finish_installer_signal_transaction
+  validate_release_tree \
+    "${RELEASE_DIR}" \
+    "${RELEASE_DIR}/checksums.txt" \
+    "${MANAGED_STAGE_DIR}/new-release-checksums"
 fi
-managed_version_output=$(runuser -u autostream -- "${RELEASE_DIR}/${RELEASE_BINARY}" --version)
-[[ ${managed_version_output%%$'\n'*} == "autostream-observability ${VERSION}" ]] || \
-  die "managed release binary version does not match ${VERSION}"
+managed_version_output=$(runuser -u autostream -- "${RELEASE_DIR}/${RELEASE_BINARY}" --version) || \
+  die "managed release binary identity probe failed"
+[[ ${managed_version_output} == "${EXPECTED_BINARY_IDENTITY}" ]] || \
+  die "managed release binary identity does not match the artifact manifest"
 
-binary_stage=$(stage_symlink \
-  "${CURRENT_LINK}/${RELEASE_BINARY}" /usr/local/bin ".autostream-observability.next") || \
+stage_symlink \
+  binary_stage \
+  "${CURRENT_LINK}/${RELEASE_BINARY}" \
+  /usr/local/bin \
+  ".autostream-observability.next" || \
   die "failed to stage the public binary link"
-alias_stage=$(stage_symlink "${PUBLIC_BINARY}" /usr/local/bin ".observability.next") || \
+stage_symlink alias_stage "${PUBLIC_BINARY}" /usr/local/bin ".observability.next" || \
   die "failed to stage the public alias link"
-unit_stage=$(reserve_path /etc/systemd/system ".autostream-observability.service.next") || \
+reserve_path unit_stage /etc/systemd/system ".autostream-observability.service.next" || \
   die "failed to reserve the systemd unit staging path"
 install \
   -o root -g root -m 0644 \
@@ -878,18 +1886,20 @@ install \
 grep -Fqx 'ExecStart=/usr/local/bin/autostream-observability' "${unit_stage}" || \
   die "release systemd unit does not use the stable public binary path"
 
-backup_exec_stage=$(reserve_path /usr/local/sbin ".autostream-backup-observability.next") || \
+reserve_path backup_exec_stage /usr/local/sbin ".autostream-backup-observability.next" || \
   die "failed to reserve the backup executable staging path"
 install -o root -g root -m 0700 "${RELEASE_DIR}/${BACKUP_SOURCE_REL}" "${backup_exec_stage}"
 
 if [[ ${env_existed} == false ]]; then
-  env_stage=$(reserve_path /etc/autostream ".observability.env.next") || \
+  reserve_path env_stage /etc/autostream ".observability.env.next" || \
     die "failed to reserve the environment staging path"
   install -o root -g root -m 0640 "${RELEASE_DIR}/.env.example" "${env_stage}"
 fi
 if [[ ${backup_config_existed} == false ]]; then
-  backup_config_stage=$(reserve_path \
-    "${BACKUP_CONFIG_DIR}" ".mariadb-backup.cnf.next") || \
+  reserve_path \
+    backup_config_stage \
+    "${BACKUP_CONFIG_DIR}" \
+    ".mariadb-backup.cnf.next" || \
     die "failed to reserve the MariaDB backup config staging path"
   install -o root -g root -m 0600 /dev/null "${backup_config_stage}"
 fi
@@ -898,27 +1908,36 @@ if [[ -L ${CURRENT_LINK} ]]; then
   current_original_exists=true
   current_original_target=$(readlink -- "${CURRENT_LINK}")
 fi
-current_stage=$(stage_symlink "${RELEASE_DIR}" "${MANAGED_ROOT}" ".current.next") || \
+stage_symlink current_stage "${RELEASE_DIR}" "${MANAGED_ROOT}" ".current.next" || \
   die "failed to stage the current release link"
 
 commit_started=true
-binary_backup=$(backup_destination \
-  "${PUBLIC_BINARY}" /usr/local/bin ".autostream-observability.backup") || \
+backup_destination \
+  binary_backup \
+  "${PUBLIC_BINARY}" \
+  /usr/local/bin \
+  ".autostream-observability.backup" || \
   die "failed to snapshot the existing public binary"
 binary_quiesced=true
-alias_backup=$(backup_destination \
-  "${PUBLIC_ALIAS}" /usr/local/bin ".observability.backup") || \
+backup_destination alias_backup "${PUBLIC_ALIAS}" /usr/local/bin ".observability.backup" || \
   die "failed to snapshot the existing public alias"
 alias_quiesced=true
-unit_backup=$(backup_destination \
-  "${UNIT_DEST}" /etc/systemd/system ".autostream-observability.service.backup") || \
+backup_destination \
+  unit_backup \
+  "${UNIT_DEST}" \
+  /etc/systemd/system \
+  ".autostream-observability.service.backup" || \
   die "failed to snapshot the existing systemd unit"
 unit_quiesced=true
-backup_exec_backup=$(backup_destination \
-  "${BACKUP_DEST}" /usr/local/sbin ".autostream-backup-observability.backup") || \
+backup_destination \
+  backup_exec_backup \
+  "${BACKUP_DEST}" \
+  /usr/local/sbin \
+  ".autostream-backup-observability.backup" || \
   die "failed to snapshot the existing backup executable"
 backup_exec_quiesced=true
 
+begin_installer_signal_transaction
 mv -Tf -- "${current_stage}" "${CURRENT_LINK}"
 current_stage=
 current_switched=true
@@ -939,12 +1958,17 @@ if [[ ${env_existed} == false ]]; then
   mv -T -- "${env_stage}" "${ENV_DEST}"
   env_stage=
   env_created=true
+  env_created_identity=$(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${ENV_DEST}")
+  env_created_digest=$(sha256sum -- "${ENV_DEST}" | awk 'NR == 1 { print $1 }')
 fi
 if [[ ${backup_config_existed} == false ]]; then
   mv -T -- "${backup_config_stage}" "${BACKUP_CONFIG_DEST}"
   backup_config_stage=
   backup_config_created=true
+  backup_config_created_identity=$(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${BACKUP_CONFIG_DEST}")
+  backup_config_created_digest=$(sha256sum -- "${BACKUP_CONFIG_DEST}" | awk 'NR == 1 { print $1 }')
 fi
+finish_installer_signal_transaction
 
 systemctl daemon-reload
 

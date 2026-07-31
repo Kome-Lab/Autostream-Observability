@@ -141,14 +141,31 @@ readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly INSTALLER_SOURCE="${SCRIPT_DIR}/install-autostream-observability"
 readonly VERSION="v9.9.9"
 readonly ARTIFACT_ID="autostream-observability_${VERSION}_linux_amd64"
+readonly FIXTURE_COMMIT="0123456789abcdef0123456789abcdef01234567"
+readonly FIXTURE_BUILD_DATE="2026-07-31T00:00:00Z"
 readonly WORK_DIR="$(mktemp -d /var/tmp/autostream-observability-installer-test.XXXXXXXX)"
 readonly ARTIFACTS_DIR="${WORK_DIR}/artifacts"
 readonly EXTRACTED_ROOT="${ARTIFACTS_DIR}/${ARTIFACT_ID}"
 readonly ARCHIVE="${ARTIFACTS_DIR}/${ARTIFACT_ID}.tar.gz"
+readonly BAD_ARTIFACTS_DIR="${WORK_DIR}/bad-artifacts"
+readonly BAD_EXTRACTED_ROOT="${BAD_ARTIFACTS_DIR}/${ARTIFACT_ID}"
+readonly BAD_ARCHIVE="${BAD_ARTIFACTS_DIR}/${ARTIFACT_ID}.tar.gz"
 readonly REAL_SYSTEMCTL_COPY="${WORK_DIR}/systemctl.real"
 readonly FAIL_SYSTEMCTL="${WORK_DIR}/systemctl.fail"
+readonly TERM_SYSTEMCTL="${WORK_DIR}/systemctl.term"
+readonly TERM_SYSTEMCTL_CALL_COUNT="${WORK_DIR}/systemctl.term.calls"
+readonly CLEANUP_SECOND_TERM_MARKER="${WORK_DIR}/cleanup-second-term-delivered"
 readonly SYSTEMCTL_CALL_LOG="${WORK_DIR}/systemctl.calls"
 readonly SYSTEMCTL_MOUNT_MARKER="${WORK_DIR}/systemctl.mount.ok"
+readonly REAL_GROUPADD_COPY="${WORK_DIR}/groupadd.real"
+readonly TERM_GROUPADD="${WORK_DIR}/groupadd.term"
+readonly GROUPADD_TERM_MARKER="${WORK_DIR}/groupadd-term-delivered"
+readonly REAL_USERADD_COPY="${WORK_DIR}/useradd.real"
+readonly TERM_USERADD="${WORK_DIR}/useradd.term"
+readonly USERADD_TERM_MARKER="${WORK_DIR}/useradd-term-delivered"
+readonly JOURNAL_TERM_BASH_ENV="${WORK_DIR}/journal-term.bash-env"
+readonly JOURNAL_FIELD_TERM_MARKER="${WORK_DIR}/journal-field-term-delivered"
+readonly JOURNAL_ORDER_TERM_MARKER="${WORK_DIR}/journal-order-term-delivered"
 readonly REAL_MKTEMP_COPY="${WORK_DIR}/mktemp.real"
 readonly FAIL_MKTEMP="${WORK_DIR}/mktemp.fail"
 readonly MKTEMP_CALL_LOG="${WORK_DIR}/mktemp.calls"
@@ -170,6 +187,7 @@ readonly PUBLIC_BINARY="/usr/local/bin/autostream-observability"
 readonly PUBLIC_ALIAS="/usr/local/bin/observability"
 readonly ENV_PATH="/etc/autostream/observability.env"
 readonly STATE_DIR="/var/lib/autostream/observability"
+readonly STATE_SENTINEL="${STATE_DIR}/rollback-sentinel"
 readonly MANAGED_ROOT="/opt/autostream/observability"
 readonly BACKUP_EXECUTABLE="/usr/local/sbin/autostream-backup-observability"
 readonly DATABASE_BACKUP_DIR="/var/backups/autostream/observability"
@@ -179,6 +197,7 @@ TARGET_LOCK_ID=$(printf '%s' "${UNIT}" | sha256sum | awk 'NR == 1 { print substr
 [[ ${TARGET_LOCK_ID} =~ ^[0-9a-f]{12}$ ]] || die "could not derive target lock identifier"
 readonly TARGET_LOCK_ID
 readonly TARGET_LOCK="/run/autostream-updater/.autostream-updater-${TARGET_LOCK_ID}.lock"
+readonly SHARED_HOST_SETUP_LOCK="/run/autostream-updater/.autostream-runtime-host-setup.lock"
 readonly LEGACY_UNIT_CONTENT="observability-installer-integration-legacy-unit"
 readonly LEGACY_BINARY_CONTENT="observability-installer-integration-legacy-binary"
 readonly LEGACY_ALIAS_CONTENT="observability-installer-integration-legacy-alias"
@@ -196,6 +215,21 @@ runtime_unit_identity=""
 runtime_unit_staging=""
 old_pid=""
 old_pid_starttime=""
+
+assert_state_preserved() {
+  local label=$1
+  [[ -d ${STATE_DIR} && ! -L ${STATE_DIR} ]] || \
+    die "${label} changed existing state existence"
+  [[ $(stat -c '%d:%i' -- "${STATE_DIR}") == "${state_identity_before}" ]] || \
+    die "${label} replaced the existing state directory"
+  [[ $(stat -c '%u:%g:%a' -- "${STATE_DIR}") == "${state_metadata_before}" ]] || \
+    die "${label} changed existing state owner or mode"
+  [[ -f ${STATE_SENTINEL} && ! -L ${STATE_SENTINEL} ]] || \
+    die "${label} removed the state sentinel"
+  [[ $(sha256sum "${STATE_SENTINEL}" | awk 'NR == 1 { print $1 }') == \
+    "${state_sentinel_before}" ]] || \
+    die "${label} changed existing state content"
+}
 
 read_process_starttime() {
   local pid=$1
@@ -530,6 +564,7 @@ cleanup() {
       "${BACKUP_EXECUTABLE}" \
       "${ENV_PATH}" \
       "${MARIADB_DEFAULTS}" \
+      "${SHARED_HOST_SETUP_LOCK}" \
       "${TARGET_LOCK}"
     rm -rf -- \
       "${STATE_DIR}" \
@@ -574,6 +609,7 @@ for path in \
   "${DATABASE_BACKUP_DIR}" \
   "${INSTALL_BACKUP_ROOT}" \
   "${MARIADB_DEFAULTS}" \
+  "${SHARED_HOST_SETUP_LOCK}" \
   "${TARGET_LOCK}"; do
   [[ ! -e ${path} && ! -L ${path} ]] || die "runner is not clean at ${path}"
 done
@@ -609,8 +645,8 @@ cat > "${EXTRACTED_ROOT}/bin/autostream-observability" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = "--version" ]; then
   printf '%s\n' 'autostream-observability v9.9.9'
-  printf '%s\n' 'commit: integration-test'
-  printf '%s\n' 'build_date: integration-test'
+  printf '%s\n' 'commit: 0123456789abcdef0123456789abcdef01234567'
+  printf '%s\n' 'build_date: 2026-07-31T00:00:00Z'
   exit 0
 fi
 exit 99
@@ -643,6 +679,33 @@ EOF
 printf '%s\n' 'OBSERVABILITY_BIND_ADDR=127.0.0.1:18082' \
   > "${EXTRACTED_ROOT}/.env.example"
 printf '%s\n' 'integration fixture' > "${EXTRACTED_ROOT}/README.install.md"
+jq -n \
+  --arg version "${VERSION}" \
+  --arg commit "${FIXTURE_COMMIT}" \
+  --arg build_date "${FIXTURE_BUILD_DATE}" \
+  --arg name "${ARTIFACT_ID}.tar.gz" \
+  --arg root "${ARTIFACT_ID}" \
+  '{
+    schema_version: 1,
+    component: "observability",
+    source_version: $version,
+    commit: $commit,
+    build_date: $build_date,
+    platform: {
+      os: "linux",
+      arch: "amd64"
+    },
+    archive: {
+      name: $name,
+      root: $root
+    },
+    compatibility: {
+      minimum_agent_version: "v1.0.0",
+      minimum_panel_version: null,
+      rollback_compatible: true,
+      database_schema: "backward_compatible"
+    }
+  }' > "${EXTRACTED_ROOT}/artifact-manifest.json"
 
 (
   cd -- "${EXTRACTED_ROOT}"
@@ -651,48 +714,93 @@ printf '%s\n' 'integration fixture' > "${EXTRACTED_ROOT}/README.install.md"
     xargs -0 sha256sum > checksums.txt
 )
 tar -C "${ARTIFACTS_DIR}" -czf "${ARCHIVE}" "${ARTIFACT_ID}"
-(
-  cd -- "${ARTIFACTS_DIR}"
-  sha256sum "${ARTIFACT_ID}.tar.gz" > "${ARTIFACT_ID}.tar.gz.sha256"
-)
 archive_sha256="$(sha256sum "${ARCHIVE}" | awk 'NR == 1 { print $1 }')"
-archive_size="$(stat -c %s "${ARCHIVE}")"
-jq -n \
-  --arg version "${VERSION}" \
-  --arg name "${ARTIFACT_ID}.tar.gz" \
-  --arg sha256 "${archive_sha256}" \
-  --argjson size "${archive_size}" \
-  '{
-    schema_version: 1,
-    release_id: $version,
-    channel: "host",
-    published_at: "2026-07-29T00:00:00Z",
-    minimum_agent_version: "v2.0.0",
-    components: [{
-      service: "observability",
-      source_version: $version,
-      commit: "0123456789abcdef0123456789abcdef01234567",
-      rollback_compatible: true,
-      database_schema: "backward_compatible",
-      artifacts: [{
-        os: "linux",
-        arch: "amd64",
-        name: $name,
-        sha256: $sha256,
-        size: $size
-      }, {
-        os: "linux",
-        arch: "arm64",
-        name: ("autostream-observability_" + $version + "_linux_arm64.tar.gz"),
-        sha256: "89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
-        size: 1
-      }]
-    }]
-  }' > "${ARTIFACTS_DIR}/release-manifest.json"
+for external_metadata in \
+  "${ARCHIVE}.sha256" \
+  "${ARTIFACTS_DIR}/release-manifest.json" \
+  "${ARTIFACTS_DIR}/release-manifest.json.sha256"; do
+  [[ ! -e ${external_metadata} && ! -L ${external_metadata} ]] || \
+    die "archive-only fixture unexpectedly created ${external_metadata}"
+done
+
+install -d -o root -g root -m 0755 "${BAD_ARTIFACTS_DIR}"
+cp -a -- "${EXTRACTED_ROOT}" "${BAD_EXTRACTED_ROOT}"
+tar \
+  --transform='s#bin/observability#bin//observability#' \
+  -C "${BAD_ARTIFACTS_DIR}" \
+  -czf "${BAD_ARCHIVE}" \
+  "${ARTIFACT_ID}"
+
+set +e
+"${BAD_EXTRACTED_ROOT}/install-autostream-observability" \
+  > "${WORK_DIR}/noncanonical-archive.out" 2>&1
+noncanonical_archive_status=$?
+set -e
+[[ ${noncanonical_archive_status} -ne 0 ]] || \
+  die "noncanonical archive path unexpectedly succeeded"
+grep -F -- "release archive contains a noncanonical path" \
+  "${WORK_DIR}/noncanonical-archive.out" >/dev/null || \
+  die "noncanonical archive path did not report the expected failure"
+[[ ! -e ${MANAGED_ROOT} && ! -L ${MANAGED_ROOT} ]] || \
+  die "noncanonical archive path mutated the managed root"
+if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+  die "noncanonical archive path created the autostream account"
+fi
+
+printf '%s\n' "not declared by checksums.txt" \
+  > "${BAD_EXTRACTED_ROOT}/unlisted.txt"
+tar -C "${BAD_ARTIFACTS_DIR}" -czf "${BAD_ARCHIVE}" "${ARTIFACT_ID}"
+
+set +e
+"${BAD_EXTRACTED_ROOT}/install-autostream-observability" \
+  > "${WORK_DIR}/bad-checksum-inventory.out" 2>&1
+bad_inventory_status=$?
+set -e
+[[ ${bad_inventory_status} -ne 0 ]] || \
+  die "incomplete embedded checksum inventory unexpectedly succeeded"
+grep -F -- "release archive checksum inventory is incomplete or unsafe" \
+  "${WORK_DIR}/bad-checksum-inventory.out" >/dev/null || \
+  die "incomplete embedded checksum inventory did not report the expected failure"
+[[ ! -e ${MANAGED_ROOT} && ! -L ${MANAGED_ROOT} ]] || \
+  die "incomplete embedded checksum inventory mutated the managed root"
+if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+  die "incomplete embedded checksum inventory created the autostream account"
+fi
+rm -f -- "${BAD_EXTRACTED_ROOT}/unlisted.txt"
+
+jq '.component = "worker"' \
+  "${BAD_EXTRACTED_ROOT}/artifact-manifest.json" \
+  > "${BAD_EXTRACTED_ROOT}/artifact-manifest.json.next"
+mv -T \
+  "${BAD_EXTRACTED_ROOT}/artifact-manifest.json.next" \
+  "${BAD_EXTRACTED_ROOT}/artifact-manifest.json"
 (
-  cd -- "${ARTIFACTS_DIR}"
-  sha256sum release-manifest.json > release-manifest.json.sha256
+  cd -- "${BAD_EXTRACTED_ROOT}"
+  find . -type f ! -path './checksums.txt' -print0 |
+    sort -z |
+    xargs -0 sha256sum > checksums.txt
 )
+tar -C "${BAD_ARTIFACTS_DIR}" -czf "${BAD_ARCHIVE}" "${ARTIFACT_ID}"
+
+set +e
+"${BAD_EXTRACTED_ROOT}/install-autostream-observability" \
+  > "${WORK_DIR}/bad-manifest.out" 2>&1
+bad_manifest_status=$?
+set -e
+[[ ${bad_manifest_status} -ne 0 ]] || \
+  die "mismatched embedded artifact manifest unexpectedly succeeded"
+grep -F -- "release artifact manifest does not bind the expected Observability archive" \
+  "${WORK_DIR}/bad-manifest.out" >/dev/null || \
+  die "mismatched embedded artifact manifest did not report the expected failure"
+[[ ! -e ${MANAGED_ROOT} && ! -L ${MANAGED_ROOT} ]] || \
+  die "mismatched embedded artifact manifest mutated the managed root"
+[[ ! -e ${TARGET_LOCK} && ! -L ${TARGET_LOCK} ]] || \
+  die "mismatched embedded artifact manifest created the updater lock"
+[[ ! -e ${SHARED_HOST_SETUP_LOCK} && ! -L ${SHARED_HOST_SETUP_LOCK} ]] || \
+  die "mismatched embedded artifact manifest created the shared host-setup lock"
+if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+  die "mismatched embedded artifact manifest created the autostream account"
+fi
 
 install -o root -g root -m 0755 /usr/bin/systemctl "${REAL_SYSTEMCTL_COPY}"
 cat > "${FAIL_SYSTEMCTL}" <<EOF
@@ -704,6 +812,73 @@ fi
 exec "${REAL_SYSTEMCTL_COPY}" "\$@"
 EOF
 chmod 0755 "${FAIL_SYSTEMCTL}"
+
+cat > "${TERM_SYSTEMCTL}" <<EOF
+#!/bin/bash
+if [[ \$# -eq 1 && \$1 == "daemon-reload" ]]; then
+  call_count=0
+  if [[ -f "${TERM_SYSTEMCTL_CALL_COUNT}" ]]; then
+    call_count=\$(<"${TERM_SYSTEMCTL_CALL_COUNT}")
+  fi
+  call_count=\$((call_count + 1))
+  printf '%s\n' "\${call_count}" > "${TERM_SYSTEMCTL_CALL_COUNT}"
+  if [[ \${call_count} -eq 1 ]]; then
+    kill -TERM "\${PPID}"
+    exit 0
+  fi
+  if [[ \${call_count} -eq 2 ]]; then
+    printf '%s\n' delivered > "${CLEANUP_SECOND_TERM_MARKER}"
+    kill -TERM "\${PPID}"
+  fi
+fi
+exec "${REAL_SYSTEMCTL_COPY}" "\$@"
+EOF
+chmod 0755 "${TERM_SYSTEMCTL}"
+
+install -o root -g root -m 0755 "$(command -v groupadd)" "${REAL_GROUPADD_COPY}"
+cat > "${TERM_GROUPADD}" <<EOF
+#!/bin/bash
+"${REAL_GROUPADD_COPY}" "\$@"
+printf '%s\n' delivered > "${GROUPADD_TERM_MARKER}"
+kill -TERM "\${PPID}"
+exit 0
+EOF
+chmod 0755 "${TERM_GROUPADD}"
+
+install -o root -g root -m 0755 "$(command -v useradd)" "${REAL_USERADD_COPY}"
+cat > "${TERM_USERADD}" <<EOF
+#!/bin/bash
+"${REAL_USERADD_COPY}" "\$@"
+printf '%s\n' delivered > "${USERADD_TERM_MARKER}"
+kill -TERM "\${PPID}"
+exit 0
+EOF
+chmod 0755 "${TERM_USERADD}"
+
+cat > "${JOURNAL_TERM_BASH_ENV}" <<EOF
+set -T
+autostream_observability_inject_journal_term() {
+  local command=\$1
+  case "\${AUTOSTREAM_OBSERVABILITY_INSTALLER_TEST_JOURNAL_TERM_TARGET:-}" in
+    field)
+      if [[ \${command} == directory_journaled*'=true' ]]; then
+        trap - DEBUG
+        printf '%s\n' delivered > "${JOURNAL_FIELD_TERM_MARKER}"
+        kill -TERM "\$\$"
+      fi
+      ;;
+    order)
+      if [[ \${command} == journaled_directory_paths*'+='* ]]; then
+        trap - DEBUG
+        printf '%s\n' delivered > "${JOURNAL_ORDER_TERM_MARKER}"
+        kill -TERM "\$\$"
+      fi
+      ;;
+  esac
+}
+trap 'autostream_observability_inject_journal_term "\$BASH_COMMAND"' DEBUG
+EOF
+chmod 0600 "${JOURNAL_TERM_BASH_ENV}"
 
 install -o root -g root -m 0755 /usr/bin/mktemp "${REAL_MKTEMP_COPY}"
 cat > "${FAIL_MKTEMP}" <<EOF
@@ -763,11 +938,20 @@ if [[ ! -f ${MKTEMP_CALL_LOG} || -L ${MKTEMP_CALL_LOG} ]]; then
   cat "${WORK_DIR}/mktemp-failure.out" >&2
   die "mktemp failure injection did not reach the staging call"
 fi
-[[ $(wc -l < "${MKTEMP_CALL_LOG}") -eq 1 ]] || \
-  die "mktemp failure injection did not reach exactly the staging call"
-grep -Fx -- "-d /opt/autostream/observability/.install.XXXXXX" \
-  "${MKTEMP_CALL_LOG}" >/dev/null || \
-  die "mktemp failure injection did not reach the expected staging call"
+[[ $(wc -l < "${MKTEMP_CALL_LOG}") -eq 4 ]] || \
+  die "mktemp failure injection did not reach archive, shared lock, target lock, and managed staging calls"
+[[ $(head -n 1 "${MKTEMP_CALL_LOG}") == \
+  "-d /var/tmp/autostream-observability-install.XXXXXXXX" ]] || \
+  die "mktemp failure injection did not begin with archive preflight staging"
+[[ $(sed -n '2p' "${MKTEMP_CALL_LOG}") == \
+  "/run/autostream-updater/.host-lock-create.XXXXXXXX" ]] || \
+  die "mktemp failure injection did not atomically stage the shared host-setup lock"
+[[ $(sed -n '3p' "${MKTEMP_CALL_LOG}") == \
+  "/run/autostream-updater/.lock-create.XXXXXXXX" ]] || \
+  die "mktemp failure injection did not atomically stage the permanent lock"
+[[ $(tail -n 1 "${MKTEMP_CALL_LOG}") == \
+  "-d /opt/autostream/observability/.install.XXXXXX" ]] || \
+  die "mktemp failure injection did not reach the managed staging call"
 grep -F -- "failed to create installer staging directory" \
   "${WORK_DIR}/mktemp-failure.out" >/dev/null || \
   die "mktemp failure was masked by the readonly assignment"
@@ -779,31 +963,129 @@ grep -F -- "failed to create installer staging directory" \
   die "mktemp failure installed the systemd unit"
 [[ ! -e ${ENV_PATH} && ! -L ${ENV_PATH} ]] || \
   die "mktemp failure installed the environment"
-
-rm -f -- "${TARGET_LOCK}"
-rm -rf -- \
+[[ -f ${TARGET_LOCK} && ! -L ${TARGET_LOCK} &&
+  $(stat -c '%U:%G:%a' -- "${TARGET_LOCK}") == "root:root:600" ]] || \
+  die "mktemp failure did not retain the permanent safe updater lock"
+[[ -f ${SHARED_HOST_SETUP_LOCK} && ! -L ${SHARED_HOST_SETUP_LOCK} &&
+  $(stat -c '%U:%G:%a' -- "${SHARED_HOST_SETUP_LOCK}") == "root:root:600" ]] || \
+  die "mktemp failure did not retain the permanent safe shared host-setup lock"
+lock_identity_after_rollback="$(stat -c '%d:%i' -- "${TARGET_LOCK}")"
+shared_lock_identity_after_rollback="$(stat -c '%d:%i' -- "${SHARED_HOST_SETUP_LOCK}")"
+for path in \
   "${STATE_DIR}" \
   "${MANAGED_ROOT}" \
   "${DATABASE_BACKUP_DIR}" \
-  "${INSTALL_BACKUP_ROOT}"
-rmdir \
+  "${INSTALL_BACKUP_ROOT}" \
   /var/backups/autostream/install-migrations \
   /var/backups/autostream \
   /var/lib/autostream \
   /opt/autostream \
   /etc/autostream \
-  /etc/autostream-local-executor \
-  /run/autostream-updater >/dev/null 2>&1 || \
-  die "mktemp-failure reset left an unexpected directory"
-userdel autostream
-if getent group autostream >/dev/null 2>&1; then
-  groupdel autostream
-fi
+  /etc/autostream-local-executor; do
+  [[ ! -e ${path} && ! -L ${path} ]] || \
+    die "mktemp failure left installer-created residue: ${path}"
+done
 if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
-  die "mktemp-failure reset retained the autostream account"
+  die "mktemp failure retained the installer-created autostream account"
 fi
 
+assert_signal_setup_paths_rolled_back() {
+  local label=$1
+  local unexpected_path
+
+  for unexpected_path in \
+    "${STATE_DIR}" \
+    "${MANAGED_ROOT}" \
+    "${DATABASE_BACKUP_DIR}" \
+    "${INSTALL_BACKUP_ROOT}" \
+    /var/backups/autostream/install-migrations \
+    /var/backups/autostream \
+    /var/lib/autostream \
+    /opt/autostream \
+    /etc/autostream \
+    /etc/autostream-local-executor; do
+    [[ ! -e ${unexpected_path} && ! -L ${unexpected_path} ]] || \
+      die "${label} left installer-created residue: ${unexpected_path}"
+  done
+  [[ $(stat -c '%d:%i' -- "${TARGET_LOCK}") == "${lock_identity_after_rollback}" ]] || \
+    die "${label} replaced the permanent updater lock inode"
+  [[ $(stat -c '%d:%i' -- "${SHARED_HOST_SETUP_LOCK}") == \
+    "${shared_lock_identity_after_rollback}" ]] || \
+    die "${label} replaced the permanent shared host-setup lock inode"
+}
+
+opt_metadata_before_journal_term="$(stat -c '%d:%i:%u:%g:%a:%Y:%Z' -- /opt)"
+for journal_term_target in field order; do
+  if [[ ${journal_term_target} == "field" ]]; then
+    journal_term_marker="${JOURNAL_FIELD_TERM_MARKER}"
+  else
+    journal_term_marker="${JOURNAL_ORDER_TERM_MARKER}"
+  fi
+  rm -f -- "${journal_term_marker}"
+  set +e
+  BASH_ENV="${JOURNAL_TERM_BASH_ENV}" \
+    AUTOSTREAM_OBSERVABILITY_INSTALLER_TEST_JOURNAL_TERM_TARGET="${journal_term_target}" \
+    "${EXTRACTED_ROOT}/install-autostream-observability" \
+    > "${WORK_DIR}/journal-${journal_term_target}-term.out" 2>&1
+  journal_term_status=$?
+  set -e
+  [[ ${journal_term_status} -eq 143 ]] || \
+    die "journal ${journal_term_target} TERM exited with ${journal_term_status}, expected 143"
+  grep -Fx -- "delivered" "${journal_term_marker}" >/dev/null || \
+    die "journal-${journal_term_target}-term-delivered marker is missing"
+  if grep -F -- "unbound variable" \
+    "${WORK_DIR}/journal-${journal_term_target}-term.out" >/dev/null; then
+    die "journal ${journal_term_target} TERM aborted cleanup through set -u"
+  fi
+  [[ $(stat -c '%d:%i:%u:%g:%a:%Y:%Z' -- /opt) == \
+    "${opt_metadata_before_journal_term}" ]] || \
+    die "journal ${journal_term_target} TERM changed the pre-existing /opt directory"
+  if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+    die "journal ${journal_term_target} TERM retained an autostream account"
+  fi
+  assert_signal_setup_paths_rolled_back "journal ${journal_term_target} TERM"
+done
+
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${TERM_GROUPADD}' '$(command -v groupadd)' && '${EXTRACTED_ROOT}/install-autostream-observability'" \
+  > "${WORK_DIR}/groupadd-term.out" 2>&1
+groupadd_term_status=$?
+set -e
+[[ ${groupadd_term_status} -eq 143 ]] || \
+  die "groupadd TERM transaction exited with ${groupadd_term_status}, expected 143"
+grep -Fx -- "delivered" "${GROUPADD_TERM_MARKER}" >/dev/null || \
+  die "groupadd-term-delivered marker is missing"
+if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+  die "groupadd TERM transaction retained the installer-created autostream account"
+fi
+assert_signal_setup_paths_rolled_back "groupadd TERM transaction"
+
+groupadd --system autostream
+preexisting_group_record="$(getent group autostream)"
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${TERM_USERADD}' '$(command -v useradd)' && '${EXTRACTED_ROOT}/install-autostream-observability'" \
+  > "${WORK_DIR}/useradd-term.out" 2>&1
+useradd_term_status=$?
+set -e
+[[ ${useradd_term_status} -eq 143 ]] || \
+  die "useradd TERM transaction exited with ${useradd_term_status}, expected 143"
+grep -Fx -- "delivered" "${USERADD_TERM_MARKER}" >/dev/null || \
+  die "useradd-term-delivered marker is missing"
+id autostream >/dev/null 2>&1 && \
+  die "useradd TERM transaction retained the installer-created autostream user"
+[[ $(getent group autostream) == "${preexisting_group_record}" ]] || \
+  die "useradd TERM transaction changed the pre-existing autostream group"
+assert_signal_setup_paths_rolled_back "useradd TERM transaction"
+groupdel autostream
+
 "${EXTRACTED_ROOT}/install-autostream-observability" > "${WORK_DIR}/fresh.out"
+[[ $(stat -c '%d:%i' -- "${TARGET_LOCK}") == "${lock_identity_after_rollback}" ]] || \
+  die "fresh install replaced the permanent updater lock inode"
+[[ $(stat -c '%d:%i' -- "${SHARED_HOST_SETUP_LOCK}") == \
+  "${shared_lock_identity_after_rollback}" ]] || \
+  die "fresh install replaced the permanent shared host-setup lock inode"
 [[ -L ${MANAGED_ROOT}/current ]] || die "fresh install did not create the managed current link"
 [[ -L ${PUBLIC_BINARY} && -L ${PUBLIC_ALIAS} ]] || \
   die "fresh install did not install stable public links"
@@ -830,6 +1112,7 @@ rm -f -- \
   "${UNIT_PATH}" \
   "${BACKUP_EXECUTABLE}" \
   "${MARIADB_DEFAULTS}" \
+  "${SHARED_HOST_SETUP_LOCK}" \
   "${TARGET_LOCK}"
 rm -rf -- \
   "${STATE_DIR}" \
@@ -856,11 +1139,66 @@ if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; the
   die "fresh-install reset retained the autostream account"
 fi
 
+install -d -o root -g root -m 0750 /etc/autostream
+printf '%s\n' "invalid preflight mode before account creation" > "${ENV_PATH}"
+chmod 0600 "${ENV_PATH}"
+set +e
+"${EXTRACTED_ROOT}/install-autostream-observability" \
+  > "${WORK_DIR}/fresh-late-preflight-failure.out" 2>&1
+fresh_late_preflight_status=$?
+set -e
+[[ ${fresh_late_preflight_status} -ne 0 ]] || \
+  die "fresh late preflight failure unexpectedly succeeded"
+grep -F -- "${ENV_PATH} owner or mode is invalid" \
+  "${WORK_DIR}/fresh-late-preflight-failure.out" >/dev/null || \
+  die "fresh late preflight failure did not reach existing environment validation"
+if id autostream >/dev/null 2>&1 || getent group autostream >/dev/null 2>&1; then
+  die "fresh late preflight failure created the autostream account"
+fi
+for unexpected_path in \
+  /opt/autostream \
+  "${MANAGED_ROOT}" \
+  /var/lib/autostream \
+  "${STATE_DIR}" \
+  /var/backups/autostream \
+  "${DATABASE_BACKUP_DIR}" \
+  "${INSTALL_BACKUP_ROOT}" \
+  /etc/autostream-local-executor \
+  "${MARIADB_DEFAULTS}" \
+  "${SHARED_HOST_SETUP_LOCK}" \
+  "${TARGET_LOCK}" \
+  /run/autostream-updater; do
+  [[ ! -e ${unexpected_path} && ! -L ${unexpected_path} ]] || \
+    die "fresh late preflight failure created ${unexpected_path}"
+done
+rm -f -- "${ENV_PATH}"
+
 groupadd --system autostream
 useradd --system --gid autostream --home-dir /var/lib/autostream \
   --no-create-home --shell /usr/sbin/nologin autostream
 install -d -o root -g root -m 0755 /etc/autostream /var/lib/autostream
-install -d -o autostream -g autostream -m 0750 "${STATE_DIR}"
+install -d -o autostream -g autostream -m 0700 "${STATE_DIR}"
+printf '%s\n' "preserve state exactly across a later preflight failure" > "${STATE_SENTINEL}"
+chown autostream:autostream "${STATE_SENTINEL}"
+chmod 0600 "${STATE_SENTINEL}"
+state_identity_before="$(stat -c '%d:%i' -- "${STATE_DIR}")"
+state_metadata_before="$(stat -c '%u:%g:%a' -- "${STATE_DIR}")"
+state_sentinel_before="$(sha256sum "${STATE_SENTINEL}" | awk 'NR == 1 { print $1 }')"
+printf '%s\n' "invalid preflight mode" > "${ENV_PATH}"
+chmod 0600 "${ENV_PATH}"
+
+set +e
+"${EXTRACTED_ROOT}/install-autostream-observability" \
+  > "${WORK_DIR}/state-preflight-failure.out" 2>&1
+state_preflight_status=$?
+set -e
+[[ ${state_preflight_status} -ne 0 ]] || \
+  die "late preflight failure with existing state unexpectedly succeeded"
+grep -F -- "${ENV_PATH} owner or mode is invalid" \
+  "${WORK_DIR}/state-preflight-failure.out" >/dev/null || \
+  die "late preflight failure did not reach existing environment validation"
+assert_state_preserved "late preflight failure"
+
 printf '%s\n' "${LEGACY_BINARY_CONTENT}" > "${PUBLIC_BINARY}"
 chmod 0755 "${PUBLIC_BINARY}"
 printf '%s\n' "${LEGACY_ALIAS_CONTENT}" > "${PUBLIC_ALIAS}"
@@ -906,6 +1244,39 @@ runtime_unit_before="$(sha256sum "${RUNTIME_UNIT_PATH}" | awk 'NR == 1 { print $
 helper_before="$(sha256sum "${BACKUP_EXECUTABLE}" | awk 'NR == 1 { print $1 }')"
 readonly RETAINED_DIR="${INSTALL_BACKUP_ROOT}/${VERSION}-${archive_sha256:0:12}"
 
+rm -f -- "${TERM_SYSTEMCTL_CALL_COUNT}" "${CLEANUP_SECOND_TERM_MARKER}"
+set +e
+unshare --mount --propagation private bash -c \
+  "mount --bind '${TERM_SYSTEMCTL}' /usr/bin/systemctl && '${EXTRACTED_ROOT}/install-autostream-observability'" \
+  > "${WORK_DIR}/signal-rollback.out" 2>&1
+signal_rollback_status=$?
+set -e
+[[ ${signal_rollback_status} -eq 143 ]] || \
+  die "signal rollback exited with ${signal_rollback_status}, expected 143"
+[[ $(<"${TERM_SYSTEMCTL_CALL_COUNT}") == "2" ]] || \
+  die "signal rollback did not reach install and cleanup daemon-reload calls"
+grep -Fx -- "delivered" "${CLEANUP_SECOND_TERM_MARKER}" >/dev/null || \
+  die "cleanup-second-term-delivered marker is missing"
+[[ $(<"${PUBLIC_BINARY}") == "${LEGACY_BINARY_CONTENT}" ]] || \
+  die "signal rollback did not restore the legacy binary"
+[[ $(<"${PUBLIC_ALIAS}") == "${LEGACY_ALIAS_CONTENT}" ]] || \
+  die "signal rollback did not restore the legacy alias"
+[[ $(sha256sum "${ENV_PATH}" | awk 'NR == 1 { print $1 }') == "${env_before}" ]] || \
+  die "signal rollback changed the environment"
+[[ $(sha256sum "${MARIADB_DEFAULTS}" | awk 'NR == 1 { print $1 }') == "${db_before}" ]] || \
+  die "signal rollback changed the MariaDB defaults"
+[[ $(sha256sum "${UNIT_PATH}" | awk 'NR == 1 { print $1 }') == "${unit_before}" ]] || \
+  die "signal rollback did not restore the systemd unit"
+[[ $(sha256sum "${BACKUP_EXECUTABLE}" | awk 'NR == 1 { print $1 }') == "${helper_before}" ]] || \
+  die "signal rollback did not restore the backup executable"
+[[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
+  die "signal rollback replaced the running legacy process"
+kill -0 "${old_pid}" || die "signal rollback stopped the running legacy process"
+assert_legacy_runtime_unit "signal rollback"
+systemctl is-enabled --quiet "${UNIT}" && \
+  die "signal rollback unexpectedly enabled the service"
+assert_state_preserved "signal rollback"
+
 set +e
 unshare --mount --propagation private bash -c \
   "mount --bind '${FAIL_SYSTEMCTL}' /usr/bin/systemctl && printf '%s\n' mounted > '${SYSTEMCTL_MOUNT_MARKER}' && '${EXTRACTED_ROOT}/install-autostream-observability'" \
@@ -940,6 +1311,7 @@ grep -Fx -- "${LEGACY_ALIAS_CONTENT}" "${PUBLIC_ALIAS}" >/dev/null || \
 kill -0 "${old_pid}" || die "failed migration stopped the running legacy process"
 assert_legacy_runtime_unit "failed migration"
 systemctl is-enabled --quiet "${UNIT}" && die "failed migration unexpectedly enabled the service"
+assert_state_preserved "daemon-reload failure"
 grep -Fx -- "${LEGACY_BINARY_CONTENT}" \
   "${RETAINED_DIR}/usr-local-bin-autostream-observability.pre-managed" >/dev/null || \
   die "failed migration did not durably retain the legacy binary before activation"
@@ -952,6 +1324,16 @@ grep -F -- "${LEGACY_UNIT_CONTENT}" \
 grep -Fx -- "${LEGACY_HELPER_CONTENT}" \
   "${RETAINED_DIR}/usr-local-sbin-autostream-backup-observability.pre-managed" >/dev/null || \
   die "failed migration did not durably retain the legacy backup executable before activation"
+declare -A retained_identity_before_retry=()
+declare -A retained_digest_before_retry=()
+for retained_file in \
+  "${RETAINED_DIR}/usr-local-bin-autostream-observability.pre-managed" \
+  "${RETAINED_DIR}/usr-local-bin-observability.pre-managed" \
+  "${RETAINED_DIR}/etc-systemd-system-autostream-observability.service.pre-managed" \
+  "${RETAINED_DIR}/usr-local-sbin-autostream-backup-observability.pre-managed"; do
+  retained_identity_before_retry["${retained_file}"]="$(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${retained_file}")"
+  retained_digest_before_retry["${retained_file}"]="$(sha256sum -- "${retained_file}" | awk 'NR == 1 { print $1 }')"
+done
 
 set +e
 unshare --mount --propagation private bash -c \
@@ -983,6 +1365,15 @@ grep -Fx -- "${LEGACY_ALIAS_CONTENT}" "${PUBLIC_ALIAS}" >/dev/null || \
   die "sync failure replaced the running legacy process"
 kill -0 "${old_pid}" || die "sync failure stopped the running legacy process"
 assert_legacy_runtime_unit "sync failure"
+assert_state_preserved "sync failure"
+for retained_file in "${!retained_identity_before_retry[@]}"; do
+  [[ $(stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a' -- "${retained_file}") == \
+    "${retained_identity_before_retry["${retained_file}"]}" ]] || \
+    die "sync failure changed pre-existing retained backup identity or metadata: ${retained_file}"
+  [[ $(sha256sum -- "${retained_file}" | awk 'NR == 1 { print $1 }') == \
+    "${retained_digest_before_retry["${retained_file}"]}" ]] || \
+    die "sync failure changed pre-existing retained backup content: ${retained_file}"
+done
 
 "${EXTRACTED_ROOT}/install-autostream-observability" > "${WORK_DIR}/migration.out"
 replace_owned_runtime_unit_atomically "${UNIT_PATH}"
@@ -1015,6 +1406,10 @@ grep -Fx -- "${LEGACY_HELPER_CONTENT}" \
   die "successful migration did not retain the legacy backup executable"
 [[ $(stat -c '%U:%G:%a' -- "${STATE_DIR}") == "autostream:autostream:750" ]] || \
   die "successful migration changed the service state ownership contract"
+[[ $(sha256sum "${STATE_SENTINEL}" | awk 'NR == 1 { print $1 }') == \
+  "${state_sentinel_before}" ]] || \
+  die "successful migration changed existing state content"
+state_metadata_before="$(stat -c '%u:%g:%a' -- "${STATE_DIR}")"
 grep -F -- "sudo systemctl restart autostream-observability" \
   "${WORK_DIR}/migration.out" >/dev/null || \
   die "active migration did not print the explicit restart command"
@@ -1023,7 +1418,60 @@ grep -F -- "sudo systemctl restart autostream-observability" \
 kill -0 "${old_pid}" || die "successful migration stopped the running legacy process"
 systemctl is-enabled --quiet "${UNIT}" && die "successful migration unexpectedly enabled the service"
 
+managed_release_dir="${MANAGED_ROOT}/releases/${VERSION}-${archive_sha256:0:12}"
+printf '%s\n' "not declared by trusted checksums" > "${managed_release_dir}/unexpected.txt"
+set +e
+"${EXTRACTED_ROOT}/install-autostream-observability" \
+  > "${WORK_DIR}/existing-release-extra-file.out" 2>&1
+existing_release_extra_file_status=$?
+set -e
+[[ ${existing_release_extra_file_status} -ne 0 ]] || \
+  die "existing release with an extra regular file unexpectedly succeeded"
+grep -F -- "existing managed release checksum inventory is incomplete or unsafe" \
+  "${WORK_DIR}/existing-release-extra-file.out" >/dev/null || \
+  die "existing release extra file did not fail exact trusted checksum inventory validation"
+[[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
+  die "existing release extra file validation replaced the running legacy process"
+assert_state_preserved "existing release extra file validation"
+rm -f -- "${managed_release_dir}/unexpected.txt"
+
+ln -s -- /etc/passwd "${managed_release_dir}/unexpected-link"
+set +e
+"${EXTRACTED_ROOT}/install-autostream-observability" \
+  > "${WORK_DIR}/existing-release-symlink.out" 2>&1
+existing_release_symlink_status=$?
+set -e
+[[ ${existing_release_symlink_status} -ne 0 ]] || \
+  die "existing release with a symlink unexpectedly succeeded"
+grep -F -- "existing managed release contains a link or special entry" \
+  "${WORK_DIR}/existing-release-symlink.out" >/dev/null || \
+  die "existing release symlink did not report the expected failure"
+assert_state_preserved "existing release symlink validation"
+rm -f -- "${managed_release_dir}/unexpected-link"
+
+mkfifo "${managed_release_dir}/unexpected-fifo"
+set +e
+"${EXTRACTED_ROOT}/install-autostream-observability" \
+  > "${WORK_DIR}/existing-release-special.out" 2>&1
+existing_release_special_status=$?
+set -e
+[[ ${existing_release_special_status} -ne 0 ]] || \
+  die "existing release with a special entry unexpectedly succeeded"
+grep -F -- "existing managed release contains a link or special entry" \
+  "${WORK_DIR}/existing-release-special.out" >/dev/null || \
+  die "existing release special entry did not report the expected failure"
+assert_state_preserved "existing release special-entry validation"
+rm -f -- "${managed_release_dir}/unexpected-fifo"
+
+printf '%s\n' "permanent updater lock sentinel" > "${TARGET_LOCK}"
+lock_identity_before_reinstall="$(stat -c '%d:%i:%u:%g:%a' -- "${TARGET_LOCK}")"
+lock_digest_before_reinstall="$(sha256sum -- "${TARGET_LOCK}" | awk 'NR == 1 { print $1 }')"
 "${EXTRACTED_ROOT}/install-autostream-observability" > "${WORK_DIR}/idempotent.out"
+[[ $(stat -c '%d:%i:%u:%g:%a' -- "${TARGET_LOCK}") == "${lock_identity_before_reinstall}" ]] || \
+  die "idempotent reinstall changed the permanent lock inode or metadata"
+[[ $(sha256sum -- "${TARGET_LOCK}" | awk 'NR == 1 { print $1 }') == \
+  "${lock_digest_before_reinstall}" ]] || \
+  die "idempotent reinstall truncated or changed the permanent lock content"
 [[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
   die "idempotent reinstall replaced the running legacy process"
 assert_loaded_runtime_unit "${PUBLIC_BINARY}" "autostream" "idempotent reinstall"
@@ -1034,10 +1482,11 @@ assert_loaded_runtime_unit "${PUBLIC_BINARY}" "autostream" "idempotent reinstall
   die "idempotent reinstall changed the existing environment"
 [[ $(sha256sum "${MARIADB_DEFAULTS}" | awk 'NR == 1 { print $1 }') == "${db_before}" ]] || \
   die "idempotent reinstall changed the existing MariaDB defaults"
+assert_state_preserved "idempotent reinstall"
 systemctl is-enabled --quiet "${UNIT}" && die "idempotent reinstall unexpectedly enabled the service"
 
 (
-  exec 8>"${TARGET_LOCK}"
+  exec 8<>"${TARGET_LOCK}"
   flock -n 8 || die "test could not acquire the updater target lock"
   set +e
   "${EXTRACTED_ROOT}/install-autostream-observability" \
@@ -1049,6 +1498,11 @@ systemctl is-enabled --quiet "${UNIT}" && die "idempotent reinstall unexpectedly
 grep -F -- "another privileged update is already active for ${UNIT}" \
   "${WORK_DIR}/contention.out" >/dev/null || \
   die "lock contention did not fail with the expected message"
+[[ $(stat -c '%d:%i:%u:%g:%a' -- "${TARGET_LOCK}") == "${lock_identity_before_reinstall}" ]] || \
+  die "lock contention changed the permanent lock inode or metadata"
+[[ $(sha256sum -- "${TARGET_LOCK}" | awk 'NR == 1 { print $1 }') == \
+  "${lock_digest_before_reinstall}" ]] || \
+  die "lock contention truncated or changed the permanent lock content"
 [[ $(systemctl show --property MainPID --value "${UNIT}") == "${old_pid}" ]] || \
   die "lock contention changed the running legacy process"
 kill -0 "${old_pid}" || die "lock contention stopped the running legacy process"
