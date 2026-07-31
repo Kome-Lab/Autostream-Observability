@@ -384,6 +384,9 @@ func TestObservabilityInstallerIntegrationFixtureCoversPrivilegedTransitions(t *
 		`existing managed release checksum inventory is incomplete or unsafe`,
 		`existing managed release contains a link or special entry`,
 		`-d /var/tmp/autostream-observability-install.XXXXXXXX`,
+		`/run/autostream-updater/.host-lock-create.XXXXXX`,
+		`/run/autostream-updater/.lock-create.XXXXXX`,
+		`-d /opt/autostream/observability/.install.XXXXXX`,
 		`readonly RUNTIME_UNIT_PATH="/run/systemd/system/${UNIT}"`,
 		`systemd runtime unit directory is unsafe`,
 		`fixture_owns_paths=false`,
@@ -664,8 +667,12 @@ func TestObservabilityInstallerArmsRollbackBeforeProvisioningAndBindsAccountLock
 		`stat -c '%d:%i:%s:%Y:%Z:%f:%u:%g:%a'`,
 		`readonly SHARED_HOST_SETUP_LOCK="/run/autostream-updater/.autostream-runtime-host-setup.lock"`,
 		`exec 8<>"${SHARED_HOST_SETUP_LOCK}"`,
+		`-f /proc/self/fd/8`,
+		`stat -Lc '%U:%G:%a' -- /proc/self/fd/8`,
 		`shared runtime host-setup lock identity changed after acquisition`,
 		`exec 9<>"${TARGET_LOCK}"`,
+		`-f /proc/self/fd/9`,
+		`stat -Lc '%U:%G:%a' -- /proc/self/fd/9`,
 		`chmod 0600 /proc/self/fd/9`,
 		`chown root:root /proc/self/fd/9`,
 		`updater target lock identity changed after acquisition`,
@@ -677,6 +684,9 @@ func TestObservabilityInstallerArmsRollbackBeforeProvisioningAndBindsAccountLock
 	}
 	if strings.Contains(installer, `exec 9>"${TARGET_LOCK}"`) {
 		t.Fatal("Observability lock acquisition must not truncate the permanent lock inode")
+	}
+	if strings.Contains(installer, `stat -Lc '%F:%U:%G:%a'`) {
+		t.Fatal("Observability lock validation must not reject an empty regular lock from GNU stat's file-type wording")
 	}
 	sharedLock := strings.Index(installer, `exec 8<>"${SHARED_HOST_SETUP_LOCK}"`)
 	targetLock := strings.Index(installer, `exec 9<>"${TARGET_LOCK}"`)

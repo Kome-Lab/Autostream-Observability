@@ -938,20 +938,33 @@ if [[ ! -f ${MKTEMP_CALL_LOG} || -L ${MKTEMP_CALL_LOG} ]]; then
   cat "${WORK_DIR}/mktemp-failure.out" >&2
   die "mktemp failure injection did not reach the staging call"
 fi
-[[ $(wc -l < "${MKTEMP_CALL_LOG}") -eq 4 ]] || \
+if [[ $(wc -l < "${MKTEMP_CALL_LOG}") -ne 4 ]]; then
+  printf '%s\n' "observed production mktemp calls:" >&2
+  cat "${MKTEMP_CALL_LOG}" >&2
+  printf '%s\n' "installer output before the mktemp assertion:" >&2
+  cat "${WORK_DIR}/mktemp-failure.out" >&2
   die "mktemp failure injection did not reach archive, shared lock, target lock, and managed staging calls"
-[[ $(head -n 1 "${MKTEMP_CALL_LOG}") == \
-  "-d /var/tmp/autostream-observability-install.XXXXXXXX" ]] || \
+fi
+if [[ $(head -n 1 "${MKTEMP_CALL_LOG}") != \
+  "-d /var/tmp/autostream-observability-install.XXXXXXXX" ]]; then
+  cat "${MKTEMP_CALL_LOG}" >&2
   die "mktemp failure injection did not begin with archive preflight staging"
-[[ $(sed -n '2p' "${MKTEMP_CALL_LOG}") == \
-  "/run/autostream-updater/.host-lock-create.XXXXXXXX" ]] || \
+fi
+if [[ $(sed -n '2p' "${MKTEMP_CALL_LOG}") != \
+  "/run/autostream-updater/.host-lock-create.XXXXXX" ]]; then
+  cat "${MKTEMP_CALL_LOG}" >&2
   die "mktemp failure injection did not atomically stage the shared host-setup lock"
-[[ $(sed -n '3p' "${MKTEMP_CALL_LOG}") == \
-  "/run/autostream-updater/.lock-create.XXXXXXXX" ]] || \
+fi
+if [[ $(sed -n '3p' "${MKTEMP_CALL_LOG}") != \
+  "/run/autostream-updater/.lock-create.XXXXXX" ]]; then
+  cat "${MKTEMP_CALL_LOG}" >&2
   die "mktemp failure injection did not atomically stage the permanent lock"
-[[ $(tail -n 1 "${MKTEMP_CALL_LOG}") == \
-  "-d /opt/autostream/observability/.install.XXXXXX" ]] || \
+fi
+if [[ $(tail -n 1 "${MKTEMP_CALL_LOG}") != \
+  "-d /opt/autostream/observability/.install.XXXXXX" ]]; then
+  cat "${MKTEMP_CALL_LOG}" >&2
   die "mktemp failure injection did not reach the managed staging call"
+fi
 grep -F -- "failed to create installer staging directory" \
   "${WORK_DIR}/mktemp-failure.out" >/dev/null || \
   die "mktemp failure was masked by the readonly assignment"
