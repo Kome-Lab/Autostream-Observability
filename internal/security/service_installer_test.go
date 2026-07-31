@@ -793,6 +793,54 @@ func TestObservabilityInstallerKeepsMutationJournalInParentShellAndDefersSignals
 	}
 }
 
+func TestObservabilityRollbackPreservesPreexistingAutostreamGroup(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "release", "install-autostream-observability"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(body)
+
+	for _, marker := range []string{
+		`readonly AUTOSTREAM_USER_ROLLBACK_LOGIN="autostream-install-rollback"`,
+		`prepare_autostream_user_rollback_login`,
+		`remove_created_autostream_user_preserving_group`,
+		`usermod --login "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" autostream`,
+		`userdel "${AUTOSTREAM_USER_ROLLBACK_LOGIN}"`,
+		`sha256sum -- /etc/group`,
+		`sha256sum -- /etc/gshadow`,
+	} {
+		if !strings.Contains(installer, marker) {
+			t.Fatalf("installer is missing pre-existing service-group rollback guard %q", marker)
+		}
+	}
+	for _, forbidden := range []string{
+		`for (index =`,
+		`usermod --gid`,
+		`usermod --home`,
+		`userdel autostream || failed=true`,
+	} {
+		if strings.Contains(installer, forbidden) {
+			t.Fatalf("installer rollback can mutate the protected service group or home through %q", forbidden)
+		}
+	}
+
+	fixtureBody, err := os.ReadFile(filepath.Join("..", "..", "release",
+		"test-install-autostream-observability-integration.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := string(fixtureBody)
+	for _, marker := range []string{
+		`useradd TERM transaction changed the pre-existing autostream group`,
+		`useradd TERM transaction changed the pre-existing local group databases`,
+		`useradd TERM transaction retained the reserved rollback account name`,
+	} {
+		if !strings.Contains(fixture, marker) {
+			t.Fatalf("integration fixture is missing exact service-group rollback assertion %q", marker)
+		}
+	}
+}
+
 func TestObservabilityDirectoryJournalPublishesCompleteSnapshotInsideSignalTransaction(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join("..", "..", "release", "install-autostream-observability"))
 	if err != nil {

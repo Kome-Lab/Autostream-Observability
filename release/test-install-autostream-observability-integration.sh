@@ -1076,6 +1076,8 @@ assert_signal_setup_paths_rolled_back "groupadd TERM transaction"
 
 groupadd --system autostream
 preexisting_group_record="$(getent group autostream)"
+preexisting_group_database_digest="$(sha256sum -- /etc/group | awk 'NR == 1 { print $1 }')"
+preexisting_gshadow_database_digest="$(sha256sum -- /etc/gshadow | awk 'NR == 1 { print $1 }')"
 set +e
 unshare --mount --propagation private bash -c \
   "mount --bind '${TERM_USERADD}' '$(command -v useradd)' && '${EXTRACTED_ROOT}/install-autostream-observability'" \
@@ -1090,6 +1092,15 @@ id autostream >/dev/null 2>&1 && \
   die "useradd TERM transaction retained the installer-created autostream user"
 [[ $(getent group autostream) == "${preexisting_group_record}" ]] || \
   die "useradd TERM transaction changed the pre-existing autostream group"
+[[ $(sha256sum -- /etc/group | awk 'NR == 1 { print $1 }') == \
+    "${preexisting_group_database_digest}" &&
+  $(sha256sum -- /etc/gshadow | awk 'NR == 1 { print $1 }') == \
+    "${preexisting_gshadow_database_digest}" ]] || \
+  die "useradd TERM transaction changed the pre-existing local group databases"
+if getent passwd autostream-install-rollback >/dev/null 2>&1 ||
+  getent group autostream-install-rollback >/dev/null 2>&1; then
+  die "useradd TERM transaction retained the reserved rollback account name"
+fi
 assert_signal_setup_paths_rolled_back "useradd TERM transaction"
 groupdel autostream
 

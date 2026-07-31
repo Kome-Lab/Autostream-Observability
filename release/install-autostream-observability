@@ -25,6 +25,7 @@ readonly BACKUP_DIR="/var/backups/autostream/observability"
 readonly BACKUP_CONFIG_DIR="/etc/autostream-local-executor"
 readonly BACKUP_CONFIG_DEST="${BACKUP_CONFIG_DIR}/mariadb-backup.cnf"
 readonly ARTIFACT_MANIFEST_REL="artifact-manifest.json"
+readonly AUTOSTREAM_USER_ROLLBACK_LOGIN="autostream-install-rollback"
 
 STAGE_DIR=
 stage_dir_identity=
@@ -83,10 +84,12 @@ managed_release_created_identity=
 created_autostream_group=false
 created_autostream_group_gid=
 created_autostream_group_record=
+preexisting_autostream_group_record=
 created_autostream_user=false
 created_autostream_user_uid=
 created_autostream_user_gid=
 created_autostream_user_record=
+autostream_user_rollback_login_ready=false
 lock_create_stage=
 shared_lock_create_stage=
 preserve_stage_directories=false
@@ -155,7 +158,7 @@ fi
 for command in \
   awk basename chmod chown cmp dirname find flock getent grep groupadd groupdel head id install jq \
   ln mkdir mktemp mv pwd readlink rm rmdir runuser sha256sum sort stat sync systemctl tar uname uniq \
-  useradd userdel wc; do
+  useradd userdel usermod wc; do
   command -v "${command}" >/dev/null 2>&1 || die "required command ${command} is unavailable"
 done
 
@@ -414,16 +417,77 @@ ensure_exact_directory() {
     die "${label} must resolve to its exact canonical path"
 }
 
+local_account_member_fields_are_clear() {
+  [[ -f /etc/group && ! -L /etc/group && -r /etc/group &&
+    -f /etc/gshadow && ! -L /etc/gshadow && -r /etc/gshadow ]] || return 1
+  awk -F: \
+    -v service_login="autostream" \
+    -v rollback_login="${AUTOSTREAM_USER_ROLLBACK_LOGIN}" \
+    '{
+      count = split($4, members, ",")
+      for (member_index = 1; member_index <= count; member_index++) {
+        if (members[member_index] == service_login || members[member_index] == rollback_login) {
+          exit 1
+        }
+      }
+    }' /etc/group || return 1
+  awk -F: \
+    -v service_login="autostream" \
+    -v rollback_login="${AUTOSTREAM_USER_ROLLBACK_LOGIN}" \
+    '{
+      admin_count = split($3, admins, ",")
+      for (admin_index = 1; admin_index <= admin_count; admin_index++) {
+        if (admins[admin_index] == service_login || admins[admin_index] == rollback_login) {
+          exit 1
+        }
+      }
+      member_count = split($4, members, ",")
+      for (member_index = 1; member_index <= member_count; member_index++) {
+        if (members[member_index] == service_login || members[member_index] == rollback_login) {
+          exit 1
+        }
+      }
+    }' /etc/gshadow
+}
+
+local_account_database_matches_digests() {
+  local expected_group_digest=$1
+  local expected_gshadow_digest=$2
+  local group_digest gshadow_digest
+
+  group_digest=$(sha256sum -- /etc/group | awk 'NR == 1 { print $1 }') || return 1
+  gshadow_digest=$(sha256sum -- /etc/gshadow | awk 'NR == 1 { print $1 }') || return 1
+  [[ ${group_digest} =~ ^[[:xdigit:]]{64}$ &&
+    ${gshadow_digest} =~ ^[[:xdigit:]]{64}$ &&
+    ${group_digest} == "${expected_group_digest}" &&
+    ${gshadow_digest} == "${expected_gshadow_digest}" ]]
+}
+
+prepare_autostream_user_rollback_login() {
+  [[ -z $(getent passwd "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) &&
+    -z $(getent group "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) ]] || \
+    return 1
+  local_account_member_fields_are_clear || return 1
+  autostream_user_rollback_login_ready=true
+}
+
 preflight_autostream_account() {
   local autostream_group_gid existing_uid existing_gid
   if getent group autostream >/dev/null 2>&1; then
-    autostream_group_gid=$(getent group autostream | awk -F: 'NR == 1 { print $3 }')
+    preexisting_autostream_group_record=$(getent group autostream) || \
+      die "could not capture the pre-existing autostream service group"
+    [[ -n ${preexisting_autostream_group_record} ]] || \
+      die "could not capture the pre-existing autostream service group"
+    autostream_group_gid=$(printf '%s\n' "${preexisting_autostream_group_record}" |
+      awk -F: 'NR == 1 { print $3 }')
     [[ ${autostream_group_gid} =~ ^[0-9]+$ && ${autostream_group_gid} -ne 0 ]] || \
       die "autostream service group must have a non-root numeric GID"
   else
     if getent passwd autostream >/dev/null 2>&1 || id autostream >/dev/null 2>&1; then
       die "autostream service account exists without the autostream group"
     fi
+    prepare_autostream_user_rollback_login || \
+      die "could not reserve a safe service-account rollback login"
     return 0
   fi
 
@@ -436,6 +500,9 @@ preflight_autostream_account() {
       die "autostream service account numeric primary GID does not match the autostream group"
     [[ $(id -gn autostream) == "autostream" ]] || \
       die "autostream service account must use the autostream primary group"
+  else
+    prepare_autostream_user_rollback_login || \
+      die "could not reserve a safe service-account rollback login"
   fi
 }
 
@@ -464,8 +531,20 @@ ensure_autostream_account() {
   if [[ ${created_autostream_group} == true ]]; then
     [[ ${created_autostream_group_gid} == "${autostream_group_gid}" ]] || \
       die "created autostream service group identity changed during provisioning"
+    [[ $(getent group autostream) == "${created_autostream_group_record}" ]] || \
+      die "created autostream service group changed before user provisioning"
+  else
+    [[ -n ${preexisting_autostream_group_record} &&
+      $(getent group autostream) == "${preexisting_autostream_group_record}" ]] || \
+      die "pre-existing autostream service group changed before user provisioning"
   fi
   if ! id autostream >/dev/null 2>&1; then
+    [[ ${autostream_user_rollback_login_ready} == true &&
+      -z $(getent passwd "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) &&
+      -z $(getent group "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) ]] || \
+      die "service-account rollback login changed before user provisioning"
+    local_account_member_fields_are_clear || \
+      die "service-account names are referenced by local group membership state"
     account_creation_failed=false
     begin_installer_signal_transaction
     if ! useradd \
@@ -1186,19 +1265,126 @@ rollback_journaled_directories() {
   [[ ${failed} == false ]]
 }
 
+restore_created_autostream_user_login() {
+  local expected_group_record=$1
+  local renamed_user_record=$2
+  local expected_group_digest=$3
+  local expected_gshadow_digest=$4
+
+  [[ -z $(getent passwd autostream 2>/dev/null || true) &&
+    $(getent passwd "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) == \
+      "${renamed_user_record}" &&
+    -z $(getent group "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) ]] || \
+    return 1
+  usermod --login autostream "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" || return 1
+  [[ $(getent passwd autostream 2>/dev/null || true) == \
+      "${created_autostream_user_record}" &&
+    -z $(getent passwd "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) &&
+    $(getent group autostream 2>/dev/null || true) == "${expected_group_record}" &&
+    -z $(getent group "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) ]] || \
+    return 1
+  local_account_database_matches_digests \
+    "${expected_group_digest}" "${expected_gshadow_digest}"
+}
+
+remove_created_autostream_user_preserving_group() {
+  local delete_status=0 expected_group_gid expected_group_record
+  local group_database_digest_before gshadow_database_digest_before
+  local rename_status=0 renamed_user_record user_record_suffix
+
+  [[ ${created_autostream_user} == true &&
+    ${autostream_user_rollback_login_ready} == true &&
+    ${created_autostream_user_record} =~ ^autostream(:[^:]*:[1-9][0-9]*:[1-9][0-9]*:[^:]*:/var/lib/autostream:/usr/sbin/nologin)$ ]] || \
+    return 1
+  user_record_suffix=${BASH_REMATCH[1]}
+  [[ $(getent passwd autostream 2>/dev/null || true) == \
+      "${created_autostream_user_record}" &&
+    $(id -u autostream 2>/dev/null || true) == "${created_autostream_user_uid}" &&
+    $(id -g autostream 2>/dev/null || true) == "${created_autostream_user_gid}" &&
+    $(id -Gn autostream 2>/dev/null || true) == "autostream" ]] || return 1
+
+  if [[ ${created_autostream_group} == true ]]; then
+    expected_group_record=${created_autostream_group_record}
+  else
+    expected_group_record=${preexisting_autostream_group_record}
+  fi
+  [[ -n ${expected_group_record} &&
+    $(getent group autostream 2>/dev/null || true) == "${expected_group_record}" ]] || \
+    return 1
+  expected_group_gid=$(printf '%s\n' "${expected_group_record}" |
+    awk -F: 'NR == 1 && $1 == "autostream" { print $3 }')
+  [[ ${expected_group_gid} =~ ^[1-9][0-9]*$ &&
+    ${created_autostream_user_gid} == "${expected_group_gid}" &&
+    -z $(getent passwd "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) &&
+    -z $(getent group "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) ]] || \
+    return 1
+
+  group_database_digest_before=$(sha256sum -- /etc/group | awk 'NR == 1 { print $1 }') || \
+    return 1
+  gshadow_database_digest_before=$(sha256sum -- /etc/gshadow | awk 'NR == 1 { print $1 }') || \
+    return 1
+  [[ ${group_database_digest_before} =~ ^[[:xdigit:]]{64}$ &&
+    ${gshadow_database_digest_before} =~ ^[[:xdigit:]]{64}$ ]] || return 1
+  local_account_member_fields_are_clear || return 1
+  local_account_database_matches_digests \
+    "${group_database_digest_before}" "${gshadow_database_digest_before}" || return 1
+
+  # With Ubuntu's USERGROUPS_ENAB setting, userdel may also delete an empty
+  # group whose name matches the login. Rename only the invocation-created
+  # login so the protected autostream group cannot be selected for deletion.
+  renamed_user_record="${AUTOSTREAM_USER_ROLLBACK_LOGIN}${user_record_suffix}"
+  if usermod --login "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" autostream; then
+    rename_status=0
+  else
+    rename_status=$?
+  fi
+  if [[ ${rename_status} -ne 0 ||
+    -n $(getent passwd autostream 2>/dev/null || true) ||
+    $(getent passwd "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) != \
+      "${renamed_user_record}" ||
+    $(getent group autostream 2>/dev/null || true) != "${expected_group_record}" ||
+    -n $(getent group "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) ]] ||
+    ! local_account_database_matches_digests \
+      "${group_database_digest_before}" "${gshadow_database_digest_before}"; then
+    restore_created_autostream_user_login \
+      "${expected_group_record}" "${renamed_user_record}" \
+      "${group_database_digest_before}" "${gshadow_database_digest_before}" || true
+    return 1
+  fi
+
+  if userdel "${AUTOSTREAM_USER_ROLLBACK_LOGIN}"; then
+    delete_status=0
+  else
+    delete_status=$?
+  fi
+  if [[ ${delete_status} -ne 0 ]]; then
+    restore_created_autostream_user_login \
+      "${expected_group_record}" "${renamed_user_record}" \
+      "${group_database_digest_before}" "${gshadow_database_digest_before}" || true
+    return 1
+  fi
+  [[ -z $(getent passwd autostream 2>/dev/null || true) &&
+    -z $(getent passwd "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) &&
+    $(getent group autostream 2>/dev/null || true) == "${expected_group_record}" &&
+    -z $(getent group "${AUTOSTREAM_USER_ROLLBACK_LOGIN}" 2>/dev/null || true) ]] || \
+    return 1
+  local_account_database_matches_digests \
+    "${group_database_digest_before}" "${gshadow_database_digest_before}" || return 1
+  created_autostream_user=false
+  created_autostream_user_uid=
+  created_autostream_user_gid=
+  created_autostream_user_record=
+}
+
 rollback_autostream_account() {
   local failed=false current_group
   if [[ ${created_autostream_user} == true ]]; then
-    if [[ $(getent passwd autostream 2>/dev/null || true) == "${created_autostream_user_record}" &&
-      $(id -u autostream 2>/dev/null || true) == "${created_autostream_user_uid}" &&
-      $(id -g autostream 2>/dev/null || true) == "${created_autostream_user_gid}" ]]; then
-      userdel autostream || failed=true
-      getent passwd autostream >/dev/null 2>&1 && failed=true
-    else
-      failed=true
-    fi
+    remove_created_autostream_user_preserving_group || failed=true
   fi
-  if [[ ${created_autostream_group} == true ]]; then
+  if [[ ${created_autostream_group} == true &&
+    ${created_autostream_user} == true ]]; then
+    failed=true
+  elif [[ ${created_autostream_group} == true ]]; then
     current_group=$(getent group autostream 2>/dev/null || true)
     if [[ -z ${current_group} ]]; then
       :
