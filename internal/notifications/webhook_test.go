@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/example/autostream-observability/internal/diagnostics"
 	"github.com/example/autostream-observability/internal/store"
 )
 
@@ -44,7 +45,7 @@ func TestDiscordWebhookPayload(t *testing.T) {
 		t.Fatalf("unexpected payload: %#v", got)
 	}
 	embed, ok := embeds[0].(map[string]any)
-	if !ok || embed["title"] != "インシデント発生: encoder_process_exited" || !strings.Contains(embed["description"].(string), "Encoder process stopped") {
+	if !ok || embed["title"] != "インシデント発生: Encoder process 停止" || !strings.Contains(embed["description"].(string), "Encoder process stopped") {
 		t.Fatalf("Discord payload is missing its structured embed: %#v", got)
 	}
 	fields, ok := embed["fields"].([]any)
@@ -61,6 +62,41 @@ func TestDiscordWebhookPayload(t *testing.T) {
 	parse, ok := allowedMentions["parse"].([]any)
 	if !ok || len(parse) != 0 {
 		t.Fatalf("Discord payload must disable all automatic mentions: %#v", got)
+	}
+}
+
+func TestNotificationTitlesAlwaysHaveSafeFallbacks(t *testing.T) {
+	for _, eventType := range []string{"incident.opened", "incident.updated", "incident.resolved", "diagnostic.created", "remediation.pending_approval", "remediation.executed", "admin.audit", "unknown.event"} {
+		t.Run(eventType, func(t *testing.T) {
+			title := notificationTitle(eventType, store.Incident{})
+			if strings.TrimSpace(title) == "" {
+				t.Fatalf("notification title is empty for event %q", eventType)
+			}
+		})
+	}
+	unknownRule := notificationTitle("incident.opened", store.Incident{Rule: "new_rule_from_future"})
+	if !strings.Contains(unknownRule, "new_rule_from_future") {
+		t.Fatalf("unknown incident rule was dropped from title: %q", unknownRule)
+	}
+}
+
+func TestKnownIncidentRulesHaveReadableTitles(t *testing.T) {
+	for _, rule := range []string{
+		"heartbeat_timeout", "encoder_process_exited", "recorder_not_writing", "disk_low",
+		"archive_package_failed", "archive_remux_slow", "gdrive_upload_failed", "gdrive_upload_retry_high",
+		"high_packet_loss", "rtmps_reconnect_loop", "encoder_low_fps", "encoder_bitrate_low",
+		"encoder_dropped_frames_high", "audio_silence", "audio_clipping", "discord_audio_not_receiving",
+		"discord_audio_forward_inactive", "discord_audio_forward_failed", "discord_audio_forward_recovered",
+		"discord_audio_forward_stale", "discord_reconnect_loop", "discord_voice_disconnected",
+		"media_input_timeout", "worker_event_send_failed", "stream_start_timeout", "stream_stop_timeout",
+		"unexpected_stopped",
+	} {
+		t.Run(rule, func(t *testing.T) {
+			title := notificationTitle("incident.opened", store.Incident{Rule: rule})
+			if strings.TrimSpace(title) == "" || strings.HasSuffix(title, ": "+rule) {
+				t.Fatalf("known incident rule has no readable title: %q", title)
+			}
+		})
 	}
 }
 
@@ -115,9 +151,18 @@ func TestAdminAuditNotificationUsesSpecificStructuredTitleAndContext(t *testing.
 	if embed["title"] != "シークレットを更新" || embed["timestamp"] != occurredAt.Format(time.RFC3339) {
 		t.Fatalf("admin audit embed title or timestamp is unclear: %#v", embed)
 	}
-	description, _ := embed["description"].(string)
-	if !strings.Contains(description, "対象: secret") || !strings.Contains(description, "実行者: ops") {
-		t.Fatalf("admin audit embed lost its operation context: %#v", embed)
+	fields, ok := embed["fields"].([]map[string]any)
+	if !ok {
+		t.Fatalf("admin audit embed fields have an unexpected shape: %#v", embed)
+	}
+	context := map[string]string{}
+	for _, field := range fields {
+		name, _ := field["name"].(string)
+		value, _ := field["value"].(string)
+		context[name] = value
+	}
+	if context["対象"] != "secret" || context["実行者"] != "ops" || context["サービス"] != "observability" {
+		t.Fatalf("admin audit embed lost its structured operation context: %#v", embed)
 	}
 	if subject := formatEmailSubject("admin.audit", incident); subject != "[AutoStream] WARNING secrets.update | シークレットを更新" {
 		t.Fatalf("admin audit email subject = %q", subject)
@@ -130,7 +175,7 @@ func TestAdminAuditNotificationUsesSpecificStructuredTitleAndContext(t *testing.
 		t.Fatalf("admin audit email is not multipart/alternative: %s", message)
 	}
 	text := formatIncidentText("admin.audit", incident)
-	for _, want := range []string{"シークレットを更新", "重要度: 警告", "結果: 成功", "操作コード: secrets.update", "対象: secret", "実行者: ops", occurredAt.Format(time.RFC3339)} {
+	for _, want := range []string{"シークレットを更新", "重要度: 警告", "結果: 成功", "操作コード: シークレットを更新 (secrets.update)", "対象: secret", "実行者: ops", occurredAt.Format(time.RFC3339)} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("structured admin audit text is missing %q: %s", want, text)
 		}
@@ -324,25 +369,64 @@ func TestGenericWebhookPayload(t *testing.T) {
 	if got["event_type"] != "incident.opened" || got["rule"] != "gdrive_upload_failed" || got["summary"] != "Google Drive upload failed. A&B <raw>" {
 		t.Fatalf("unexpected payload: %#v", got)
 	}
+	if got["schema_version"] != float64(2) || got["title"] != "インシデント発生: Google Drive upload 失敗" || got["service_id"] != "enc-01" {
+		t.Fatalf("generic webhook lost structured identity: %#v", got)
+	}
+	if got["details"] != "" || got["target"] != "" || got["actor"] != "" {
+		t.Fatalf("generic webhook details are not normalized: %#v", got)
+	}
+}
+
+func TestGenericWebhookCarriesDiagnosticDetailsWithoutRepeatingSummary(t *testing.T) {
+	incident := store.Incident{
+		ID:        "inc-1",
+		Rule:      "encoder_process_exited",
+		Severity:  "critical",
+		Status:    "open",
+		SummaryJA: "Encoder process stopped.",
+		ServiceID: "enc-01",
+		Report: diagnostics.Report{
+			LikelyCause:        "FFmpeg exited unexpectedly",
+			RecommendedActions: []string{"check encoder logs", "restart encoder"},
+		},
+	}
+	payload := (WebhookNotifier{Type: "generic"}).payload("incident.opened", incident)
+	if payload["summary"] != incident.SummaryJA {
+		t.Fatalf("generic summary changed: %#v", payload)
+	}
+	details, ok := payload["details"].(string)
+	if !ok || !strings.Contains(details, "原因候補: FFmpeg exited unexpectedly") || !strings.Contains(details, "推奨対応: check encoder logs / restart encoder") {
+		t.Fatalf("generic diagnostic details are incomplete: %#v", payload)
+	}
+	if strings.Contains(details, incident.SummaryJA) {
+		t.Fatalf("generic details repeat the summary: %q", details)
+	}
 }
 
 func TestGenericWebhookPreservesAdminAuditSummaryContract(t *testing.T) {
 	incident := store.Incident{
-		Rule:          "integrations.oauth_account.update",
-		Severity:      "info",
-		Status:        "success",
-		SummaryJA:     "OAuth接続アカウントを更新\n対象: OAuth接続アカウント (acct-01)\n実行者: ops",
-		SourceSummary: "管理イベント: integrations.oauth_account.update / success / oauth_account acct-01 / actor=ops",
-		ServiceID:     "observability",
+		Rule:                     "integrations.oauth_account.update",
+		Severity:                 "info",
+		Status:                   "success",
+		SummaryJA:                "OAuth接続アカウントを更新\n対象: OAuth接続アカウント (acct-01)\n実行者: ops",
+		SourceSummary:            "管理イベント: integrations.oauth_account.update / success / oauth_account acct-01 / actor=ops",
+		ServiceID:                "observability",
+		NotificationResourceType: "oauth_account",
+		NotificationResourceID:   "acct-01",
+		NotificationActor:        "ops",
+		NotificationDetails:      "OAuth connected account updated",
 	}
 	payload := (WebhookNotifier{Type: "generic"}).payload("admin.audit", incident)
 	if payload["summary"] != incident.SourceSummary {
 		t.Fatalf("generic webhook source summary contract changed: %#v", payload)
 	}
-	if _, exists := payload["display_summary"]; exists {
-		t.Fatalf("generic webhook payload shape changed: %#v", payload)
+	if payload["schema_version"] != 2 || payload["service_id"] != "observability" || payload["target"] != "OAuth接続アカウント (acct-01)" || payload["actor"] != "ops" {
+		t.Fatalf("generic webhook structured context changed: %#v", payload)
 	}
-	if len(payload) != 8 {
+	if payload["details"] != "OAuth connected account updated" {
+		t.Fatalf("generic webhook admin details changed: %#v", payload)
+	}
+	if len(payload) != 15 {
 		t.Fatalf("generic webhook field set changed: %#v", payload)
 	}
 }

@@ -132,10 +132,12 @@ type notificationEventRequest struct {
 	Severity      string `json:"severity"`
 	Status        string `json:"status"`
 	Action        string `json:"action"`
+	ServiceID     string `json:"service_id"`
 	ResourceType  string `json:"resource_type"`
 	ResourceID    string `json:"resource_id"`
 	ActorUsername string `json:"actor_username"`
 	Summary       string `json:"summary"`
+	Details       string `json:"details"`
 	Timestamp     string `json:"timestamp"`
 }
 
@@ -692,9 +694,20 @@ func notificationIncidentFromRequest(body notificationEventRequest, fallbackServ
 	resourceType := safeNotificationResourceType(body.ResourceType)
 	resourceID := safeNotificationField(body.ResourceID, 160)
 	actor := safeNotificationField(body.ActorUsername, 80)
+	serviceID := safeNotificationField(body.ServiceID, 160)
+	if serviceID == "" && !strings.EqualFold(strings.TrimSpace(fallbackService), "observability") {
+		serviceID = safeNotificationField(fallbackService, 160)
+	}
+	// A missing service_id describes the producer, not the Observability
+	// process that happens to receive the request. Never attribute an event to
+	// the receiver merely because it was delivered through this endpoint.
+	if serviceID == "" || strings.EqualFold(serviceID, "observability") {
+		serviceID = "control-panel"
+	}
 	status := safeNotificationStatus(body.Status)
 	severity := safeNotificationSeverity(body.Severity)
 	callerSummary := safeNotificationField(body.Summary, 240)
+	details := safeNotificationField(body.Details, 3000)
 	sourceSummary := callerSummary
 	legacySummary := "管理イベント: " + action + " / " + status
 	if sourceSummary == "" {
@@ -729,10 +742,6 @@ func notificationIncidentFromRequest(body notificationEventRequest, fallbackServ
 		}
 		summary = strings.Join(parts, "\n")
 	}
-	serviceID := strings.TrimSpace(fallbackService)
-	if serviceID == "" {
-		serviceID = "observability"
-	}
 	var occurredAt time.Time
 	if timestamp := strings.TrimSpace(body.Timestamp); timestamp != "" {
 		parsed, err := time.Parse(time.RFC3339, timestamp)
@@ -742,13 +751,17 @@ func notificationIncidentFromRequest(body notificationEventRequest, fallbackServ
 		occurredAt = parsed.UTC()
 	}
 	return store.Incident{
-		Rule:          action,
-		Severity:      severity,
-		Status:        status,
-		SummaryJA:     summary,
-		SourceSummary: sourceSummary,
-		ServiceID:     serviceID,
-		UpdatedAt:     occurredAt,
+		Rule:                     action,
+		Severity:                 severity,
+		Status:                   status,
+		SummaryJA:                summary,
+		SourceSummary:            sourceSummary,
+		ServiceID:                serviceID,
+		NotificationResourceType: resourceType,
+		NotificationResourceID:   resourceID,
+		NotificationActor:        actor,
+		NotificationDetails:      details,
+		UpdatedAt:                occurredAt,
 	}, nil
 }
 
@@ -770,11 +783,26 @@ func safeNotificationField(value string, maxLen int) string {
 	if value == "" {
 		return ""
 	}
+	value = strings.Map(func(char rune) rune {
+		switch char {
+		case '\n', '\r', '\t':
+			return char
+		default:
+			if char < 0x20 || (char >= 0x7f && char <= 0x9f) {
+				return -1
+			}
+			return char
+		}
+	}, value)
+	value = strings.TrimSpace(value)
 	if safeEvidenceValue(value) == "<redacted>" {
 		return ""
 	}
-	if maxLen > 0 && len(value) > maxLen {
-		return value[:maxLen]
+	if maxLen > 0 {
+		runes := []rune(value)
+		if len(runes) > maxLen {
+			return string(runes[:maxLen])
+		}
 	}
 	return value
 }
@@ -1233,7 +1261,6 @@ func (s *Server) evaluateAndStoreIncidents(r *http.Request, signal store.Signal)
 		}
 		if created {
 			s.notifyIncidentEvent(r, "incident.opened", stored)
-			s.notifyIncidentEvent(r, "diagnostic.created", stored)
 			if err := s.createRemediationActions(r, stored); err != nil {
 				return nil, err
 			}
@@ -1440,13 +1467,14 @@ func secretAttributeKey(key string) bool {
 
 func (s *Server) createRemediationActions(r *http.Request, incident store.Incident) error {
 	for _, action := range remediation.BuildActions(incident, remediation.ModeFromEnv()) {
-		created, err := s.store.CreateRemediationAction(r.Context(), action)
+		_, err := s.store.CreateRemediationAction(r.Context(), action)
 		if err != nil {
 			return err
 		}
-		if created.Status == "pending_approval" {
-			s.notifyIncidentEvent(r, "remediation.pending_approval", incident)
-		}
+		// The incident.opened notification already contains the diagnostic
+		// report and recommended actions. Do not emit one identical webhook per
+		// generated remediation action; explicit /notification-events callers
+		// can still request diagnostic.created or remediation.pending_approval.
 	}
 	return nil
 }

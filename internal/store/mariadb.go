@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -140,7 +141,12 @@ func (s MariaDBStore) UpsertIncident(ctx context.Context, incident Incident) (In
 		return Incident{}, false, err
 	}
 	now := time.Now().UTC()
-	existing, err := s.findOpenIncident(ctx, incident.Rule, incident.ServiceID, incident.StreamID)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return Incident{}, false, err
+	}
+	defer tx.Rollback()
+	existing, err := findOpenIncidentQuery(ctx, tx, incident.Rule, incident.ServiceID, incident.StreamID)
 	if err == nil {
 		existing.SignalID = incident.SignalID
 		existing.SummaryJA = incident.SummaryJA
@@ -150,8 +156,11 @@ func (s MariaDBStore) UpsertIncident(ctx context.Context, incident Incident) (In
 		if err != nil {
 			return Incident{}, false, err
 		}
-		if _, err := s.DB.ExecContext(ctx, `UPDATE incidents SET signal_id = ?, summary_ja = ?, diagnostic_report = ?, updated_at = ? WHERE id = ?`,
+		if _, err := tx.ExecContext(ctx, `UPDATE incidents SET signal_id = ?, summary_ja = ?, diagnostic_report = ?, updated_at = ? WHERE id = ?`,
 			existing.SignalID, existing.SummaryJA, string(report), existing.UpdatedAt, existing.ID); err != nil {
+			return Incident{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
 			return Incident{}, false, err
 		}
 		return existing, false, nil
@@ -171,10 +180,30 @@ func (s MariaDBStore) UpsertIncident(ctx context.Context, incident Incident) (In
 	if err != nil {
 		return Incident{}, false, err
 	}
-	if _, err := s.DB.ExecContext(ctx, `INSERT INTO incidents
-(id, rule, severity, status, summary_ja, service_id, stream_id, signal_id, diagnostic_report, opened_at, updated_at, resolved_at)
-VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, NULL)`,
-		incident.ID, incident.Rule, incident.Severity, incident.Status, incident.SummaryJA, incident.ServiceID, incident.StreamID, incident.SignalID, string(report), incident.OpenedAt, incident.UpdatedAt); err != nil {
+	dedupeKey := incidentDedupeKey(incident.Rule, incident.ServiceID, incident.StreamID)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO incidents
+(id, rule, severity, status, summary_ja, service_id, stream_id, signal_id, diagnostic_report, opened_at, updated_at, resolved_at, dedupe_key)
+VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, NULL, ?)`,
+		incident.ID, incident.Rule, incident.Severity, incident.Status, incident.SummaryJA, incident.ServiceID, incident.StreamID, incident.SignalID, string(report), incident.OpenedAt, incident.UpdatedAt, dedupeKey); err != nil {
+		// A concurrent writer may have won the unique dedupe key race. Read
+		// that row inside this transaction and converge on it instead of
+		// surfacing a duplicate incident to the notifier.
+		if existing, lookupErr := findIncidentByDedupeKey(ctx, tx, dedupeKey); lookupErr == nil {
+			existing.SignalID = incident.SignalID
+			existing.SummaryJA = incident.SummaryJA
+			existing.Report = incident.Report
+			existing.UpdatedAt = now
+			if _, updateErr := tx.ExecContext(ctx, `UPDATE incidents SET signal_id = ?, summary_ja = ?, diagnostic_report = ?, updated_at = ? WHERE id = ?`, existing.SignalID, existing.SummaryJA, string(report), existing.UpdatedAt, existing.ID); updateErr != nil {
+				return Incident{}, false, updateErr
+			}
+			if commitErr := tx.Commit(); commitErr != nil {
+				return Incident{}, false, commitErr
+			}
+			return existing, false, nil
+		}
+		return Incident{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
 		return Incident{}, false, err
 	}
 	return incident, true, nil
@@ -220,7 +249,7 @@ func (s MariaDBStore) UpdateIncidentStatus(ctx context.Context, id, status strin
 	if status == "resolved" || status == "ignored" {
 		resolved = now
 	}
-	result, err := s.DB.ExecContext(ctx, `UPDATE incidents SET status = ?, updated_at = ?, resolved_at = ? WHERE id = ?`, status, now, resolved, id)
+	result, err := s.DB.ExecContext(ctx, `UPDATE incidents SET status = ?, updated_at = ?, resolved_at = ?, dedupe_key = CASE WHEN ? IN ('resolved', 'ignored') THEN NULL ELSE dedupe_key END WHERE id = ?`, status, now, resolved, status, id)
 	if err != nil {
 		return Incident{}, err
 	}
@@ -556,11 +585,29 @@ func scanRemediationAction(scanner remediationScanner) (RemediationAction, error
 }
 
 func (s MariaDBStore) findOpenIncident(ctx context.Context, rule, serviceID, streamID string) (Incident, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at
+	return findOpenIncidentQuery(ctx, s.DB, rule, serviceID, streamID)
+}
+
+type queryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func findOpenIncidentQuery(ctx context.Context, queryer queryRower, rule, serviceID, streamID string) (Incident, error) {
+	row := queryer.QueryRowContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at
 FROM incidents
 WHERE rule = ? AND service_id = ? AND COALESCE(stream_id, '') = ? AND status NOT IN ('resolved', 'ignored')
-ORDER BY updated_at DESC LIMIT 1`, rule, serviceID, streamID)
+	ORDER BY updated_at DESC LIMIT 1 FOR UPDATE`, rule, serviceID, streamID)
 	return scanIncident(row)
+}
+
+func findIncidentByDedupeKey(ctx context.Context, queryer queryRower, dedupeKey string) (Incident, error) {
+	row := queryer.QueryRowContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at
+FROM incidents WHERE dedupe_key = ? LIMIT 1 FOR UPDATE`, dedupeKey)
+	return scanIncident(row)
+}
+
+func incidentDedupeKey(rule, serviceID, streamID string) string {
+	return strings.Join([]string{strings.TrimSpace(rule), strings.TrimSpace(serviceID), strings.TrimSpace(streamID)}, "\x00")
 }
 
 type incidentScanner interface {

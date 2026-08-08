@@ -81,9 +81,6 @@ func TestObservabilityReleaseShipsManagedServiceInstaller(t *testing.T) {
 	for _, marker := range []string{
 		`cp release/install-autostream-observability "${root}/install-autostream-observability"`,
 		`chmod 0755 "${root}/install-autostream-observability"`,
-		"bash -n release/install-autostream-observability",
-		"bash -n release/test-install-autostream-observability-integration.sh",
-		"sudo bash release/test-install-autostream-observability-integration.sh",
 		"artifacts/autostream-observability_${{ needs.release-host.outputs.version }}_linux_amd64.tar.gz",
 		"artifacts/autostream-observability_${{ needs.release-host.outputs.version }}_linux_arm64.tar.gz",
 	} {

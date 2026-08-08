@@ -899,7 +899,7 @@ func TestCreateNotificationEventAcceptsExactControlPanelPayload(t *testing.T) {
 	st := store.NewMemoryStore()
 	notifier := &eventRecordingNotifier{}
 	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), notifier, nil)
-	req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(`{"event_type":"admin.audit","severity":"info","status":"success","action":"oauth_accounts.update","resource_type":"oauth_account","resource_id":"acct-01","actor_username":"ops","summary":"OAuth connected account updated","timestamp":"2026-07-18T01:32:00Z"}`))
+	req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(`{"event_type":"admin.audit","severity":"info","status":"success","action":"oauth_accounts.update","service_id":"control-panel","resource_type":"oauth_account","resource_id":"acct-01","actor_username":"ops","summary":"OAuth connected account updated","details":"OAuth account was updated successfully.","timestamp":"2026-07-18T01:32:00Z"}`))
 	req.Header.Set("Authorization", "Bearer admin-token")
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
@@ -918,6 +918,9 @@ func TestCreateNotificationEventAcceptsExactControlPanelPayload(t *testing.T) {
 	}
 	if notificationIncident.SourceSummary != "OAuth connected account updated / oauth_account acct-01 / actor=ops" {
 		t.Fatalf("admin audit source summary was not preserved: %q", notificationIncident.SourceSummary)
+	}
+	if notificationIncident.ServiceID != "control-panel" || notificationIncident.NotificationDetails != "OAuth account was updated successfully." || notificationIncident.NotificationActor != "ops" {
+		t.Fatalf("admin audit structured notification context was not preserved: %#v", notificationIncident)
 	}
 	if notificationIncident.UpdatedAt.Format(time.RFC3339) != "2026-07-18T01:32:00Z" {
 		t.Fatalf("admin audit occurrence timestamp was lost: %s", notificationIncident.UpdatedAt)
@@ -957,6 +960,9 @@ func TestNotificationIncidentPreservesSafeResourceTypeAndValidatesTimestamp(t *t
 		}
 		if !strings.Contains(incident.SummaryJA, "対象: シークレット") {
 			t.Fatalf("safe secret resource type was removed: %q", incident.SummaryJA)
+		}
+		if incident.ServiceID != "control-panel" {
+			t.Fatalf("admin audit fallback service must identify the producer: %q", incident.ServiceID)
 		}
 		if incident.UpdatedAt.IsZero() {
 			t.Fatalf("valid timestamp %q was lost", timestamp)
@@ -1826,6 +1832,25 @@ func TestNotificationDeliveryHistoryDoesNotExposeWebhookErrorSecrets(t *testing.
 	}
 	if !strings.Contains(body, "notification webhook delivery failed") {
 		t.Fatalf("expected sanitized delivery error: %s", body)
+	}
+}
+
+func TestSignalIncidentSendsOneConsolidatedNotification(t *testing.T) {
+	st := store.NewMemoryStore()
+	notifier := &eventRecordingNotifier{}
+	handler := NewServerWithStoreAuthAndNotifier("observability", st, auth.NewVerifierFromRawTokens("service-token"), notifier)
+	request := httptest.NewRequest(http.MethodPost, "/signals", bytes.NewBufferString(`{"type":"error","name":"encoder.process.exited","service_id":"enc-01","service_type":"encoder_recorder","stream_id":"stream-01"}`))
+	request.Header.Set("Authorization", "Bearer service-token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("signal status = %d body = %s", response.Code, response.Body.String())
+	}
+	if len(notifier.events) != 1 || notifier.events[0] != "incident.opened" {
+		t.Fatalf("one incident must produce one consolidated notification: %#v", notifier.events)
+	}
+	if len(notifier.incidents) != 1 || len(notifier.incidents[0].Report.RecommendedActions) == 0 {
+		t.Fatalf("consolidated notification lost diagnostics or actions: %#v", notifier.incidents)
 	}
 }
 

@@ -632,16 +632,35 @@ func (n WebhookNotifier) payload(eventType string, incident store.Incident) map[
 		if sourceSummary := strings.TrimSpace(incident.SourceSummary); sourceSummary != "" {
 			summary = sourceSummary
 		}
-		return map[string]any{
-			"event_type":  eventType,
-			"severity":    incident.Severity,
-			"status":      incident.Status,
-			"incident_id": incident.ID,
-			"rule":        incident.Rule,
-			"service_id":  incident.ServiceID,
-			"stream_id":   incident.StreamID,
-			"summary":     summary,
+		// Keep the original summary fields for existing consumers, while also
+		// exposing the same structured context used by Discord, Slack, and email.
+		// This prevents generic webhook receivers from having to parse Japanese
+		// free-form text or accidentally displaying the receiver (observability)
+		// as the source service.
+		payload := map[string]any{
+			"schema_version": 2,
+			"event_type":     eventType,
+			"event_label":    notificationEventLabel(eventType),
+			"title":          notificationTitle(eventType, incident),
+			"severity":       incident.Severity,
+			"status":         incident.Status,
+			"incident_id":    incident.ID,
+			"rule":           incident.Rule,
+			"service_id":     incident.ServiceID,
+			"stream_id":      incident.StreamID,
+			"target":         notificationTargetValue(incident),
+			"actor":          notificationActorValue(incident),
+			"summary":        summary,
+			"details":        truncateNotificationText(notificationAdditionalDetails(eventType, incident), 6000),
+			"occurred_at":    notificationTimestamp(incident),
 		}
+		if actions := compactNotificationList(incident.Report.RecommendedActions); len(actions) > 0 {
+			payload["recommended_actions"] = actions
+		}
+		if evidence := compactNotificationList(incident.Report.Evidence); len(evidence) > 0 {
+			payload["evidence"] = evidence
+		}
+		return payload
 	}
 }
 
@@ -705,15 +724,11 @@ func emailNotificationFields(eventType string, incident store.Incident) []notifi
 	eventType = normalizedEventType(eventType)
 	eventValue := notificationEventLabel(eventType) + " (" + eventType + ")"
 	actionCode := strings.TrimSpace(incident.Rule)
-	actionValue := actionCode
-	if actionCode != "" && eventType == "admin.audit" {
-		actionValue = NotificationActionLabel(actionCode) + " (" + actionCode + ")"
-	}
+	actionValue := notificationRuleValue(eventType, actionCode)
 	if actionValue == "" {
 		actionValue = "—"
 	}
-	description := notificationDescription(eventType, incident)
-	resource := notificationContextValue(description, "対象", "resource")
+	resource := notificationTargetValue(incident)
 	if resource == "" {
 		switch {
 		case strings.TrimSpace(incident.StreamID) != "":
@@ -726,7 +741,7 @@ func emailNotificationFields(eventType string, incident store.Incident) []notifi
 			resource = "—"
 		}
 	}
-	actor := notificationContextValue(description, "実行者", "actor")
+	actor := notificationActorValue(incident)
 	if actor == "" {
 		actor = "—"
 	}
@@ -979,9 +994,46 @@ func notificationTitle(eventType string, incident store.Incident) string {
 	}
 	label := notificationEventLabel(eventType)
 	if rule := strings.TrimSpace(incident.Rule); rule != "" {
-		return label + ": " + rule
+		return label + ": " + notificationRuleLabel(rule)
 	}
 	return label
+}
+
+func notificationRuleLabel(rule string) string {
+	rule = strings.TrimSpace(rule)
+	labels := map[string]string{
+		"heartbeat_timeout":               "サービスの heartbeat 遅延",
+		"encoder_process_exited":          "Encoder process 停止",
+		"recorder_not_writing":            "録画書き込み停止",
+		"disk_low":                        "ディスク空き容量不足",
+		"archive_package_failed":          "アーカイブ package 失敗",
+		"archive_remux_slow":              "アーカイブ remux 遅延",
+		"gdrive_upload_failed":            "Google Drive upload 失敗",
+		"gdrive_upload_retry_high":        "Google Drive retry 増加",
+		"high_packet_loss":                "メディア packet loss 高騰",
+		"rtmps_reconnect_loop":            "RTMPS 再接続ループ",
+		"encoder_low_fps":                 "Encoder FPS 低下",
+		"encoder_bitrate_low":             "Encoder bitrate 低下",
+		"encoder_dropped_frames_high":     "Encoder dropped frames 増加",
+		"audio_silence":                   "配信音声の無音",
+		"audio_clipping":                  "配信音声 clipping",
+		"discord_audio_not_receiving":     "Discord 音声受信停止",
+		"discord_audio_forward_inactive":  "Discord 音声転送停止",
+		"discord_audio_forward_failed":    "Discord 音声転送失敗",
+		"discord_audio_forward_recovered": "Discord 音声転送回復",
+		"discord_audio_forward_stale":     "Discord 音声転送停滞",
+		"discord_reconnect_loop":          "Discord Gateway 再接続ループ",
+		"discord_voice_disconnected":      "Discord VC 切断",
+		"media_input_timeout":             "メディア入力 timeout",
+		"worker_event_send_failed":        "Worker event 送信失敗",
+		"stream_start_timeout":            "配信開始 timeout",
+		"stream_stop_timeout":             "配信停止 timeout",
+		"unexpected_stopped":              "配信の予期しない停止",
+	}
+	if label := labels[rule]; label != "" {
+		return label
+	}
+	return rule
 }
 
 func notificationEventLabel(eventType string) string {
@@ -1049,13 +1101,19 @@ func notificationMessageFields(eventType string, incident store.Incident) []noti
 		if normalizedEventType(eventType) == "admin.audit" {
 			name = "操作コード"
 		}
-		fields = append(fields, notificationMessageField{Name: name, Value: rule})
+		fields = append(fields, notificationMessageField{Name: name, Value: notificationRuleValue(eventType, rule)})
+	}
+	if target := notificationTargetValue(incident); target != "" {
+		fields = append(fields, notificationMessageField{Name: "対象", Value: target})
 	}
 	if serviceID := strings.TrimSpace(incident.ServiceID); serviceID != "" {
 		fields = append(fields, notificationMessageField{Name: "サービス", Value: serviceID})
 	}
-	if streamID := strings.TrimSpace(incident.StreamID); streamID != "" {
+	if streamID := strings.TrimSpace(incident.StreamID); streamID != "" && !notificationTargetIsStream(incident, streamID) {
 		fields = append(fields, notificationMessageField{Name: "配信枠", Value: streamID})
+	}
+	if actor := notificationActorValue(incident); actor != "" {
+		fields = append(fields, notificationMessageField{Name: "実行者", Value: actor})
 	}
 	return fields
 }
@@ -1117,15 +1175,168 @@ func slackNotificationBlocks(eventType string, incident store.Incident) []map[st
 }
 
 func notificationDescription(eventType string, incident store.Incident) string {
+	if normalizedEventType(eventType) == "admin.audit" {
+		if details := strings.TrimSpace(incident.NotificationDetails); details != "" {
+			return details
+		}
+		return legacyNotificationDetails(incident.SummaryJA, notificationTitle(eventType, incident))
+	}
 	description := strings.TrimSpace(incident.SummaryJA)
 	title := strings.TrimSpace(notificationTitle(eventType, incident))
 	if description == title {
-		return ""
+		description = ""
 	}
 	if strings.HasPrefix(description, title+"\n") {
-		return strings.TrimSpace(strings.TrimPrefix(description, title+"\n"))
+		description = strings.TrimSpace(strings.TrimPrefix(description, title+"\n"))
 	}
-	return description
+	return joinNotificationDetails(description, incidentReportDetails(incident))
+}
+
+func notificationAdditionalDetails(eventType string, incident store.Incident) string {
+	if normalizedEventType(eventType) == "admin.audit" {
+		return notificationDescription(eventType, incident)
+	}
+	return incidentReportDetails(incident)
+}
+
+func notificationRuleValue(eventType, rule string) string {
+	rule = strings.TrimSpace(rule)
+	if rule == "" {
+		return ""
+	}
+	var label string
+	if normalizedEventType(eventType) == "admin.audit" {
+		label = NotificationActionLabel(rule)
+	} else {
+		label = notificationRuleLabel(rule)
+	}
+	if label == "" || label == rule {
+		return rule
+	}
+	return label + " (" + rule + ")"
+}
+
+func notificationTargetValue(incident store.Incident) string {
+	resourceType := strings.TrimSpace(incident.NotificationResourceType)
+	resourceID := strings.TrimSpace(incident.NotificationResourceID)
+	if resourceType == "" || resourceID == "" {
+		description := strings.TrimSpace(incident.NotificationDetails)
+		if description == "" {
+			description = incident.SummaryJA
+		}
+		if resourceType == "" {
+			resourceType = notificationContextValue(description, "対象種別", "resource_type")
+		}
+		if resourceID == "" {
+			resourceID = notificationContextValue(description, "resource_id")
+		}
+	}
+	if resourceType == "" {
+		if target := notificationContextValue(incident.SummaryJA, "対象"); target != "" {
+			return target
+		}
+		return ""
+	}
+	label := NotificationResourceLabel(resourceType)
+	if resourceID == "" {
+		return label
+	}
+	return label + " (" + resourceID + ")"
+}
+
+func notificationTargetIsStream(incident store.Incident, streamID string) bool {
+	return strings.EqualFold(strings.TrimSpace(incident.NotificationResourceType), "stream") && strings.TrimSpace(incident.NotificationResourceID) == strings.TrimSpace(streamID)
+}
+
+func notificationActorValue(incident store.Incident) string {
+	if actor := strings.TrimSpace(incident.NotificationActor); actor != "" {
+		return actor
+	}
+	description := strings.TrimSpace(incident.NotificationDetails)
+	if description == "" {
+		description = incident.SummaryJA
+	}
+	return notificationContextValue(description, "実行者", "actor")
+}
+
+func legacyNotificationDetails(summary, title string) string {
+	var details []string
+	for _, line := range strings.Split(strings.ReplaceAll(summary, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == strings.TrimSpace(title) {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(line, "対象:") || strings.HasPrefix(line, "実行者:") || strings.HasPrefix(lower, "resource") || strings.HasPrefix(lower, "actor") {
+			continue
+		}
+		if strings.HasPrefix(line, "詳細:") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "詳細:"))
+		}
+		if line != "" {
+			details = append(details, line)
+		}
+	}
+	return strings.Join(details, "\n")
+}
+
+func incidentReportDetails(incident store.Incident) string {
+	var details []string
+	if summary := strings.TrimSpace(incident.Report.Summary); summary != "" && summary != strings.TrimSpace(incident.SummaryJA) {
+		details = append(details, "診断: "+summary)
+	}
+	if cause := strings.TrimSpace(incident.Report.LikelyCause); cause != "" {
+		details = append(details, "原因候補: "+cause)
+	}
+	if impact := strings.TrimSpace(incident.Report.Impact); impact != "" {
+		details = append(details, "影響: "+impact)
+	}
+	if actions := compactNotificationList(incident.Report.RecommendedActions); len(actions) > 0 {
+		details = append(details, "推奨対応: "+strings.Join(actions, " / "))
+	}
+	if evidence := compactNotificationList(incident.Report.Evidence); len(evidence) > 0 {
+		details = append(details, "根拠: "+strings.Join(evidence, ", "))
+	}
+	return strings.Join(details, "\n")
+}
+
+func compactNotificationList(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+		if len(out) == 6 {
+			break
+		}
+	}
+	return out
+}
+
+func joinNotificationDetails(parts ...string) string {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		for _, line := range strings.Split(strings.ReplaceAll(part, "\r\n", "\n"), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if _, ok := seen[line]; ok {
+				continue
+			}
+			seen[line] = struct{}{}
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 func notificationTimestamp(incident store.Incident) string {

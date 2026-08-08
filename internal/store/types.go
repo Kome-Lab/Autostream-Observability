@@ -36,6 +36,15 @@ type Incident struct {
 	OpenedAt      time.Time          `json:"opened_at"`
 	UpdatedAt     time.Time          `json:"updated_at"`
 	ResolvedAt    *time.Time         `json:"resolved_at,omitempty"`
+
+	// Notification-only context is intentionally excluded from the public
+	// incident JSON and persistence contract. It carries the richer context
+	// supplied by the Control Panel admin-audit bridge so webhook renderers can
+	// avoid rebuilding or duplicating fields from a free-form summary.
+	NotificationResourceType string `json:"-"`
+	NotificationResourceID   string `json:"-"`
+	NotificationActor        string `json:"-"`
+	NotificationDetails      string `json:"-"`
 }
 
 type NotificationDelivery struct {
