@@ -34,6 +34,12 @@ type IncidentEventNotifier interface {
 	NotifyIncidentEvent(ctx context.Context, eventType string, incident store.Incident) ([]DeliveryResult, error)
 }
 
+// ChannelSelectiveIncidentEventNotifier allows a caller to retry only the
+// configured channels that have not already accepted the same event.
+type ChannelSelectiveIncidentEventNotifier interface {
+	NotifyIncidentEventExceptChannels(ctx context.Context, eventType string, incident store.Incident, excludedChannelIDs map[string]struct{}) ([]DeliveryResult, error)
+}
+
 func NotifyIncidentEvent(ctx context.Context, notifier Notifier, eventType string, incident store.Incident) ([]DeliveryResult, error) {
 	if eventNotifier, ok := notifier.(IncidentEventNotifier); ok {
 		return eventNotifier.NotifyIncidentEvent(ctx, eventType, incident)
@@ -50,6 +56,7 @@ type DeliveryResult struct {
 	Target    string `json:"target"`
 	Status    string `json:"status"`
 	Error     string `json:"error,omitempty"`
+	ChannelID string `json:"-"`
 }
 
 type EmailRelay interface {
@@ -200,6 +207,14 @@ func (n ChannelNotifier) NotifyIncidentOpened(ctx context.Context, incident stor
 }
 
 func (n ChannelNotifier) NotifyIncidentEvent(ctx context.Context, eventType string, incident store.Incident) ([]DeliveryResult, error) {
+	return n.notifyIncidentEvent(ctx, eventType, incident, nil)
+}
+
+func (n ChannelNotifier) NotifyIncidentEventExceptChannels(ctx context.Context, eventType string, incident store.Incident, excludedChannelIDs map[string]struct{}) ([]DeliveryResult, error) {
+	return n.notifyIncidentEvent(ctx, eventType, incident, excludedChannelIDs)
+}
+
+func (n ChannelNotifier) notifyIncidentEvent(ctx context.Context, eventType string, incident store.Incident, excludedChannelIDs map[string]struct{}) ([]DeliveryResult, error) {
 	eventType = normalizedEventType(eventType)
 	if n.Store == nil {
 		if n.Fallback == nil {
@@ -212,12 +227,19 @@ func (n ChannelNotifier) NotifyIncidentEvent(ctx context.Context, eventType stri
 		return nil, err
 	}
 	results := make([]DeliveryResult, 0, len(channels))
+	matchedChannel := false
 	for _, channel := range channels {
 		if !channel.Enabled {
 			continue
 		}
 		if eventType != "admin.audit" && !matchesFilters(channel, incident, eventType) {
 			continue
+		}
+		matchedChannel = true
+		if channel.ID != "" {
+			if _, excluded := excludedChannelIDs[channel.ID]; excluded {
+				continue
+			}
 		}
 		timeout := n.Timeout
 		if channel.Type == "email" && n.EmailTimeout > 0 {
@@ -226,6 +248,7 @@ func (n ChannelNotifier) NotifyIncidentEvent(ctx context.Context, eventType stri
 		notifier := NotifierForChannelWithRelay(channel, timeout, n.RetryMax, n.RetryBaseDelay, n.HTTP, n.AllowPrivate, n.EmailRelay)
 		deliveries, _ := notifier.NotifyIncidentEvent(ctx, eventType, incident)
 		for _, delivery := range deliveries {
+			delivery.ChannelID = channel.ID
 			delivery.Channel = channel.Type
 			if channel.Type == "email" {
 				delivery.Target = channel.MaskedEmailTarget
@@ -235,7 +258,7 @@ func (n ChannelNotifier) NotifyIncidentEvent(ctx context.Context, eventType stri
 			results = append(results, delivery)
 		}
 	}
-	if len(results) == 0 && n.Fallback != nil {
+	if len(results) == 0 && !matchedChannel && n.Fallback != nil {
 		return NotifyIncidentEvent(ctx, n.Fallback, eventType, incident)
 	}
 	return results, nil
@@ -858,6 +881,7 @@ func NotificationActionLabel(action string) string {
 		"discord_configs.create":                "Discord BOT設定を作成",
 		"discord_configs.delete":                "Discord BOT設定を削除",
 		"discord_configs.update":                "Discord BOT設定を更新",
+		"diagnostics.run":                       "診断を再実行",
 		"caption_profiles.create":               "Captionプロファイルを作成",
 		"caption_profiles.delete":               "Captionプロファイルを削除",
 		"caption_profiles.update":               "Captionプロファイルを更新",
@@ -925,8 +949,10 @@ func NotificationActionLabel(action string) string {
 		"system_updates.failed":                 "システム更新に失敗",
 		"streams.create":                        "配信枠を作成",
 		"streams.discord_youtube_notify":        "DiscordへYouTube配信を通知",
+		"streams.force_stop":                    "配信を強制停止",
 		"streams.mark_failed":                   "配信を失敗状態に変更",
 		"streams.preview_link.create":           "プレビューリンクを作成",
+		"streams.rearm":                         "配信枠を待機状態に戻す",
 		"streams.retry_upload":                  "録画ファイルのアップロードを再試行",
 		"streams.start":                         "配信を開始",
 		"streams.stop":                          "配信を停止",

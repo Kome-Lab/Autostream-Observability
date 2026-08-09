@@ -142,10 +142,12 @@ type MetricSnapshot struct {
 type Store interface {
 	SaveSignal(ctx context.Context, signal Signal) (Signal, error)
 	ListSignals(ctx context.Context, limit int) ([]Signal, error)
+	GetSignal(ctx context.Context, id string) (Signal, error)
 	UpsertIncident(ctx context.Context, incident Incident) (Incident, bool, error)
 	ListIncidents(ctx context.Context) ([]Incident, error)
 	GetIncident(ctx context.Context, id string) (Incident, error)
 	UpdateIncidentStatus(ctx context.Context, id, status string) (Incident, error)
+	UpdateIncidentDiagnostic(ctx context.Context, id, expectedSignalID string, report diagnostics.Report) (Incident, bool, error)
 	SaveNotificationDelivery(ctx context.Context, delivery NotificationDelivery) (NotificationDelivery, error)
 	ListNotificationDeliveries(ctx context.Context) ([]NotificationDelivery, error)
 	ListNotificationChannels(ctx context.Context) ([]NotificationChannel, error)

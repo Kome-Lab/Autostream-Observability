@@ -309,6 +309,20 @@ func TestNotificationActionLabelsCoverControlPanelAuditVocabulary(t *testing.T) 
 	}
 }
 
+func TestNotificationTitlesUseJapaneseLabelsForDiagnosticsAndStreamRecoveryActions(t *testing.T) {
+	for action, want := range map[string]string{
+		"diagnostics.run":    "診断を再実行",
+		"streams.force_stop": "配信を強制停止",
+		"streams.rearm":      "配信枠を待機状態に戻す",
+	} {
+		t.Run(action, func(t *testing.T) {
+			if got := notificationTitle("admin.audit", store.Incident{Rule: action}); got != want {
+				t.Fatalf("notification title = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestDiscordEmbedStaysWithinTotalCharacterLimit(t *testing.T) {
 	incident := store.Incident{
 		Rule:      strings.Repeat("r", 5000),

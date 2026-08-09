@@ -18,6 +18,7 @@ import (
 
 	"github.com/example/autostream-observability/internal/auth"
 	"github.com/example/autostream-observability/internal/control"
+	"github.com/example/autostream-observability/internal/diagnostics"
 	"github.com/example/autostream-observability/internal/notifications"
 	"github.com/example/autostream-observability/internal/store"
 	"github.com/example/autostream-observability/internal/version"
@@ -360,6 +361,228 @@ func TestIncidentAcknowledgeAndResolve(t *testing.T) {
 	handler.ServeHTTP(resolveRes, resolveReq)
 	if resolveRes.Code != http.StatusOK || !strings.Contains(resolveRes.Body.String(), "resolved_at") {
 		t.Fatalf("resolve status = %d body = %s", resolveRes.Code, resolveRes.Body.String())
+	}
+}
+
+func TestRerunIncidentDiagnosticsReevaluatesSavedSignalWithoutSideEffects(t *testing.T) {
+	st := store.NewMemoryStore()
+	saved, err := st.SaveSignal(t.Context(), store.Signal{
+		ID:          "sig-rerun-01",
+		Type:        "error",
+		Name:        "encoder.process.exited",
+		ServiceID:   "enc-01",
+		ServiceType: "encoder_recorder",
+		StreamID:    "stream-01",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	incident, _, err := st.UpsertIncident(t.Context(), store.Incident{
+		Rule:      "encoder_process_exited",
+		Severity:  "critical",
+		Status:    "acknowledged",
+		SummaryJA: "Encoder stopped.",
+		ServiceID: "enc-01",
+		StreamID:  "stream-01",
+		SignalID:  saved.ID,
+		Report:    diagnostics.JapaneseReport("encoder_process_exited", []string{"stale=true"}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := st.CreateRemediationAction(t.Context(), store.RemediationAction{
+		IncidentID: incident.ID,
+		Action:     "rerun_diagnostics",
+		Mode:       "suggest_only",
+		Status:     "executed",
+		Result:     "recorded_noop",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier := &eventRecordingNotifier{}
+	executor := &fakeControlExecutor{}
+	admin := auth.WithRawTokenScopes(auth.Verifier{}, "diagnostics-token", "diagnostics.run")
+	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.Verifier{}, admin, notifier, executor)
+
+	req := httptest.NewRequest(http.MethodPost, "/incidents/"+incident.ID+"/diagnostics/rerun", nil)
+	req.Header.Set("Authorization", "Bearer diagnostics-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	updated, err := st.GetIncident(t.Context(), incident.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != "acknowledged" || updated.ResolvedAt != nil {
+		t.Fatalf("diagnostic rerun changed incident lifecycle: %#v", updated)
+	}
+	if !strings.Contains(strings.Join(updated.Report.Evidence, "\n"), "signal_id=sig-rerun-01") {
+		t.Fatalf("rerun did not rebuild diagnostics from saved signal: %#v", updated.Report)
+	}
+	if strings.Contains(strings.Join(updated.Report.Evidence, "\n"), "stale=true") {
+		t.Fatalf("rerun kept stale diagnostic evidence: %#v", updated.Report)
+	}
+	updatedAction, err := st.GetRemediationAction(t.Context(), action.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedAction.Status != "executed" || updatedAction.Result != "recorded_noop" || updatedAction.ExecutedAt != nil {
+		t.Fatalf("diagnostic rerun changed remediation state: %#v", updatedAction)
+	}
+	if len(notifier.events) != 0 {
+		t.Fatalf("diagnostic rerun must not notify: %#v", notifier.events)
+	}
+	if len(executor.calls) != 0 {
+		t.Fatalf("diagnostic rerun must not dispatch remediation: %#v", executor.calls)
+	}
+	deliveries, err := st.ListNotificationDeliveries(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 0 {
+		t.Fatalf("diagnostic rerun must not create notification deliveries: %#v", deliveries)
+	}
+}
+
+func TestRerunIncidentDiagnosticsRequiresDiagnosticsRunScope(t *testing.T) {
+	st := store.NewMemoryStore()
+	incident, _, err := st.UpsertIncident(t.Context(), store.Incident{Rule: "encoder_process_exited", Severity: "critical", Status: "open", SummaryJA: "Encoder stopped.", ServiceID: "enc-01", SignalID: "sig-01"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := auth.WithRawTokenScopes(auth.Verifier{}, "read-token", adminScopeRead)
+	handler := NewServerWithStoreAuthz("observability", st, auth.Verifier{}, admin)
+	req := httptest.NewRequest(http.MethodPost, "/incidents/"+incident.ID+"/diagnostics/rerun", nil)
+	req.Header.Set("Authorization", "Bearer read-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden || !strings.Contains(res.Body.String(), "missing_admin_scope") {
+		t.Fatalf("diagnostics.run scope must be required: status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestRerunIncidentDiagnosticsKeepsExistingReportWhenSavedSignalNoLongerMatches(t *testing.T) {
+	st := store.NewMemoryStore()
+	value := 60.0
+	saved, err := st.SaveSignal(t.Context(), store.Signal{
+		ID:          "sig-rerun-inconclusive",
+		Type:        "metric",
+		Name:        "encoder.output_fps",
+		ServiceID:   "enc-01",
+		ServiceType: "encoder_recorder",
+		StreamID:    "stream-01",
+		Value:       &value,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalReport := diagnostics.JapaneseReport("encoder_process_exited", []string{"original=true"})
+	incident, _, err := st.UpsertIncident(t.Context(), store.Incident{
+		Rule:      "encoder_process_exited",
+		Severity:  "critical",
+		Status:    "acknowledged",
+		SummaryJA: "Encoder stopped.",
+		ServiceID: "enc-01",
+		StreamID:  "stream-01",
+		SignalID:  saved.ID,
+		Report:    originalReport,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier := &eventRecordingNotifier{}
+	admin := auth.WithRawTokenScopes(auth.Verifier{}, "diagnostics-token", "diagnostics.run")
+	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.Verifier{}, admin, notifier, &fakeControlExecutor{})
+	req := httptest.NewRequest(http.MethodPost, "/incidents/"+incident.ID+"/diagnostics/rerun", nil)
+	req.Header.Set("Authorization", "Bearer diagnostics-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	var response diagnosticRerunResponse
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Outcome != "inconclusive" || response.Reason != "saved_signal_no_longer_matches_rule" {
+		t.Fatalf("unexpected inconclusive response: %#v", response)
+	}
+	updated, err := st.GetIncident(t.Context(), incident.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != incident.Status || !updated.UpdatedAt.Equal(incident.UpdatedAt) || strings.Join(updated.Report.Evidence, "\n") != strings.Join(originalReport.Evidence, "\n") {
+		t.Fatalf("inconclusive rerun mutated incident: %#v", updated)
+	}
+	if len(notifier.events) != 0 {
+		t.Fatalf("inconclusive rerun must not notify: %#v", notifier.events)
+	}
+}
+
+func TestRerunIncidentDiagnosticsDoesNotOverwriteNewerSignalReport(t *testing.T) {
+	memory := store.NewMemoryStore()
+	staleSignal, err := memory.SaveSignal(t.Context(), store.Signal{
+		ID:          "sig-rerun-stale",
+		Type:        "error",
+		Name:        "encoder.process.exited",
+		ServiceID:   "enc-01",
+		ServiceType: "encoder_recorder",
+		StreamID:    "stream-01",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newerSignal, err := memory.SaveSignal(t.Context(), store.Signal{
+		ID:          "sig-rerun-newer",
+		Type:        "error",
+		Name:        "encoder.process.exited",
+		ServiceID:   "enc-01",
+		ServiceType: "encoder_recorder",
+		StreamID:    "stream-01",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	incident, _, err := memory.UpsertIncident(t.Context(), store.Incident{
+		Rule:      "encoder_process_exited",
+		Severity:  "critical",
+		Status:    "open",
+		SummaryJA: "Encoder stopped.",
+		ServiceID: "enc-01",
+		StreamID:  "stream-01",
+		SignalID:  staleSignal.ID,
+		Report:    diagnostics.JapaneseReport("encoder_process_exited", []string{"signal_id=" + staleSignal.ID}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &diagnosticRaceStore{MemoryStore: memory, incident: incident, newerSignal: newerSignal}
+	admin := auth.WithRawTokenScopes(auth.Verifier{}, "diagnostics-token", "diagnostics.run")
+	handler := NewServerWithStoreAuthz("observability", st, auth.Verifier{}, admin)
+	req := httptest.NewRequest(http.MethodPost, "/incidents/"+incident.ID+"/diagnostics/rerun", nil)
+	req.Header.Set("Authorization", "Bearer diagnostics-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	var response diagnosticRerunResponse
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Outcome != "inconclusive" || response.Reason != "incident_updated_during_rerun" {
+		t.Fatalf("stale diagnostic rerun must be inconclusive: %#v", response)
+	}
+	updated, err := memory.GetIncident(t.Context(), incident.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.SignalID != newerSignal.ID || !strings.Contains(strings.Join(updated.Report.Evidence, "\n"), "signal_id="+newerSignal.ID) {
+		t.Fatalf("stale diagnostic rerun overwrote newer report: %#v", updated)
 	}
 }
 
@@ -941,6 +1164,145 @@ func TestCreateNotificationEventAcceptsExactControlPanelPayload(t *testing.T) {
 	}
 	if strings.Contains(res.Body.String(), "acct-01") || strings.Contains(res.Body.String(), "ops") {
 		t.Fatalf("notification event response should only include sanitized delivery results: %s", res.Body.String())
+	}
+}
+
+func TestCreateNotificationEventCoalescesDuplicateSemanticEventsAndKeepsLifecycleTransitions(t *testing.T) {
+	st := store.NewMemoryStore()
+	notifier := &eventRecordingNotifier{}
+	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), notifier, nil)
+
+	request := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(body))
+		req.Header.Set("Authorization", "Bearer admin-token")
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		return res
+	}
+
+	duplicate := `{"event_type":"diagnostic.created","severity":"warning","status":"open","action":"worker_event_send_failed","service_id":"worker-stk-skylab-01","resource_type":"stream","resource_id":"stream-01","summary":"Worker event delivery failed","details":"The same event was retried."}`
+	first := request(duplicate)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first event status = %d body = %s", first.Code, first.Body.String())
+	}
+	second := request(duplicate)
+	if second.Code != http.StatusAccepted {
+		t.Fatalf("duplicate event status = %d body = %s", second.Code, second.Body.String())
+	}
+	if len(notifier.events) != 1 || notifier.events[0] != "diagnostic.created" {
+		t.Fatalf("duplicate semantic event should not notify twice: %#v", notifier.events)
+	}
+	if !strings.Contains(second.Body.String(), `"status":"suppressed"`) {
+		t.Fatalf("duplicate event should report coalescing: %s", second.Body.String())
+	}
+
+	resolved := request(`{"event_type":"incident.resolved","severity":"warning","status":"resolved","action":"worker_event_send_failed","service_id":"worker-stk-skylab-01","resource_type":"stream","resource_id":"stream-01","summary":"Worker event delivery recovered"}`)
+	if resolved.Code != http.StatusAccepted {
+		t.Fatalf("resolved transition status = %d body = %s", resolved.Code, resolved.Body.String())
+	}
+	if len(notifier.events) != 2 || notifier.events[1] != "incident.resolved" {
+		t.Fatalf("distinct lifecycle transition must still notify: %#v", notifier.events)
+	}
+
+	deliveries, err := st.ListNotificationDeliveries(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 3 {
+		t.Fatalf("expected delivered, coalesced-audit, and resolved records: %#v", deliveries)
+	}
+	var suppressed store.NotificationDelivery
+	for _, delivery := range deliveries {
+		if delivery.Status == "suppressed" {
+			suppressed = delivery
+			break
+		}
+	}
+	if suppressed.EventType != "diagnostic.created" || suppressed.Metadata["suppression_reason"] != "duplicate_semantic_event" {
+		t.Fatalf("duplicate coalescing must remain auditable: %#v", suppressed)
+	}
+}
+
+func TestCreateNotificationEventRetriesPartialDeliveryWithoutSuppressingDiscordFailure(t *testing.T) {
+	st := store.NewMemoryStore()
+	emailRelay := &fakeEmailRelay{}
+	if _, err := st.CreateNotificationChannel(t.Context(), store.NotificationChannel{
+		Name:             "ops email",
+		Type:             "email",
+		Enabled:          true,
+		UseGlobalSMTP:    true,
+		UseGlobalSMTPSet: true,
+		EmailRecipients:  []string{"ops@example.com"},
+		SeverityFilter:   []string{"warning"},
+		EventTypeFilter:  []string{"diagnostic.created"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var discordCalls int
+	discord := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		discordCalls++
+		if discordCalls == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer discord.Close()
+	if _, err := st.CreateNotificationChannel(t.Context(), store.NotificationChannel{
+		Name:            "ops discord",
+		Type:            "discord",
+		Enabled:         true,
+		WebhookURL:      discord.URL + "/api/webhooks/id/secret-token",
+		SeverityFilter:  []string{"warning"},
+		EventTypeFilter: []string{"diagnostic.created"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	notifier := notifications.ChannelNotifier{Store: st, EmailRelay: emailRelay, Timeout: time.Second, EmailTimeout: time.Second, RetryMax: 0, HTTP: discord.Client(), AllowPrivate: true}
+	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), notifier, nil)
+
+	request := func() *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/notification-events", bytes.NewBufferString(`{"event_type":"diagnostic.created","severity":"warning","status":"open","action":"worker_event_send_failed","service_id":"worker-stk-skylab-01","resource_type":"stream","resource_id":"stream-01","summary":"Worker event delivery failed"}`))
+		req.Header.Set("Authorization", "Bearer admin-token")
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		return res
+	}
+
+	if first := request(); first.Code != http.StatusAccepted {
+		t.Fatalf("first event status = %d body = %s", first.Code, first.Body.String())
+	}
+	second := request()
+	if second.Code != http.StatusAccepted {
+		t.Fatalf("retry event status = %d body = %s", second.Code, second.Body.String())
+	}
+	if strings.Contains(second.Body.String(), `"status":"suppressed"`) {
+		t.Fatalf("failed Discord delivery was incorrectly coalesced: %s", second.Body.String())
+	}
+	if emailRelay.calls != 1 {
+		t.Fatalf("successful email was retried %d times, want 1", emailRelay.calls)
+	}
+	if discordCalls != 2 {
+		t.Fatalf("Discord attempts = %d, want 2", discordCalls)
+	}
+
+	deliveries, err := st.ListNotificationDeliveries(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 3 {
+		t.Fatalf("expected one email and two Discord delivery records, got %#v", deliveries)
+	}
+	discordStatuses := map[string]int{}
+	for _, delivery := range deliveries {
+		if delivery.Channel == "discord" {
+			discordStatuses[delivery.Status]++
+		}
+	}
+	if discordStatuses["failure"] != 1 || discordStatuses["success"] != 1 {
+		t.Fatalf("Discord must be retried after its partial failure: %#v", deliveries)
 	}
 }
 
@@ -2471,6 +2833,29 @@ func (p partialFailureNotifier) NotifyIncidentOpened(ctx context.Context, incide
 type fakeControlExecutor struct {
 	calls []control.RemediationRequest
 	err   error
+}
+
+type diagnosticRaceStore struct {
+	*store.MemoryStore
+	incident    store.Incident
+	newerSignal store.Signal
+}
+
+func (s *diagnosticRaceStore) UpdateIncidentDiagnostic(ctx context.Context, id, expectedSignalID string, report diagnostics.Report) (store.Incident, bool, error) {
+	_, _, err := s.MemoryStore.UpsertIncident(ctx, store.Incident{
+		Rule:      s.incident.Rule,
+		Severity:  s.incident.Severity,
+		Status:    s.incident.Status,
+		SummaryJA: s.incident.SummaryJA,
+		ServiceID: s.incident.ServiceID,
+		StreamID:  s.incident.StreamID,
+		SignalID:  s.newerSignal.ID,
+		Report:    diagnostics.JapaneseReport(s.incident.Rule, []string{"signal_id=" + s.newerSignal.ID}),
+	})
+	if err != nil {
+		return store.Incident{}, false, err
+	}
+	return s.MemoryStore.UpdateIncidentDiagnostic(ctx, id, expectedSignalID, report)
 }
 
 func (f *fakeControlExecutor) ExecuteRemediation(ctx context.Context, req control.RemediationRequest) error {

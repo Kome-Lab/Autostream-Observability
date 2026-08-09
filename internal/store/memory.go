@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/example/autostream-observability/internal/diagnostics"
 )
 
 type MemoryStore struct {
@@ -60,6 +62,24 @@ func (s *MemoryStore) ListSignals(ctx context.Context, limit int) ([]Signal, err
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (s *MemoryStore) GetSignal(ctx context.Context, id string) (Signal, error) {
+	if err := ctx.Err(); err != nil {
+		return Signal{}, err
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Signal{}, ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, signal := range s.signals {
+		if signal.ID == id {
+			return signal, nil
+		}
+	}
+	return Signal{}, ErrNotFound
 }
 
 func (s *MemoryStore) UpsertIncident(ctx context.Context, incident Incident) (Incident, bool, error) {
@@ -143,6 +163,32 @@ func (s *MemoryStore) UpdateIncidentStatus(ctx context.Context, id, status strin
 		return incident, nil
 	}
 	return Incident{}, ErrNotFound
+}
+
+func (s *MemoryStore) UpdateIncidentDiagnostic(ctx context.Context, id, expectedSignalID string, report diagnostics.Report) (Incident, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Incident{}, false, err
+	}
+	id = strings.TrimSpace(id)
+	expectedSignalID = strings.TrimSpace(expectedSignalID)
+	if id == "" || expectedSignalID == "" {
+		return Incident{}, false, ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, incident := range s.incidents {
+		if incident.ID != id {
+			continue
+		}
+		if incident.SignalID != expectedSignalID {
+			return incident, false, nil
+		}
+		incident.Report = report
+		incident.UpdatedAt = time.Now().UTC()
+		s.incidents[key] = incident
+		return incident, true, nil
+	}
+	return Incident{}, false, ErrNotFound
 }
 
 func (s *MemoryStore) SaveNotificationDelivery(ctx context.Context, delivery NotificationDelivery) (NotificationDelivery, error) {

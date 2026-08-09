@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+
+	"github.com/example/autostream-observability/internal/diagnostics"
 )
 
 type MariaDBStore struct {
@@ -136,6 +138,19 @@ FROM signals ORDER BY created_at DESC LIMIT ?`, limit)
 	return out, rows.Err()
 }
 
+func (s MariaDBStore) GetSignal(ctx context.Context, id string) (Signal, error) {
+	if err := ctx.Err(); err != nil {
+		return Signal{}, err
+	}
+	row := s.DB.QueryRowContext(ctx, `SELECT id, signal_type, name, service_id, service_type, COALESCE(stream_id, ''), COALESCE(status, ''), value_double, attributes, occurred_at, created_at
+FROM signals WHERE id = ?`, strings.TrimSpace(id))
+	signal, err := scanSignal(row)
+	if err == sql.ErrNoRows {
+		return Signal{}, ErrNotFound
+	}
+	return signal, err
+}
+
 func (s MariaDBStore) UpsertIncident(ctx context.Context, incident Incident) (Incident, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return Incident{}, false, err
@@ -261,6 +276,38 @@ func (s MariaDBStore) UpdateIncidentStatus(ctx context.Context, id, status strin
 		return Incident{}, ErrNotFound
 	}
 	return s.GetIncident(ctx, id)
+}
+
+func (s MariaDBStore) UpdateIncidentDiagnostic(ctx context.Context, id, expectedSignalID string, report diagnostics.Report) (Incident, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Incident{}, false, err
+	}
+	reportRaw, err := json.Marshal(report)
+	if err != nil {
+		return Incident{}, false, err
+	}
+	id = strings.TrimSpace(id)
+	expectedSignalID = strings.TrimSpace(expectedSignalID)
+	if id == "" || expectedSignalID == "" {
+		return Incident{}, false, ErrNotFound
+	}
+	result, err := s.DB.ExecContext(ctx, `UPDATE incidents SET diagnostic_report = ?, updated_at = ? WHERE id = ? AND signal_id = ?`, string(reportRaw), time.Now().UTC(), id, expectedSignalID)
+	if err != nil {
+		return Incident{}, false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return Incident{}, false, err
+	}
+	if affected == 0 {
+		current, getErr := s.GetIncident(ctx, id)
+		if getErr != nil {
+			return Incident{}, false, getErr
+		}
+		return current, false, nil
+	}
+	incident, err := s.GetIncident(ctx, id)
+	return incident, true, err
 }
 
 func (s MariaDBStore) SaveNotificationDelivery(ctx context.Context, delivery NotificationDelivery) (NotificationDelivery, error) {
@@ -612,6 +659,28 @@ func incidentDedupeKey(rule, serviceID, streamID string) string {
 
 type incidentScanner interface {
 	Scan(dest ...any) error
+}
+
+type signalScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanSignal(scanner signalScanner) (Signal, error) {
+	var signal Signal
+	var value sql.NullFloat64
+	var attrsRaw []byte
+	if err := scanner.Scan(&signal.ID, &signal.Type, &signal.Name, &signal.ServiceID, &signal.ServiceType, &signal.StreamID, &signal.Status, &value, &attrsRaw, &signal.Timestamp, &signal.CreatedAt); err != nil {
+		return Signal{}, err
+	}
+	if value.Valid {
+		parsed := value.Float64
+		signal.Value = &parsed
+	}
+	signal.Attributes = map[string]any{}
+	if len(attrsRaw) > 0 {
+		_ = json.Unmarshal(attrsRaw, &signal.Attributes)
+	}
+	return signal, nil
 }
 
 type notificationChannelScanner interface {

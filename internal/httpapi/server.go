@@ -46,16 +46,17 @@ var notificationActionPattern = regexp.MustCompile(`^[A-Za-z0-9_]+(?:\.[A-Za-z0-
 var notificationResourceTypePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 type Server struct {
-	serviceType     string
-	updaterIdentity *UpdaterIdentityLatch
-	store           store.Store
-	ingestAuth      auth.Verifier
-	adminAuth       auth.Verifier
-	notifier        notifications.Notifier
-	emailRelay      notifications.EmailRelay
-	executor        controlExecutor
-	rateLimiter     *rateLimiter
-	logger          *log.Logger
+	serviceType        string
+	updaterIdentity    *UpdaterIdentityLatch
+	store              store.Store
+	ingestAuth         auth.Verifier
+	adminAuth          auth.Verifier
+	notifier           notifications.Notifier
+	emailRelay         notifications.EmailRelay
+	executor           controlExecutor
+	rateLimiter        *rateLimiter
+	logger             *log.Logger
+	notificationDedupe notificationDeduper
 }
 
 const maxJSONBodyBytes = 64 << 10
@@ -64,6 +65,7 @@ const (
 	adminScopeRead                = "observability.read"
 	adminScopeIngest              = "observability.ingest"
 	adminScopeIncidentsUpdate     = "incidents.update"
+	adminScopeDiagnosticsRun      = "diagnostics.run"
 	adminScopeNotificationsRead   = "notifications.read"
 	adminScopeNotificationsManage = "notifications.manage"
 	adminScopeRemediationRead     = "remediation.read"
@@ -108,6 +110,12 @@ type DiagnosticReportView struct {
 	StreamID   string             `json:"stream_id,omitempty"`
 	Report     diagnostics.Report `json:"diagnostic_report"`
 	UpdatedAt  time.Time          `json:"updated_at"`
+}
+
+type diagnosticRerunResponse struct {
+	Incident store.Incident `json:"incident"`
+	Outcome  string         `json:"outcome"`
+	Reason   string         `json:"reason,omitempty"`
 }
 
 type notificationChannelRequest struct {
@@ -211,6 +219,7 @@ func NewServerWithStoreAuthzNotifierExecutorEmailRelayAndUpdaterIdentity(service
 	mux.HandleFunc("GET /diagnostics", s.listDiagnostics)
 	mux.HandleFunc("GET /incidents", s.listIncidents)
 	mux.HandleFunc("GET /incidents/{id}", s.getIncident)
+	mux.HandleFunc("POST /incidents/{id}/diagnostics/rerun", s.rerunIncidentDiagnostics)
 	mux.HandleFunc("POST /incidents/{id}/acknowledge", s.acknowledgeIncident)
 	mux.HandleFunc("POST /incidents/{id}/resolve", s.resolveIncident)
 	mux.HandleFunc("GET /notification-deliveries", s.listNotificationDeliveries)
@@ -442,6 +451,53 @@ func (s *Server) getIncident(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, incident)
+}
+
+func (s *Server) rerunIncidentDiagnostics(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeAdmin(w, r, adminScopeDiagnosticsRun) {
+		return
+	}
+	incident, err := s.store.GetIncident(r.Context(), r.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"code": "not_found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "get_incident_failed"})
+		return
+	}
+	if strings.TrimSpace(incident.SignalID) == "" {
+		writeJSON(w, http.StatusOK, diagnosticRerunResponse{Incident: incident, Outcome: "inconclusive", Reason: "saved_signal_missing"})
+		return
+	}
+	signal, err := s.store.GetSignal(r.Context(), incident.SignalID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, http.StatusOK, diagnosticRerunResponse{Incident: incident, Outcome: "inconclusive", Reason: "saved_signal_not_found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "get_saved_signal_failed"})
+		return
+	}
+	report, matched := diagnosticReportForSavedSignal(incident, signal)
+	if !matched {
+		writeJSON(w, http.StatusOK, diagnosticRerunResponse{Incident: incident, Outcome: "inconclusive", Reason: "saved_signal_no_longer_matches_rule"})
+		return
+	}
+	updated, reportUpdated, err := s.store.UpdateIncidentDiagnostic(r.Context(), incident.ID, incident.SignalID, report)
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"code": "not_found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "update_diagnostic_report_failed"})
+		return
+	}
+	if !reportUpdated {
+		writeJSON(w, http.StatusOK, diagnosticRerunResponse{Incident: updated, Outcome: "inconclusive", Reason: "incident_updated_during_rerun"})
+		return
+	}
+	writeJSON(w, http.StatusOK, diagnosticRerunResponse{Incident: updated, Outcome: "evaluated"})
 }
 
 func (s *Server) acknowledgeIncident(w http.ResponseWriter, r *http.Request) {
@@ -1220,31 +1276,10 @@ func requiresControlPanelDispatch(action string) bool {
 }
 
 func (s *Server) evaluateAndStoreIncidents(r *http.Request, signal store.Signal) ([]store.Incident, error) {
-	value := 0.0
-	if signal.Value != nil {
-		value = *signal.Value
-	}
-	streamLive := signal.Attributes["stream_live"] == true || signal.Status == "live"
-	detected := detection.Evaluate(detection.Signal{
-		Type:       signal.Type,
-		Name:       signal.Name,
-		Value:      value,
-		StreamID:   signal.StreamID,
-		StreamLive: streamLive,
-		Status:     signal.Status,
-		Attributes: signal.Attributes,
-	})
+	detected := detectSignal(signal)
 	out := make([]store.Incident, 0, len(detected))
 	for _, detectedIncident := range detected {
-		evidence := []string{
-			"signal_id=" + signal.ID,
-			"signal_name=" + signal.Name,
-			"service_id=" + signal.ServiceID,
-		}
-		if signal.StreamID != "" {
-			evidence = append(evidence, "stream_id="+signal.StreamID)
-		}
-		evidence = append(evidence, safeAttributeEvidence(signal.Attributes)...)
+		evidence := diagnosticEvidence(signal)
 		incident := store.Incident{
 			Rule:      detectedIncident.Rule,
 			Severity:  detectedIncident.Severity,
@@ -1268,6 +1303,44 @@ func (s *Server) evaluateAndStoreIncidents(r *http.Request, signal store.Signal)
 		out = append(out, stored)
 	}
 	return out, nil
+}
+
+func diagnosticReportForSavedSignal(incident store.Incident, signal store.Signal) (diagnostics.Report, bool) {
+	for _, detected := range detectSignal(signal) {
+		if detected.Rule == incident.Rule {
+			return diagnostics.JapaneseReport(detected.Rule, diagnosticEvidence(signal)), true
+		}
+	}
+	return diagnostics.Report{}, false
+}
+
+func detectSignal(signal store.Signal) []detection.Incident {
+	value := 0.0
+	if signal.Value != nil {
+		value = *signal.Value
+	}
+	streamLive := signal.Attributes["stream_live"] == true || signal.Status == "live"
+	return detection.Evaluate(detection.Signal{
+		Type:       signal.Type,
+		Name:       signal.Name,
+		Value:      value,
+		StreamID:   signal.StreamID,
+		StreamLive: streamLive,
+		Status:     signal.Status,
+		Attributes: signal.Attributes,
+	})
+}
+
+func diagnosticEvidence(signal store.Signal) []string {
+	evidence := []string{
+		"signal_id=" + signal.ID,
+		"signal_name=" + signal.Name,
+		"service_id=" + signal.ServiceID,
+	}
+	if signal.StreamID != "" {
+		evidence = append(evidence, "stream_id="+signal.StreamID)
+	}
+	return append(evidence, safeAttributeEvidence(signal.Attributes)...)
 }
 
 func safeAttributeEvidence(attributes map[string]any) []string {
@@ -1487,18 +1560,79 @@ func (s *Server) deliverNotificationEvent(r *http.Request, eventType string, inc
 	if s.notifier == nil {
 		return nil
 	}
+	reservation := s.notificationDedupe.reserve(eventType, incident, time.Now().UTC())
+	if !reservation.allowed {
+		if reservation.recordSuppression {
+			s.saveSuppressedNotificationDelivery(r, eventType, incident, reservation.suppressionCount)
+		}
+		return []notifications.DeliveryResult{{
+			EventType: eventType,
+			Channel:   "dedupe",
+			Target:    "<NOTIFICATION_DEDUPLICATED>",
+			Status:    "suppressed",
+		}}
+	}
 	// Notification delivery must not be canceled just because the originating
 	// HTTP client used a shorter request timeout. Keep request values, detach
 	// cancellation, and retain a hard deadline so a stuck provider cannot keep
 	// the handler alive indefinitely.
 	deliveryContext, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), notificationFanoutTimeout)
 	defer cancel()
-	results, err := notifications.NotifyIncidentEvent(deliveryContext, s.notifier, eventType, incident)
+	var results []notifications.DeliveryResult
+	var err error
+	if selectiveNotifier, ok := s.notifier.(notifications.ChannelSelectiveIncidentEventNotifier); ok && len(reservation.successfulChannelIDs) > 0 {
+		results, err = selectiveNotifier.NotifyIncidentEventExceptChannels(deliveryContext, eventType, incident, reservation.successfulChannelIDs)
+	} else {
+		results, err = notifications.NotifyIncidentEvent(deliveryContext, s.notifier, eventType, incident)
+	}
 	if err != nil && len(results) == 0 {
 		results = []notifications.DeliveryResult{{EventType: eventType, Channel: "generic", Target: "<WEBHOOK_URL>", Status: "failure", Error: notifications.SanitizeDeliveryError(err)}}
 	}
+	s.notificationDedupe.complete(reservation, results)
 	s.saveNotificationDeliveryResults(deliveryContext, eventType, incident, results)
 	return results
+}
+
+func notificationDeliverySucceeded(results []notifications.DeliveryResult) bool {
+	// Keep a semantic event eligible for another fan-out until every selected
+	// destination accepts it. In particular, a successful email must not cause
+	// a failed Discord delivery to be suppressed by the short dedupe window.
+	if len(results) == 0 {
+		return false
+	}
+	for _, result := range results {
+		status := strings.TrimSpace(result.Status)
+		if strings.TrimSpace(result.Error) != "" || (status != "" && !strings.EqualFold(status, "success")) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) saveSuppressedNotificationDelivery(r *http.Request, eventType string, incident store.Incident, suppressionCount int) {
+	if s.store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), notificationFanoutTimeout)
+	defer cancel()
+	metadata := notificationDeliveryMetadata(eventType, incident)
+	metadata["suppression_reason"] = "duplicate_semantic_event"
+	metadata["suppression_count_at_record"] = suppressionCount
+	metadata["coalescing_active"] = true
+	if _, err := s.store.SaveNotificationDelivery(ctx, store.NotificationDelivery{
+		EventType:  eventType,
+		Channel:    "dedupe",
+		Target:     "<NOTIFICATION_DEDUPLICATED>",
+		IncidentID: incident.ID,
+		Status:     "suppressed",
+		Metadata:   metadata,
+	}); err != nil {
+		logger := s.logger
+		if logger == nil {
+			logger = log.Default()
+		}
+		logger.Printf("notification coalescing audit save failed: event_type=%q", eventType)
+	}
 }
 
 func (s *Server) saveNotificationDeliveryResults(ctx context.Context, eventType string, incident store.Incident, results []notifications.DeliveryResult) {
@@ -1517,17 +1651,7 @@ func (s *Server) saveNotificationDeliveryResults(ctx context.Context, eventType 
 		if result.EventType == "" {
 			result.EventType = eventType
 		}
-		metadata := map[string]any{
-			"severity": incident.Severity,
-			"rule":     incident.Rule,
-			"summary":  incident.SummaryJA,
-		}
-		if result.EventType == "admin.audit" {
-			metadata["action"] = incident.Rule
-		}
-		if !incident.UpdatedAt.IsZero() {
-			metadata["occurred_at"] = incident.UpdatedAt.UTC().Format(time.RFC3339)
-		}
+		metadata := notificationDeliveryMetadata(result.EventType, incident)
 		_, err := s.store.SaveNotificationDelivery(ctx, store.NotificationDelivery{
 			EventType:  result.EventType,
 			Channel:    result.Channel,
@@ -1545,6 +1669,33 @@ func (s *Server) saveNotificationDeliveryResults(ctx context.Context, eventType 
 			logger.Printf("notification delivery history save failed: event_type=%q channel=%q status=%q", result.EventType, result.Channel, status)
 		}
 	}
+}
+
+func notificationDeliveryMetadata(eventType string, incident store.Incident) map[string]any {
+	metadata := map[string]any{
+		"severity": incident.Severity,
+		"rule":     incident.Rule,
+		"summary":  incident.SummaryJA,
+	}
+	if incident.ServiceID != "" {
+		metadata["service_id"] = incident.ServiceID
+	}
+	if incident.StreamID != "" {
+		metadata["stream_id"] = incident.StreamID
+	}
+	if incident.NotificationResourceType != "" {
+		metadata["resource_type"] = incident.NotificationResourceType
+	}
+	if incident.NotificationResourceID != "" {
+		metadata["resource_id"] = incident.NotificationResourceID
+	}
+	if eventType == "admin.audit" {
+		metadata["action"] = incident.Rule
+	}
+	if !incident.UpdatedAt.IsZero() {
+		metadata["occurred_at"] = incident.UpdatedAt.UTC().Format(time.RFC3339)
+	}
+	return metadata
 }
 
 func metricSnapshots(signals []store.Signal) []store.MetricSnapshot {
@@ -1730,7 +1881,7 @@ func isRateLimitedEndpoint(r *http.Request) bool {
 		if path == "/heartbeat" || path == "/signals" || path == "/notification-channels" || path == "/notification-events" {
 			return true
 		}
-		if strings.HasPrefix(path, "/incidents/") && (strings.HasSuffix(path, "/acknowledge") || strings.HasSuffix(path, "/resolve")) {
+		if strings.HasPrefix(path, "/incidents/") && (strings.HasSuffix(path, "/acknowledge") || strings.HasSuffix(path, "/resolve") || strings.HasSuffix(path, "/diagnostics/rerun")) {
 			return true
 		}
 		if strings.HasPrefix(path, "/notification-channels/") && strings.HasSuffix(path, "/test") {
@@ -1767,6 +1918,9 @@ func rateLimitPath(r *http.Request) string {
 	}
 	if strings.HasPrefix(path, "/incidents/") && strings.HasSuffix(path, "/resolve") {
 		return "/incidents/{id}/resolve"
+	}
+	if strings.HasPrefix(path, "/incidents/") && strings.HasSuffix(path, "/diagnostics/rerun") {
+		return "/incidents/{id}/diagnostics/rerun"
 	}
 	if strings.HasPrefix(path, "/notification-channels/") && strings.HasSuffix(path, "/test") {
 		return "/notification-channels/{id}/test"
