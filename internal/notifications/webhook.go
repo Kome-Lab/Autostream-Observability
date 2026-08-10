@@ -978,6 +978,8 @@ func NotificationActionLabel(action string) string {
 		"youtube_outputs.delete":                "YouTube出力を削除",
 		"youtube_outputs.update":                "YouTube出力を更新",
 	}
+	labels["streams.youtube_relay_static_recovery.resolve"] = "固定リレー配信の復旧を解決済みに変更"
+	labels["youtube.relay_static_cleanup"] = "YouTube固定リレーの後始末を実行"
 	if label := labels[action]; label != "" {
 		return label
 	}

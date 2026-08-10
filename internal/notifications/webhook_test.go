@@ -297,10 +297,12 @@ func TestNotificationActionLabelsCoverControlPanelAuditVocabulary(t *testing.T) 
 		"streams.discord_youtube_notify",
 		"streams.retry_upload",
 		"streams.worker_event_test",
+		"streams.youtube_relay_static_recovery.resolve",
 		"users.email_welcome",
 		"users.force_password_change",
 		"users.oauth_link.delete",
 		"workers.unassign",
+		"youtube.relay_static_cleanup",
 	}
 	for _, action := range actions {
 		if label := NotificationActionLabel(action); label == action || label == "" {
@@ -316,6 +318,22 @@ func TestNotificationTitlesUseJapaneseLabelsForDiagnosticsAndStreamRecoveryActio
 		"streams.rearm":      "配信枠を待機状態に戻す",
 	} {
 		t.Run(action, func(t *testing.T) {
+			if got := notificationTitle("admin.audit", store.Incident{Rule: action}); got != want {
+				t.Fatalf("notification title = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRelayStaticAuditActionsUseJapaneseNotificationLabels(t *testing.T) {
+	for action, want := range map[string]string{
+		"youtube.relay_static_cleanup":                  "YouTube固定リレーの後始末を実行",
+		"streams.youtube_relay_static_recovery.resolve": "固定リレー配信の復旧を解決済みに変更",
+	} {
+		t.Run(action, func(t *testing.T) {
+			if got := NotificationActionLabel(action); got != want {
+				t.Fatalf("notification action label = %q, want %q", got, want)
+			}
 			if got := notificationTitle("admin.audit", store.Incident{Rule: action}); got != want {
 				t.Fatalf("notification title = %q, want %q", got, want)
 			}
