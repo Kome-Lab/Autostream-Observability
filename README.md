@@ -5,7 +5,7 @@ Distributed observability service for AutoStream incidents, diagnostics, remedia
 ## Features
 
 - Signal ingest for service health, metrics, warnings, and errors.
-- Rule-based detection and incident deduplication.
+- Rule-based detection, active-incident deduplication, and signal-driven recovery.
 - Diagnostic reports and remediation action records.
 - Discord, Slack, generic webhook, and email notification channels.
 - Secret-safe notification delivery history for the Control Panel.
@@ -72,9 +72,11 @@ $env:AUTOSTREAM_OBSERVABILITY_CONTAINER_PORT = "18080"
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
-Control Panel calls Observability with the Node Runtime Token stored in the Panel-generated `AUTOSTREAM_NODE_CONFIG`. Do not configure a separate Observability admin token or direct ingest token.
+Control Panel calls Observability with the Node Runtime Token stored in the Panel-generated `AUTOSTREAM_NODE_CONFIG`. Do not configure a separate Observability admin token or direct ingest token. Email channels relay through Control Panel and therefore require the `notifications.email.send` scope. Current Control Panel migrations add this scope to existing active Observability tokens; newly issued tokens include it from the start.
 
-The Observability service does not serve a browser UI. `GET /` and `GET /status` return safe operator status JSON. `GET /updater/version` returns the embedded release version together with the Control Panel service identity and applied config revision for the loopback local executor. API data such as `GET /metrics` is token protected and is normally read through the Control Panel `/observability/metrics` proxy. A browser request to `/metrics` without the Node Runtime Token should return an authorization error.
+The Observability service does not serve a browser UI. `GET /` and `GET /status` return safe operator status JSON. `GET /updater/version` returns the embedded release version together with the Control Panel service identity and applied config revision for the loopback local executor. API data such as `GET /metrics` is token protected and is normally read through the Control Panel `/observability/metrics` proxy. `GET /metrics?range_sec=<seconds>` returns bounded history for the requested 15-minute to 3-hour range instead of only process-local browser history. A browser request to `/metrics` without the Node Runtime Token should return an authorization error.
+
+An incident dedupe key is unique only while the incident is active. A matching failure increments its occurrence count and last-seen timestamp. A matching healthy signal resolves the active incident with recovery provenance, clears the active dedupe key, and preserves the old incident row so a later recurrence creates a new incident instead of overwriting history. Terminal incidents cannot be reopened by a stale status update.
 
 ## Platform and Metrics Reporting
 

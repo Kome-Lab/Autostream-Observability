@@ -3,6 +3,7 @@ package notifications
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -236,7 +237,7 @@ func (n ChannelNotifier) notifyIncidentEvent(ctx context.Context, eventType stri
 			continue
 		}
 		matchedChannel = true
-		if channel.ID != "" {
+		if channel.ID != "" && channel.Type != "email" {
 			if _, excluded := excludedChannelIDs[channel.ID]; excluded {
 				continue
 			}
@@ -245,23 +246,44 @@ func (n ChannelNotifier) notifyIncidentEvent(ctx context.Context, eventType stri
 		if channel.Type == "email" && n.EmailTimeout > 0 {
 			timeout = n.EmailTimeout
 		}
-		notifier := NotifierForChannelWithRelay(channel, timeout, n.RetryMax, n.RetryBaseDelay, n.HTTP, n.AllowPrivate, n.EmailRelay)
-		deliveries, _ := notifier.NotifyIncidentEvent(ctx, eventType, incident)
-		for _, delivery := range deliveries {
-			delivery.ChannelID = channel.ID
-			delivery.Channel = channel.Type
-			if channel.Type == "email" {
-				delivery.Target = channel.MaskedEmailTarget
-			} else {
-				delivery.Target = channel.MaskedWebhookURL
+		channelDestinations := []store.NotificationChannel{channel}
+		if channel.Type == "email" {
+			channelDestinations = make([]store.NotificationChannel, 0, len(channel.EmailRecipients))
+			for _, recipient := range channel.EmailRecipients {
+				destinationID := emailDestinationID(channel.ID, recipient)
+				if _, excluded := excludedChannelIDs[destinationID]; excluded {
+					continue
+				}
+				destination := channel
+				destination.EmailRecipients = []string{recipient}
+				channelDestinations = append(channelDestinations, destination)
 			}
-			results = append(results, delivery)
+		}
+		for _, destination := range channelDestinations {
+			notifier := NotifierForChannelWithRelay(destination, timeout, n.RetryMax, n.RetryBaseDelay, n.HTTP, n.AllowPrivate, n.EmailRelay)
+			deliveries, _ := notifier.NotifyIncidentEvent(ctx, eventType, incident)
+			for _, delivery := range deliveries {
+				delivery.ChannelID = channel.ID
+				delivery.Channel = channel.Type
+				if channel.Type == "email" {
+					delivery.ChannelID = emailDestinationID(channel.ID, destination.EmailRecipients[0])
+					delivery.Target = channel.MaskedEmailTarget
+				} else {
+					delivery.Target = channel.MaskedWebhookURL
+				}
+				results = append(results, delivery)
+			}
 		}
 	}
 	if len(results) == 0 && !matchedChannel && n.Fallback != nil {
 		return NotifyIncidentEvent(ctx, n.Fallback, eventType, incident)
 	}
 	return results, nil
+}
+
+func emailDestinationID(channelID, recipient string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(recipient))))
+	return strings.TrimSpace(channelID) + "/recipient/" + fmt.Sprintf("%x", sum[:8])
 }
 
 func NotifierForChannel(channel store.NotificationChannel, timeout time.Duration, retryMax int, retryBaseDelay time.Duration, client *http.Client, allowPrivate bool) IncidentEventNotifier {
@@ -651,10 +673,7 @@ func (n WebhookNotifier) payload(eventType string, incident store.Incident) map[
 			"blocks": slackNotificationBlocks(eventType, incident),
 		}
 	default:
-		summary := incident.SummaryJA
-		if sourceSummary := strings.TrimSpace(incident.SourceSummary); sourceSummary != "" {
-			summary = sourceSummary
-		}
+		content := buildNotificationContent(eventType, incident)
 		// Keep the original summary fields for existing consumers, while also
 		// exposing the same structured context used by Discord, Slack, and email.
 		// This prevents generic webhook receivers from having to parse Japanese
@@ -673,15 +692,15 @@ func (n WebhookNotifier) payload(eventType string, incident store.Incident) map[
 			"stream_id":      incident.StreamID,
 			"target":         notificationTargetValue(incident),
 			"actor":          notificationActorValue(incident),
-			"summary":        summary,
-			"details":        truncateNotificationText(notificationAdditionalDetails(eventType, incident), 6000),
+			"summary":        content.Summary,
+			"details":        truncateNotificationText(content.Diagnosis, 6000),
 			"occurred_at":    notificationTimestamp(incident),
 		}
-		if actions := compactNotificationList(incident.Report.RecommendedActions); len(actions) > 0 {
-			payload["recommended_actions"] = actions
+		if len(content.Actions) > 0 {
+			payload["recommended_actions"] = content.Actions
 		}
-		if evidence := compactNotificationList(incident.Report.Evidence); len(evidence) > 0 {
-			payload["evidence"] = evidence
+		if len(content.Evidence) > 0 {
+			payload["evidence"] = content.Evidence
 		}
 		return payload
 	}
@@ -696,6 +715,7 @@ func escapeSlackText(value string) string {
 }
 
 func formatIncidentText(eventType string, incident store.Incident) string {
+	content := buildNotificationContent(eventType, incident)
 	parts := []string{notificationTitle(eventType, incident), ""}
 	for _, field := range notificationMessageFields(eventType, incident) {
 		parts = append(parts, field.Name+": "+field.Value)
@@ -703,8 +723,14 @@ func formatIncidentText(eventType string, incident store.Incident) string {
 	if timestamp := notificationTimestamp(incident); timestamp != "" {
 		parts = append(parts, "日時: "+timestamp)
 	}
-	if description := notificationDescription(eventType, incident); description != "" {
+	if description := joinNotificationDetails(content.Summary, content.Diagnosis); description != "" {
 		parts = append(parts, "", "詳細", description)
+	}
+	if len(content.Actions) > 0 {
+		parts = append(parts, "", "推奨対応", "- "+strings.Join(content.Actions, "\n- "))
+	}
+	if len(content.Evidence) > 0 {
+		parts = append(parts, "", "根拠", "- "+strings.Join(content.Evidence, "\n- "))
 	}
 	return strings.Join(parts, "\n")
 }
@@ -715,7 +741,8 @@ func formatIncidentEmailText(eventType string, incident store.Incident) string {
 
 func formatIncidentHTML(eventType string, incident store.Incident) string {
 	title := truncateNotificationText(notificationTitle(eventType, incident), 256)
-	summary := truncateNotificationText(notificationDescription(eventType, incident), 12000)
+	content := buildNotificationContent(eventType, incident)
+	summary := truncateNotificationText(joinNotificationDetails(content.Summary, content.Diagnosis), 12000)
 	if summary == "" {
 		summary = "詳細情報はありません。"
 	}
@@ -728,6 +755,13 @@ func formatIncidentHTML(eventType string, incident store.Incident) string {
 		rows.WriteString(formatEmailHTMLText(truncateNotificationText(field.Value, 2048)))
 		rows.WriteString(`</td></tr>`)
 	}
+	var detailSections strings.Builder
+	if len(content.Actions) > 0 {
+		detailSections.WriteString(notificationHTMLSection("推奨対応", "• "+strings.Join(content.Actions, "\n• ")))
+	}
+	if len(content.Evidence) > 0 {
+		detailSections.WriteString(notificationHTMLSection("根拠", "• "+strings.Join(content.Evidence, "\n• ")))
+	}
 
 	return `<!doctype html><html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>` +
 		`<body style="margin:0;padding:0;background:#f2f4f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#101828;">` +
@@ -738,9 +772,14 @@ func formatIncidentHTML(eventType string, incident store.Incident) string {
 		`<h1 style="margin:8px 0 0;font-size:22px;line-height:1.35;color:#101828;">` + html.EscapeString(title) + `</h1></td></tr>` +
 		`<tr><td style="padding:0 24px 18px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e4e7ec;border-radius:8px;border-collapse:separate;border-spacing:0;overflow:hidden;">` + rows.String() + `</table></td></tr>` +
 		`<tr><td style="padding:0 24px 24px;"><div style="margin-bottom:8px;color:#475467;font-size:13px;font-weight:700;">概要</div>` +
-		`<div style="padding:14px 16px;background:#f9fafb;border-radius:8px;color:#344054;font-size:14px;line-height:1.65;word-break:break-word;">` + formatEmailHTMLText(summary) + `</div></td></tr>` +
+		`<div style="padding:14px 16px;background:#f9fafb;border-radius:8px;color:#344054;font-size:14px;line-height:1.65;word-break:break-word;">` + formatEmailHTMLText(summary) + `</div></td></tr>` + detailSections.String() +
 		`<tr><td style="padding:14px 24px;background:#f9fafb;border-top:1px solid #e4e7ec;color:#667085;font-size:12px;">AutoStream Control Panel から送信された通知です。</td></tr>` +
 		`</table></td></tr></table></body></html>`
+}
+
+func notificationHTMLSection(title, value string) string {
+	return `<tr><td style="padding:0 24px 24px;"><div style="margin-bottom:8px;color:#475467;font-size:13px;font-weight:700;">` + html.EscapeString(title) + `</div>` +
+		`<div style="padding:14px 16px;background:#f9fafb;border-radius:8px;color:#344054;font-size:14px;line-height:1.65;word-break:break-word;">` + formatEmailHTMLText(value) + `</div></td></tr>`
 }
 
 func emailNotificationFields(eventType string, incident store.Incident) []notificationMessageField {
@@ -1156,6 +1195,13 @@ func discordNotificationFields(eventType string, incident store.Incident) []map[
 			"inline": true,
 		})
 	}
+	content := buildNotificationContent(eventType, incident)
+	if len(content.Actions) > 0 {
+		out = append(out, map[string]any{"name": "推奨対応", "value": truncateNotificationText("• "+strings.Join(content.Actions, "\n• "), 1000), "inline": false})
+	}
+	if len(content.Evidence) > 0 {
+		out = append(out, map[string]any{"name": "根拠", "value": truncateNotificationText("• "+strings.Join(content.Evidence, "\n• "), 1000), "inline": false})
+	}
 	return out
 }
 
@@ -1177,6 +1223,13 @@ func slackNotificationBlocks(eventType string, incident store.Incident) []map[st
 				"text": truncateNotificationText(description, 3000),
 			},
 		})
+	}
+	content := buildNotificationContent(eventType, incident)
+	if len(content.Actions) > 0 {
+		blocks = append(blocks, map[string]any{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": "*推奨対応*\n• " + escapeSlackText(strings.Join(content.Actions, "\n• "))}})
+	}
+	if len(content.Evidence) > 0 {
+		blocks = append(blocks, map[string]any{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": "*根拠*\n• " + escapeSlackText(strings.Join(content.Evidence, "\n• "))}})
 	}
 	fields := make([]map[string]any, 0, len(notificationMessageFields(eventType, incident)))
 	for _, field := range notificationMessageFields(eventType, incident) {
@@ -1203,11 +1256,31 @@ func slackNotificationBlocks(eventType string, incident store.Incident) []map[st
 }
 
 func notificationDescription(eventType string, incident store.Incident) string {
+	content := buildNotificationContent(eventType, incident)
+	return joinNotificationDetails(content.Summary, content.Diagnosis)
+}
+
+type notificationContent struct {
+	Summary   string
+	Diagnosis string
+	Actions   []string
+	Evidence  []string
+}
+
+func buildNotificationContent(eventType string, incident store.Incident) notificationContent {
+	content := notificationContent{
+		Actions:  compactNotificationList(incident.Report.RecommendedActions),
+		Evidence: compactNotificationList(incident.Report.Evidence),
+	}
 	if normalizedEventType(eventType) == "admin.audit" {
-		if details := strings.TrimSpace(incident.NotificationDetails); details != "" {
-			return details
+		content.Summary = strings.TrimSpace(incident.NotificationDetails)
+		if content.Summary == "" {
+			content.Summary = legacyNotificationDetails(incident.SummaryJA, notificationTitle(eventType, incident))
 		}
-		return legacyNotificationDetails(incident.SummaryJA, notificationTitle(eventType, incident))
+		if content.Summary == "" {
+			content.Summary = legacyNotificationDetails(incident.SourceSummary, notificationTitle(eventType, incident))
+		}
+		return content
 	}
 	description := strings.TrimSpace(incident.SummaryJA)
 	title := strings.TrimSpace(notificationTitle(eventType, incident))
@@ -1217,14 +1290,16 @@ func notificationDescription(eventType string, incident store.Incident) string {
 	if strings.HasPrefix(description, title+"\n") {
 		description = strings.TrimSpace(strings.TrimPrefix(description, title+"\n"))
 	}
-	return joinNotificationDetails(description, incidentReportDetails(incident))
+	content.Summary = description
+	content.Diagnosis = incidentReportDetails(incident)
+	return content
 }
 
 func notificationAdditionalDetails(eventType string, incident store.Incident) string {
 	if normalizedEventType(eventType) == "admin.audit" {
-		return notificationDescription(eventType, incident)
+		return ""
 	}
-	return incidentReportDetails(incident)
+	return buildNotificationContent(eventType, incident).Diagnosis
 }
 
 func notificationRuleValue(eventType, rule string) string {
@@ -1318,12 +1393,6 @@ func incidentReportDetails(incident store.Incident) string {
 	}
 	if impact := strings.TrimSpace(incident.Report.Impact); impact != "" {
 		details = append(details, "影響: "+impact)
-	}
-	if actions := compactNotificationList(incident.Report.RecommendedActions); len(actions) > 0 {
-		details = append(details, "推奨対応: "+strings.Join(actions, " / "))
-	}
-	if evidence := compactNotificationList(incident.Report.Evidence); len(evidence) > 0 {
-		details = append(details, "根拠: "+strings.Join(evidence, ", "))
 	}
 	return strings.Join(details, "\n")
 }

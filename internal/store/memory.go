@@ -14,16 +14,17 @@ import (
 )
 
 type MemoryStore struct {
-	mu           sync.Mutex
-	signals      []Signal
-	incidents    map[string]Incident
-	deliveries   []NotificationDelivery
-	channels     map[string]NotificationChannel
-	remediations map[string]RemediationAction
+	mu              sync.Mutex
+	signals         []Signal
+	incidents       map[string]Incident
+	activeIncidents map[string]string
+	deliveries      []NotificationDelivery
+	channels        map[string]NotificationChannel
+	remediations    map[string]RemediationAction
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{incidents: map[string]Incident{}, channels: map[string]NotificationChannel{}, remediations: map[string]RemediationAction{}}
+	return &MemoryStore{incidents: map[string]Incident{}, activeIncidents: map[string]string{}, channels: map[string]NotificationChannel{}, remediations: map[string]RemediationAction{}}
 }
 
 func (s *MemoryStore) SaveSignal(ctx context.Context, signal Signal) (Signal, error) {
@@ -45,6 +46,21 @@ func (s *MemoryStore) SaveSignal(ctx context.Context, signal Signal) (Signal, er
 	}
 	s.signals = append(s.signals, signal)
 	return signal, nil
+}
+
+func (s *MemoryStore) LatestMetricValue(ctx context.Context, name, serviceID, streamID string) (float64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index := len(s.signals) - 1; index >= 0; index-- {
+		signal := s.signals[index]
+		if signal.Name == name && signal.ServiceID == serviceID && signal.StreamID == streamID && signal.Value != nil {
+			return *signal.Value, true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 func (s *MemoryStore) ListSignals(ctx context.Context, limit int) ([]Signal, error) {
@@ -90,13 +106,27 @@ func (s *MemoryStore) UpsertIncident(ctx context.Context, incident Incident) (In
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
 	key := incidentKey(incident)
-	if existing, ok := s.incidents[key]; ok && existing.Status != "resolved" && existing.Status != "ignored" {
-		existing.SignalID = incident.SignalID
-		existing.SummaryJA = incident.SummaryJA
-		existing.Report = incident.Report
-		existing.UpdatedAt = now
-		s.incidents[key] = existing
-		return existing, false, nil
+	if activeID, ok := s.activeIncidents[key]; ok {
+		existing, exists := s.incidents[activeID]
+		if !exists || isTerminalIncidentStatus(existing.Status) {
+			delete(s.activeIncidents, key)
+		} else {
+			existing.SeverityChanged = isMoreSevereIncidentSeverity(incident.Severity, existing.Severity)
+			if existing.SeverityChanged {
+				existing.Severity = incident.Severity
+			}
+			existing.SignalID = incident.SignalID
+			existing.SummaryJA = incident.SummaryJA
+			existing.Report = incident.Report
+			existing.UpdatedAt = now
+			existing.LastSeenAt = now
+			existing.OccurrenceCount++
+			persisted := existing
+			persisted.SeverityChanged = false
+			persisted.StatusChanged = false
+			s.incidents[existing.ID] = persisted
+			return existing, false, nil
+		}
 	}
 	if incident.ID == "" {
 		incident.ID = newID("inc")
@@ -106,7 +136,10 @@ func (s *MemoryStore) UpsertIncident(ctx context.Context, incident Incident) (In
 	}
 	incident.OpenedAt = now
 	incident.UpdatedAt = now
-	s.incidents[key] = incident
+	incident.LastSeenAt = now
+	incident.OccurrenceCount = 1
+	s.incidents[incident.ID] = incident
+	s.activeIncidents[key] = incident.ID
 	return incident, true, nil
 }
 
@@ -120,7 +153,43 @@ func (s *MemoryStore) ListIncidents(ctx context.Context) ([]Incident, error) {
 	for _, incident := range s.incidents {
 		out = append(out, incident)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out, nil
+}
+
+func (s *MemoryStore) ListIncidentHistory(ctx context.Context, limit int, before time.Time, beforeID, status string) ([]Incident, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Incident, 0, len(s.incidents))
+	for _, incident := range s.incidents {
+		if status != "" && incident.Status != status {
+			continue
+		}
+		if !before.IsZero() && (incident.UpdatedAt.After(before) || (incident.UpdatedAt.Equal(before) && incident.ID >= beforeID)) {
+			continue
+		}
+		out = append(out, incident)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
 	return out, nil
 }
 
@@ -130,10 +199,8 @@ func (s *MemoryStore) GetIncident(ctx context.Context, id string) (Incident, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, incident := range s.incidents {
-		if incident.ID == id {
-			return incident, nil
-		}
+	if incident, ok := s.incidents[id]; ok {
+		return incident, nil
 	}
 	return Incident{}, ErrNotFound
 }
@@ -147,22 +214,89 @@ func (s *MemoryStore) UpdateIncidentStatus(ctx context.Context, id, status strin
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for key, incident := range s.incidents {
-		if incident.ID != id {
-			continue
+	incident, ok := s.incidents[id]
+	if ok {
+		if incident.Status == status {
+			incident.StatusChanged = false
+			return incident, nil
+		}
+		if !canTransitionIncidentStatus(incident.Status, status) {
+			return Incident{}, ErrInvalidTransition
 		}
 		now := time.Now().UTC()
 		incident.Status = status
+		incident.StatusChanged = true
 		incident.UpdatedAt = now
-		if status == "resolved" || status == "ignored" {
+		if isTerminalIncidentStatus(status) {
 			incident.ResolvedAt = &now
+			incident.ResolutionReason = "manual"
+			delete(s.activeIncidents, incidentKey(incident))
 		} else {
 			incident.ResolvedAt = nil
+			incident.ResolvedBySignalID = ""
+			incident.ResolutionReason = ""
 		}
-		s.incidents[key] = incident
+		persisted := incident
+		persisted.SeverityChanged = false
+		persisted.StatusChanged = false
+		s.incidents[id] = persisted
 		return incident, nil
 	}
 	return Incident{}, ErrNotFound
+}
+
+func (s *MemoryStore) ResolveActiveIncidents(ctx context.Context, rules []string, serviceID, streamID, signalID, reason string) ([]Incident, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	resolved := make([]Incident, 0, len(rules))
+	for _, rule := range uniqueNonEmptyStrings(rules) {
+		key := incidentKey(Incident{Rule: rule, ServiceID: serviceID, StreamID: streamID})
+		id, ok := s.activeIncidents[key]
+		if !ok {
+			continue
+		}
+		incident, ok := s.incidents[id]
+		if !ok || isTerminalIncidentStatus(incident.Status) {
+			delete(s.activeIncidents, key)
+			continue
+		}
+		incident.Status = "resolved"
+		incident.StatusChanged = true
+		incident.UpdatedAt = now
+		incident.ResolvedAt = &now
+		incident.ResolvedBySignalID = strings.TrimSpace(signalID)
+		incident.ResolutionReason = strings.TrimSpace(reason)
+		persisted := incident
+		persisted.SeverityChanged = false
+		persisted.StatusChanged = false
+		s.incidents[id] = persisted
+		delete(s.activeIncidents, key)
+		resolved = append(resolved, incident)
+	}
+	return resolved, nil
+}
+
+func isMoreSevereIncidentSeverity(candidate, current string) bool {
+	return incidentSeverityRank(candidate) > incidentSeverityRank(current)
+}
+
+func incidentSeverityRank(severity string) int {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "info":
+		return 1
+	case "warning":
+		return 2
+	case "error":
+		return 3
+	case "critical":
+		return 4
+	default:
+		return 0
+	}
 }
 
 func (s *MemoryStore) UpdateIncidentDiagnostic(ctx context.Context, id, expectedSignalID string, report diagnostics.Report) (Incident, bool, error) {
@@ -176,16 +310,14 @@ func (s *MemoryStore) UpdateIncidentDiagnostic(ctx context.Context, id, expected
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for key, incident := range s.incidents {
-		if incident.ID != id {
-			continue
-		}
+	incident, ok := s.incidents[id]
+	if ok {
 		if incident.SignalID != expectedSignalID {
 			return incident, false, nil
 		}
 		incident.Report = report
 		incident.UpdatedAt = time.Now().UTC()
-		s.incidents[key] = incident
+		s.incidents[id] = incident
 		return incident, true, nil
 	}
 	return Incident{}, false, ErrNotFound
@@ -516,6 +648,48 @@ func validIncidentStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+func isTerminalIncidentStatus(status string) bool {
+	return status == "resolved" || status == "ignored"
+}
+
+func canTransitionIncidentStatus(current, next string) bool {
+	if current == next {
+		return true
+	}
+	if isTerminalIncidentStatus(current) {
+		return false
+	}
+	switch current {
+	case "open":
+		return validIncidentStatus(next)
+	case "acknowledged":
+		return next == "investigating" || next == "mitigated" || isTerminalIncidentStatus(next)
+	case "investigating":
+		return next == "mitigated" || isTerminalIncidentStatus(next)
+	case "mitigated":
+		return isTerminalIncidentStatus(next)
+	default:
+		return false
+	}
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func newID(prefix string) string {

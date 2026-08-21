@@ -363,6 +363,11 @@ func (s *Server) ingestSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	signal.Attributes = safeSignalAttributes(signal.Attributes)
+	signal, err := s.withCumulativeCounterDelta(r.Context(), signal)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "counter_state_lookup_failed"})
+		return
+	}
 	saved, err := s.store.SaveSignal(r.Context(), signal)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "save_signal_failed"})
@@ -374,6 +379,52 @@ func (s *Server) ingestSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, IngestResponse{Signal: safeSignal(saved), Incidents: createdIncidents})
+}
+
+const counterDeltaAttribute = "observability.counter_delta"
+
+var cumulativeCounterMetrics = map[string]struct{}{
+	"encoder.dropped_frames_total":                {},
+	"encoder.audio_clipping_total":                {},
+	"worker.event_send_failures_total":            {},
+	"discord.worker_event_publish_failures_total": {},
+	"discord.audio_forward_errors_total":          {},
+	"rtmp.reconnect_count":                        {},
+	"encoder.rtmp_reconnect_count":                {},
+	"discord.reconnect_count":                     {},
+	"discord.voice_disconnect_count":              {},
+}
+
+func (s *Server) withCumulativeCounterDelta(ctx context.Context, signal store.Signal) (store.Signal, error) {
+	if signal.Value == nil {
+		return signal, nil
+	}
+	if _, ok := cumulativeCounterMetrics[signal.Name]; !ok {
+		return signal, nil
+	}
+	previous, found, err := s.store.LatestMetricValue(ctx, signal.Name, signal.ServiceID, signal.StreamID)
+	if err != nil {
+		return store.Signal{}, err
+	}
+	delta := 0.0
+	reset := false
+	if found {
+		if *signal.Value >= previous {
+			delta = *signal.Value - previous
+		} else {
+			reset = true
+		}
+	}
+	attributes := make(map[string]any, len(signal.Attributes)+2)
+	for key, value := range signal.Attributes {
+		attributes[key] = value
+	}
+	attributes[counterDeltaAttribute] = delta
+	if reset {
+		attributes["observability.counter_reset"] = true
+	}
+	signal.Attributes = attributes
+	return signal, nil
 }
 
 func (s *Server) listSignals(w http.ResponseWriter, r *http.Request) {
@@ -392,12 +443,27 @@ func (s *Server) listMetrics(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeAdmin(w, r, adminScopeRead) {
 		return
 	}
-	signals, err := s.store.ListSignals(r.Context(), parseLimit(r, 500))
+	rangeSeconds := 3 * 60 * 60
+	if raw := strings.TrimSpace(r.URL.Query().Get("range_sec")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 15*60 || parsed > 3*60*60 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_metric_range"})
+			return
+		}
+		rangeSeconds = parsed
+	}
+	metrics, err := s.store.ListMetricSnapshots(r.Context(), store.MetricQuery{
+		Since:              time.Now().UTC().Add(-time.Duration(rangeSeconds) * time.Second),
+		MaxPointsPerSeries: 360,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "list_metrics_failed"})
 		return
 	}
-	writeJSON(w, http.StatusOK, appendSelfMetricSnapshots(metricSnapshots(signals)))
+	for index := range metrics {
+		metrics[index].Attributes = safeSignalAttributes(metrics[index].Attributes)
+	}
+	writeJSON(w, http.StatusOK, appendSelfMetricSnapshots(metrics))
 }
 
 func (s *Server) listDiagnostics(w http.ResponseWriter, r *http.Request) {
@@ -429,12 +495,38 @@ func (s *Server) listIncidents(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeAdmin(w, r, adminScopeRead) {
 		return
 	}
-	incidents, err := s.store.ListIncidents(r.Context())
+	before, beforeID, err := parseHistoryCursor(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_history_cursor"})
+		return
+	}
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	if status != "" && status != "open" && status != "acknowledged" && status != "investigating" && status != "mitigated" && status != "resolved" && status != "ignored" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_incident_status"})
+		return
+	}
+	incidents, err := s.store.ListIncidentHistory(r.Context(), parseLimit(r, 200), before, beforeID, status)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "list_incidents_failed"})
 		return
 	}
 	writeJSON(w, http.StatusOK, incidents)
+}
+
+func parseHistoryCursor(r *http.Request) (time.Time, string, error) {
+	rawBefore := strings.TrimSpace(r.URL.Query().Get("before"))
+	beforeID := strings.TrimSpace(r.URL.Query().Get("before_id"))
+	if rawBefore == "" && beforeID == "" {
+		return time.Time{}, "", nil
+	}
+	if rawBefore == "" || beforeID == "" {
+		return time.Time{}, "", errors.New("before and before_id are both required")
+	}
+	before, err := time.Parse(time.RFC3339Nano, rawBefore)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	return before.UTC(), beforeID, nil
 }
 
 func (s *Server) getIncident(w http.ResponseWriter, r *http.Request) {
@@ -521,6 +613,10 @@ func (s *Server) updateIncidentStatus(w http.ResponseWriter, r *http.Request, st
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_incident_status"})
 		return
 	}
+	if errors.Is(err, store.ErrInvalidTransition) {
+		writeJSON(w, http.StatusConflict, map[string]string{"code": "invalid_incident_transition"})
+		return
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "update_incident_failed"})
 		return
@@ -529,7 +625,9 @@ func (s *Server) updateIncidentStatus(w http.ResponseWriter, r *http.Request, st
 	if status == "resolved" {
 		eventType = "incident.resolved"
 	}
-	s.notifyIncidentEvent(r, eventType, incident)
+	if incident.StatusChanged {
+		s.notifyIncidentEvent(r, eventType, incident)
+	}
 	writeJSON(w, http.StatusOK, incident)
 }
 
@@ -1276,7 +1374,17 @@ func requiresControlPanelDispatch(action string) bool {
 }
 
 func (s *Server) evaluateAndStoreIncidents(r *http.Request, signal store.Signal) ([]store.Incident, error) {
-	detected := detectSignal(signal)
+	evaluation := evaluateSignal(signal)
+	for _, recovery := range evaluation.Recoveries {
+		resolved, err := s.store.ResolveActiveIncidents(r.Context(), []string{recovery.Rule}, signal.ServiceID, signal.StreamID, signal.ID, recovery.Reason)
+		if err != nil {
+			return nil, err
+		}
+		for _, incident := range resolved {
+			s.notifyIncidentEvent(r, "incident.resolved", incident)
+		}
+	}
+	detected := evaluation.Incidents
 	out := make([]store.Incident, 0, len(detected))
 	for _, detectedIncident := range detected {
 		evidence := diagnosticEvidence(signal)
@@ -1299,6 +1407,8 @@ func (s *Server) evaluateAndStoreIncidents(r *http.Request, signal store.Signal)
 			if err := s.createRemediationActions(r, stored); err != nil {
 				return nil, err
 			}
+		} else if stored.SeverityChanged {
+			s.notifyIncidentEvent(r, "incident.updated", stored)
 		}
 		out = append(out, stored)
 	}
@@ -1315,12 +1425,16 @@ func diagnosticReportForSavedSignal(incident store.Incident, signal store.Signal
 }
 
 func detectSignal(signal store.Signal) []detection.Incident {
+	return evaluateSignal(signal).Incidents
+}
+
+func evaluateSignal(signal store.Signal) detection.Evaluation {
 	value := 0.0
 	if signal.Value != nil {
 		value = *signal.Value
 	}
 	streamLive := signal.Attributes["stream_live"] == true || signal.Status == "live"
-	return detection.Evaluate(detection.Signal{
+	return detection.EvaluateSignal(detection.Signal{
 		Type:       signal.Type,
 		Name:       signal.Name,
 		Value:      value,
@@ -1350,7 +1464,7 @@ func safeAttributeEvidence(attributes map[string]any) []string {
 	allowed := []string{
 		"failure_phase", "error_class", "dry_run", "upload_dry_run", "upload_attempts", "file_count", "remux_duration_ms",
 		"discord.audio_forwarded_total", "discord.audio_forward_errors_total", "discord.audio_last_forward_age_sec", "discord.audio_last_packet_age_sec",
-		"discord.worker_event_publish_failures_total",
+		"discord.worker_event_publish_failures_total", counterDeltaAttribute, "observability.counter_reset",
 	}
 	out := make([]string, 0, len(allowed))
 	for _, key := range allowed {

@@ -427,11 +427,39 @@ func TestGenericWebhookCarriesDiagnosticDetailsWithoutRepeatingSummary(t *testin
 		t.Fatalf("generic summary changed: %#v", payload)
 	}
 	details, ok := payload["details"].(string)
-	if !ok || !strings.Contains(details, "原因候補: FFmpeg exited unexpectedly") || !strings.Contains(details, "推奨対応: check encoder logs / restart encoder") {
+	if !ok || !strings.Contains(details, "原因候補: FFmpeg exited unexpectedly") {
 		t.Fatalf("generic diagnostic details are incomplete: %#v", payload)
 	}
-	if strings.Contains(details, incident.SummaryJA) {
-		t.Fatalf("generic details repeat the summary: %q", details)
+	if strings.Contains(details, incident.SummaryJA) || strings.Contains(details, "check encoder logs") {
+		t.Fatalf("generic details repeat summary or structured actions: %q", details)
+	}
+	actions, ok := payload["recommended_actions"].([]string)
+	if !ok || len(actions) != 2 || actions[0] != "check encoder logs" {
+		t.Fatalf("generic actions are not structured once: %#v", payload)
+	}
+}
+
+func TestNotificationPresentationDoesNotRepeatActionsOrEvidence(t *testing.T) {
+	incident := store.Incident{
+		Rule:      "encoder_process_exited",
+		Severity:  "critical",
+		Status:    "open",
+		SummaryJA: "Encoder process stopped.",
+		ServiceID: "enc-01",
+		Report: diagnostics.Report{
+			LikelyCause:        "FFmpeg exited unexpectedly",
+			RecommendedActions: []string{"check encoder logs"},
+			Evidence:           []string{"signal_id=sig-01"},
+		},
+	}
+	text := formatIncidentText("incident.opened", incident)
+	if strings.Count(text, "check encoder logs") != 1 || strings.Count(text, "signal_id=sig-01") != 1 {
+		t.Fatalf("plain notification repeated structured content: %s", text)
+	}
+	payload := (WebhookNotifier{Type: "generic"}).payload("incident.opened", incident)
+	details, _ := payload["details"].(string)
+	if strings.Contains(details, "check encoder logs") || strings.Contains(details, "signal_id=sig-01") {
+		t.Fatalf("generic details duplicate structured lists: %#v", payload)
 	}
 }
 
@@ -449,14 +477,14 @@ func TestGenericWebhookPreservesAdminAuditSummaryContract(t *testing.T) {
 		NotificationDetails:      "OAuth connected account updated",
 	}
 	payload := (WebhookNotifier{Type: "generic"}).payload("admin.audit", incident)
-	if payload["summary"] != incident.SourceSummary {
-		t.Fatalf("generic webhook source summary contract changed: %#v", payload)
+	if payload["summary"] != incident.NotificationDetails {
+		t.Fatalf("generic webhook did not use the concise canonical summary: %#v", payload)
 	}
 	if payload["schema_version"] != 2 || payload["service_id"] != "observability" || payload["target"] != "OAuth接続アカウント (acct-01)" || payload["actor"] != "ops" {
 		t.Fatalf("generic webhook structured context changed: %#v", payload)
 	}
-	if payload["details"] != "OAuth connected account updated" {
-		t.Fatalf("generic webhook admin details changed: %#v", payload)
+	if payload["details"] != "" {
+		t.Fatalf("generic webhook repeated the canonical admin summary: %#v", payload)
 	}
 	if len(payload) != 15 {
 		t.Fatalf("generic webhook field set changed: %#v", payload)
@@ -1014,6 +1042,20 @@ type codedEmailRelayError string
 func (e codedEmailRelayError) Error() string            { return string(e) }
 func (e codedEmailRelayError) SafeDeliveryCode() string { return string(e) }
 
+type recipientRecordingRelay struct {
+	calls []string
+	fail  map[string]error
+}
+
+func (r *recipientRecordingRelay) SendNotificationEmail(_ context.Context, recipients []string, _, _ string) error {
+	if len(recipients) != 1 {
+		return errors.New("expected exactly one recipient")
+	}
+	recipient := recipients[0]
+	r.calls = append(r.calls, recipient)
+	return r.fail[recipient]
+}
+
 func TestEmailNotifierUsesGlobalSMTPRelay(t *testing.T) {
 	relay := &recordingEmailRelay{}
 	notifier := EmailNotifier{
@@ -1092,6 +1134,54 @@ func TestChannelNotifierUsesGlobalSMTPRelayForIncident(t *testing.T) {
 	}
 	if !relay.hasDeadline || time.Until(relay.deadline) < 300*time.Millisecond {
 		t.Fatalf("email relay inherited the webhook timeout: deadline=%v hasDeadline=%t", relay.deadline, relay.hasDeadline)
+	}
+}
+
+func TestChannelNotifierRetriesOnlyFailedEmailRecipients(t *testing.T) {
+	st := store.NewMemoryStore()
+	channel, err := st.CreateNotificationChannel(t.Context(), store.NotificationChannel{
+		Name:            "global email",
+		Type:            "email",
+		Enabled:         true,
+		UseGlobalSMTP:   true,
+		EmailRecipients: []string{"accepted@example.com", "failed@example.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := &recipientRecordingRelay{fail: map[string]error{"failed@example.com": codedEmailRelayError("rate_limited")}}
+	notifier := ChannelNotifier{Store: st, EmailRelay: relay}
+	incident := store.Incident{ID: "inc-partial-email", Rule: "encoder_down", Severity: "critical", Status: "open"}
+	results, err := notifier.NotifyIncidentOpened(t.Context(), incident)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || len(relay.calls) != 2 {
+		t.Fatalf("email recipients were not delivered independently: results=%#v calls=%#v", results, relay.calls)
+	}
+	excluded := map[string]struct{}{}
+	for _, result := range results {
+		if result.Status == "success" {
+			excluded[result.ChannelID] = struct{}{}
+		}
+		if strings.Contains(result.ChannelID, "@") {
+			t.Fatalf("recipient address leaked through destination id: %q", result.ChannelID)
+		}
+	}
+	if len(excluded) != 1 {
+		t.Fatalf("expected one successful recipient destination: %#v", results)
+	}
+	relay.fail = map[string]error{}
+	relay.calls = nil
+	retry, err := notifier.NotifyIncidentEventExceptChannels(t.Context(), "incident.opened", incident, excluded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retry) != 1 || len(relay.calls) != 1 || relay.calls[0] != "failed@example.com" || retry[0].Status != "success" {
+		t.Fatalf("retry duplicated an already accepted recipient: retry=%#v calls=%#v", retry, relay.calls)
+	}
+	if !strings.HasPrefix(retry[0].ChannelID, channel.ID+"/recipient/") {
+		t.Fatalf("retry destination is not scoped to the channel: %#v", retry[0])
 	}
 }
 

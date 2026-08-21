@@ -107,6 +107,25 @@ VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?)`,
 	return signal, nil
 }
 
+func (s MariaDBStore) LatestMetricValue(ctx context.Context, name, serviceID, streamID string) (float64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	var value float64
+	err := s.DB.QueryRowContext(ctx, `SELECT value_double
+FROM signals
+WHERE name = ? AND service_id = ? AND COALESCE(stream_id, '') = ? AND value_double IS NOT NULL
+ORDER BY occurred_at DESC, created_at DESC, id DESC
+LIMIT 1`, strings.TrimSpace(name), strings.TrimSpace(serviceID), strings.TrimSpace(streamID)).Scan(&value)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return value, true, nil
+}
+
 func (s MariaDBStore) ListSignals(ctx context.Context, limit int) ([]Signal, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 200
@@ -163,16 +182,22 @@ func (s MariaDBStore) UpsertIncident(ctx context.Context, incident Incident) (In
 	defer tx.Rollback()
 	existing, err := findOpenIncidentQuery(ctx, tx, incident.Rule, incident.ServiceID, incident.StreamID)
 	if err == nil {
+		existing.SeverityChanged = isMoreSevereIncidentSeverity(incident.Severity, existing.Severity)
+		if existing.SeverityChanged {
+			existing.Severity = incident.Severity
+		}
 		existing.SignalID = incident.SignalID
 		existing.SummaryJA = incident.SummaryJA
 		existing.Report = incident.Report
 		existing.UpdatedAt = now
+		existing.LastSeenAt = now
+		existing.OccurrenceCount++
 		report, err := json.Marshal(existing.Report)
 		if err != nil {
 			return Incident{}, false, err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE incidents SET signal_id = ?, summary_ja = ?, diagnostic_report = ?, updated_at = ? WHERE id = ?`,
-			existing.SignalID, existing.SummaryJA, string(report), existing.UpdatedAt, existing.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE incidents SET severity = ?, signal_id = ?, summary_ja = ?, diagnostic_report = ?, updated_at = ?, last_seen_at = ?, occurrence_count = ? WHERE id = ?`,
+			existing.Severity, existing.SignalID, existing.SummaryJA, string(report), existing.UpdatedAt, existing.LastSeenAt, existing.OccurrenceCount, existing.ID); err != nil {
 			return Incident{}, false, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -191,24 +216,32 @@ func (s MariaDBStore) UpsertIncident(ctx context.Context, incident Incident) (In
 	}
 	incident.OpenedAt = now
 	incident.UpdatedAt = now
+	incident.LastSeenAt = now
+	incident.OccurrenceCount = 1
 	report, err := json.Marshal(incident.Report)
 	if err != nil {
 		return Incident{}, false, err
 	}
 	dedupeKey := incidentDedupeKey(incident.Rule, incident.ServiceID, incident.StreamID)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO incidents
-(id, rule, severity, status, summary_ja, service_id, stream_id, signal_id, diagnostic_report, opened_at, updated_at, resolved_at, dedupe_key)
-VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, NULL, ?)`,
-		incident.ID, incident.Rule, incident.Severity, incident.Status, incident.SummaryJA, incident.ServiceID, incident.StreamID, incident.SignalID, string(report), incident.OpenedAt, incident.UpdatedAt, dedupeKey); err != nil {
+(id, rule, severity, status, summary_ja, service_id, stream_id, signal_id, diagnostic_report, opened_at, updated_at, resolved_at, occurrence_count, last_seen_at, resolved_by_signal_id, resolution_reason, dedupe_key)
+VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, ?)`,
+		incident.ID, incident.Rule, incident.Severity, incident.Status, incident.SummaryJA, incident.ServiceID, incident.StreamID, incident.SignalID, string(report), incident.OpenedAt, incident.UpdatedAt, incident.OccurrenceCount, incident.LastSeenAt, dedupeKey); err != nil {
 		// A concurrent writer may have won the unique dedupe key race. Read
 		// that row inside this transaction and converge on it instead of
 		// surfacing a duplicate incident to the notifier.
 		if existing, lookupErr := findIncidentByDedupeKey(ctx, tx, dedupeKey); lookupErr == nil {
+			existing.SeverityChanged = isMoreSevereIncidentSeverity(incident.Severity, existing.Severity)
+			if existing.SeverityChanged {
+				existing.Severity = incident.Severity
+			}
 			existing.SignalID = incident.SignalID
 			existing.SummaryJA = incident.SummaryJA
 			existing.Report = incident.Report
 			existing.UpdatedAt = now
-			if _, updateErr := tx.ExecContext(ctx, `UPDATE incidents SET signal_id = ?, summary_ja = ?, diagnostic_report = ?, updated_at = ? WHERE id = ?`, existing.SignalID, existing.SummaryJA, string(report), existing.UpdatedAt, existing.ID); updateErr != nil {
+			existing.LastSeenAt = now
+			existing.OccurrenceCount++
+			if _, updateErr := tx.ExecContext(ctx, `UPDATE incidents SET severity = ?, signal_id = ?, summary_ja = ?, diagnostic_report = ?, updated_at = ?, last_seen_at = ?, occurrence_count = ? WHERE id = ?`, existing.Severity, existing.SignalID, existing.SummaryJA, string(report), existing.UpdatedAt, existing.LastSeenAt, existing.OccurrenceCount, existing.ID); updateErr != nil {
 				return Incident{}, false, updateErr
 			}
 			if commitErr := tx.Commit(); commitErr != nil {
@@ -225,8 +258,8 @@ VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, NULL, ?)`,
 }
 
 func (s MariaDBStore) ListIncidents(ctx context.Context) ([]Incident, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at
-FROM incidents ORDER BY updated_at DESC LIMIT 200`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at, occurrence_count, COALESCE(last_seen_at, updated_at), COALESCE(resolved_by_signal_id, ''), COALESCE(resolution_reason, '')
+FROM incidents ORDER BY updated_at DESC, id DESC LIMIT 200`)
 	if err != nil {
 		return nil, err
 	}
@@ -242,8 +275,48 @@ FROM incidents ORDER BY updated_at DESC LIMIT 200`)
 	return out, rows.Err()
 }
 
+func (s MariaDBStore) ListIncidentHistory(ctx context.Context, limit int, before time.Time, beforeID, status string) ([]Incident, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	const columns = `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at, occurrence_count, COALESCE(last_seen_at, updated_at), COALESCE(resolved_by_signal_id, ''), COALESCE(resolution_reason, '') FROM incidents`
+	conditions := make([]string, 0, 2)
+	args := make([]any, 0, 5)
+	if status = strings.TrimSpace(status); status != "" {
+		conditions = append(conditions, "status = ?")
+		args = append(args, status)
+	}
+	if !before.IsZero() {
+		conditions = append(conditions, "(updated_at < ? OR (updated_at = ? AND id < ?))")
+		args = append(args, before.UTC(), before.UTC(), strings.TrimSpace(beforeID))
+	}
+	query := columns
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+	args = append(args, limit)
+	rows, err := s.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Incident, 0, limit)
+	for rows.Next() {
+		incident, err := scanIncident(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, incident)
+	}
+	return out, rows.Err()
+}
+
 func (s MariaDBStore) GetIncident(ctx context.Context, id string) (Incident, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at
+	row := s.DB.QueryRowContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at, occurrence_count, COALESCE(last_seen_at, updated_at), COALESCE(resolved_by_signal_id, ''), COALESCE(resolution_reason, '')
 FROM incidents WHERE id = ?`, id)
 	incident, err := scanIncident(row)
 	if err == sql.ErrNoRows {
@@ -259,23 +332,77 @@ func (s MariaDBStore) UpdateIncidentStatus(ctx context.Context, id, status strin
 	if !validIncidentStatus(status) {
 		return Incident{}, ErrInvalidStatus
 	}
-	now := time.Now().UTC()
-	var resolved any
-	if status == "resolved" || status == "ignored" {
-		resolved = now
-	}
-	result, err := s.DB.ExecContext(ctx, `UPDATE incidents SET status = ?, updated_at = ?, resolved_at = ?, dedupe_key = CASE WHEN ? IN ('resolved', 'ignored') THEN NULL ELSE dedupe_key END WHERE id = ?`, status, now, resolved, status, id)
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return Incident{}, err
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return Incident{}, err
-	}
-	if affected == 0 {
+	defer tx.Rollback()
+	current, err := findIncidentByID(ctx, tx, id)
+	if err == sql.ErrNoRows {
 		return Incident{}, ErrNotFound
 	}
-	return s.GetIncident(ctx, id)
+	if err != nil {
+		return Incident{}, err
+	}
+	if current.Status == status {
+		current.StatusChanged = false
+		return current, nil
+	}
+	if !canTransitionIncidentStatus(current.Status, status) {
+		return Incident{}, ErrInvalidTransition
+	}
+	now := time.Now().UTC()
+	var resolved any
+	resolutionReason := ""
+	if isTerminalIncidentStatus(status) {
+		resolved = now
+		resolutionReason = "manual"
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE incidents SET status = ?, updated_at = ?, resolved_at = ?, resolved_by_signal_id = NULL, resolution_reason = NULLIF(?, ''), dedupe_key = CASE WHEN ? IN ('resolved', 'ignored') THEN NULL ELSE dedupe_key END WHERE id = ?`, status, now, resolved, resolutionReason, status, id); err != nil {
+		return Incident{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Incident{}, err
+	}
+	updated, err := s.GetIncident(ctx, id)
+	updated.StatusChanged = err == nil
+	return updated, err
+}
+
+func (s MariaDBStore) ResolveActiveIncidents(ctx context.Context, rules []string, serviceID, streamID, signalID, reason string) ([]Incident, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	resolved := make([]Incident, 0, len(rules))
+	for _, rule := range uniqueNonEmptyStrings(rules) {
+		incident, err := findOpenIncidentQuery(ctx, tx, rule, serviceID, streamID)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE incidents SET status = 'resolved', updated_at = ?, resolved_at = ?, resolved_by_signal_id = NULLIF(?, ''), resolution_reason = NULLIF(?, ''), dedupe_key = NULL WHERE id = ?`, now, now, strings.TrimSpace(signalID), strings.TrimSpace(reason), incident.ID); err != nil {
+			return nil, err
+		}
+		incident.Status = "resolved"
+		incident.StatusChanged = true
+		incident.UpdatedAt = now
+		incident.ResolvedAt = &now
+		incident.ResolvedBySignalID = strings.TrimSpace(signalID)
+		incident.ResolutionReason = strings.TrimSpace(reason)
+		resolved = append(resolved, incident)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return resolved, nil
 }
 
 func (s MariaDBStore) UpdateIncidentDiagnostic(ctx context.Context, id, expectedSignalID string, report diagnostics.Report) (Incident, bool, error) {
@@ -640,7 +767,7 @@ type queryRower interface {
 }
 
 func findOpenIncidentQuery(ctx context.Context, queryer queryRower, rule, serviceID, streamID string) (Incident, error) {
-	row := queryer.QueryRowContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at
+	row := queryer.QueryRowContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at, occurrence_count, COALESCE(last_seen_at, updated_at), COALESCE(resolved_by_signal_id, ''), COALESCE(resolution_reason, '')
 FROM incidents
 WHERE rule = ? AND service_id = ? AND COALESCE(stream_id, '') = ? AND status NOT IN ('resolved', 'ignored')
 	ORDER BY updated_at DESC LIMIT 1 FOR UPDATE`, rule, serviceID, streamID)
@@ -648,8 +775,14 @@ WHERE rule = ? AND service_id = ? AND COALESCE(stream_id, '') = ? AND status NOT
 }
 
 func findIncidentByDedupeKey(ctx context.Context, queryer queryRower, dedupeKey string) (Incident, error) {
-	row := queryer.QueryRowContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at
+	row := queryer.QueryRowContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at, occurrence_count, COALESCE(last_seen_at, updated_at), COALESCE(resolved_by_signal_id, ''), COALESCE(resolution_reason, '')
 FROM incidents WHERE dedupe_key = ? LIMIT 1 FOR UPDATE`, dedupeKey)
+	return scanIncident(row)
+}
+
+func findIncidentByID(ctx context.Context, queryer queryRower, id string) (Incident, error) {
+	row := queryer.QueryRowContext(ctx, `SELECT id, rule, severity, status, summary_ja, service_id, COALESCE(stream_id, ''), signal_id, diagnostic_report, opened_at, updated_at, resolved_at, occurrence_count, COALESCE(last_seen_at, updated_at), COALESCE(resolved_by_signal_id, ''), COALESCE(resolution_reason, '')
+FROM incidents WHERE id = ? LIMIT 1 FOR UPDATE`, strings.TrimSpace(id))
 	return scanIncident(row)
 }
 
@@ -727,7 +860,7 @@ func scanIncident(scanner incidentScanner) (Incident, error) {
 	var incident Incident
 	var reportRaw []byte
 	var resolved sql.NullTime
-	if err := scanner.Scan(&incident.ID, &incident.Rule, &incident.Severity, &incident.Status, &incident.SummaryJA, &incident.ServiceID, &incident.StreamID, &incident.SignalID, &reportRaw, &incident.OpenedAt, &incident.UpdatedAt, &resolved); err != nil {
+	if err := scanner.Scan(&incident.ID, &incident.Rule, &incident.Severity, &incident.Status, &incident.SummaryJA, &incident.ServiceID, &incident.StreamID, &incident.SignalID, &reportRaw, &incident.OpenedAt, &incident.UpdatedAt, &resolved, &incident.OccurrenceCount, &incident.LastSeenAt, &incident.ResolvedBySignalID, &incident.ResolutionReason); err != nil {
 		return Incident{}, err
 	}
 	if resolved.Valid {

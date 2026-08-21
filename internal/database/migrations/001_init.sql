@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS signals (
   created_at DATETIME NOT NULL,
   INDEX idx_signals_service_created (service_id, created_at),
   INDEX idx_signals_stream_created (stream_id, created_at),
-  INDEX idx_signals_name_created (name, created_at)
+  INDEX idx_signals_name_created (name, created_at),
+  INDEX idx_signals_metric_series_occurred (name, service_id, service_type, stream_id, occurred_at, created_at, id)
 );
 
 CREATE TABLE IF NOT EXISTS incidents (
@@ -28,8 +29,15 @@ CREATE TABLE IF NOT EXISTS incidents (
   opened_at DATETIME NOT NULL,
   updated_at DATETIME NOT NULL,
   resolved_at DATETIME NULL,
+	occurrence_count INT NOT NULL DEFAULT 1,
+	last_seen_at DATETIME NULL,
+	resolved_by_signal_id VARCHAR(64) NULL,
+	resolution_reason VARCHAR(128) NULL,
+	dedupe_key VARCHAR(400) NULL,
   INDEX idx_incidents_open_dedupe (rule, service_id, stream_id, status),
-  INDEX idx_incidents_status_updated (status, updated_at)
+	INDEX idx_incidents_status_updated (status, updated_at),
+	INDEX idx_incidents_updated_id (updated_at, id),
+	UNIQUE KEY uq_incidents_active_dedupe (dedupe_key)
 );
 
 CREATE TABLE IF NOT EXISTS notification_deliveries (
@@ -38,7 +46,7 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
   channel VARCHAR(64) NOT NULL,
   target VARCHAR(512) NOT NULL,
   incident_id VARCHAR(64) NULL,
-  status ENUM('success','failure') NOT NULL,
+  status ENUM('success','failure','suppressed') NOT NULL,
   error_text TEXT NULL,
   metadata JSON NOT NULL,
   created_at DATETIME NOT NULL,

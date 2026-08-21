@@ -23,19 +23,25 @@ type Signal struct {
 }
 
 type Incident struct {
-	ID            string             `json:"id"`
-	Rule          string             `json:"rule"`
-	Severity      string             `json:"severity"`
-	Status        string             `json:"status"`
-	SummaryJA     string             `json:"summary_ja"`
-	SourceSummary string             `json:"-"`
-	ServiceID     string             `json:"service_id"`
-	StreamID      string             `json:"stream_id,omitempty"`
-	SignalID      string             `json:"signal_id"`
-	Report        diagnostics.Report `json:"diagnostic_report"`
-	OpenedAt      time.Time          `json:"opened_at"`
-	UpdatedAt     time.Time          `json:"updated_at"`
-	ResolvedAt    *time.Time         `json:"resolved_at,omitempty"`
+	ID                 string             `json:"id"`
+	Rule               string             `json:"rule"`
+	Severity           string             `json:"severity"`
+	Status             string             `json:"status"`
+	SummaryJA          string             `json:"summary_ja"`
+	SourceSummary      string             `json:"-"`
+	ServiceID          string             `json:"service_id"`
+	StreamID           string             `json:"stream_id,omitempty"`
+	SignalID           string             `json:"signal_id"`
+	Report             diagnostics.Report `json:"diagnostic_report"`
+	OpenedAt           time.Time          `json:"opened_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+	ResolvedAt         *time.Time         `json:"resolved_at,omitempty"`
+	OccurrenceCount    int                `json:"occurrence_count"`
+	LastSeenAt         time.Time          `json:"last_seen_at"`
+	ResolvedBySignalID string             `json:"resolved_by_signal_id,omitempty"`
+	ResolutionReason   string             `json:"resolution_reason,omitempty"`
+	SeverityChanged    bool               `json:"-"`
+	StatusChanged      bool               `json:"-"`
 
 	// Notification-only context is intentionally excluded from the public
 	// incident JSON and persistence contract. It carries the richer context
@@ -139,15 +145,24 @@ type MetricSnapshot struct {
 	UpdatedAt   time.Time      `json:"updated_at"`
 }
 
+type MetricQuery struct {
+	Since              time.Time
+	MaxPointsPerSeries int
+}
+
 type Store interface {
 	SaveSignal(ctx context.Context, signal Signal) (Signal, error)
+	LatestMetricValue(ctx context.Context, name, serviceID, streamID string) (float64, bool, error)
 	ListSignals(ctx context.Context, limit int) ([]Signal, error)
 	GetSignal(ctx context.Context, id string) (Signal, error)
 	UpsertIncident(ctx context.Context, incident Incident) (Incident, bool, error)
 	ListIncidents(ctx context.Context) ([]Incident, error)
+	ListIncidentHistory(ctx context.Context, limit int, before time.Time, beforeID, status string) ([]Incident, error)
 	GetIncident(ctx context.Context, id string) (Incident, error)
 	UpdateIncidentStatus(ctx context.Context, id, status string) (Incident, error)
+	ResolveActiveIncidents(ctx context.Context, rules []string, serviceID, streamID, signalID, reason string) ([]Incident, error)
 	UpdateIncidentDiagnostic(ctx context.Context, id, expectedSignalID string, report diagnostics.Report) (Incident, bool, error)
+	ListMetricSnapshots(ctx context.Context, query MetricQuery) ([]MetricSnapshot, error)
 	SaveNotificationDelivery(ctx context.Context, delivery NotificationDelivery) (NotificationDelivery, error)
 	ListNotificationDeliveries(ctx context.Context) ([]NotificationDelivery, error)
 	ListNotificationChannels(ctx context.Context) ([]NotificationChannel, error)

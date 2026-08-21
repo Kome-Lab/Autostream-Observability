@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -338,6 +339,149 @@ func TestSignalIngestDeduplicatesIncident(t *testing.T) {
 	}
 	if len(incidents) != 1 {
 		t.Fatalf("expected deduped incident, got %#v", incidents)
+	}
+}
+
+func TestSignalRecoveryResolvesActiveIncidentWithoutOpeningRecoveryIncident(t *testing.T) {
+	st := store.NewMemoryStore()
+	notifier := &eventRecordingNotifier{}
+	handler := NewServerWithStoreAuthzNotifierAndExecutor(
+		"observability",
+		st,
+		auth.NewVerifierFromRawTokens("service-token"),
+		auth.NewVerifierFromRawTokens("service-token"),
+		notifier,
+		nil,
+	)
+	baseline := `{"type":"metric","name":"discord.audio_forward_errors_total","service_id":"bot-01","service_type":"discord_bot","stream_id":"stream-01","value":0,"attributes":{"stream_live":true,"discord.audio_forwarded_total":20,"discord.audio_last_forward_age_sec":1}}`
+	failed := `{"type":"metric","name":"discord.audio_forward_errors_total","service_id":"bot-01","service_type":"discord_bot","stream_id":"stream-01","value":3,"attributes":{"stream_live":true,"discord.audio_forwarded_total":20,"discord.audio_last_forward_age_sec":9}}`
+	recovered := `{"type":"metric","name":"discord.audio_forward_errors_total","service_id":"bot-01","service_type":"discord_bot","stream_id":"stream-01","value":3,"attributes":{"stream_live":true,"discord.audio_forwarded_total":21,"discord.audio_last_forward_age_sec":1}}`
+	for _, body := range []string{baseline, failed, recovered} {
+		req := httptest.NewRequest(http.MethodPost, "/signals", bytes.NewBufferString(body))
+		req.Header.Set("Authorization", "Bearer service-token")
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		if res.Code != http.StatusAccepted {
+			t.Fatalf("signal status = %d body = %s", res.Code, res.Body.String())
+		}
+	}
+	incidents, err := st.ListIncidents(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents) != 1 || incidents[0].Rule != "discord_audio_forward_failed" || incidents[0].Status != "resolved" {
+		t.Fatalf("recovery did not converge incident lifecycle: %#v", incidents)
+	}
+	if incidents[0].ResolvedBySignalID == "" || incidents[0].ResolutionReason != "recent_forward_succeeded" {
+		t.Fatalf("recovery provenance is missing: %#v", incidents[0])
+	}
+	if len(notifier.events) != 2 || notifier.events[0] != "incident.opened" || notifier.events[1] != "incident.resolved" {
+		t.Fatalf("unexpected lifecycle notifications: %#v", notifier.events)
+	}
+}
+
+func TestSignalIncidentSeverityEscalationSendsOneUpdatedNotification(t *testing.T) {
+	st := store.NewMemoryStore()
+	notifier := &eventRecordingNotifier{}
+	handler := NewServerWithStoreAuthAndNotifier("observability", st, auth.NewVerifierFromRawTokens("service-token"), notifier)
+	for _, body := range []string{
+		`{"type":"metric","name":"discord.audio_forward_errors_total","service_id":"bot-01","service_type":"discord_bot","stream_id":"stream-01","value":0,"attributes":{"stream_live":true}}`,
+		`{"type":"metric","name":"discord.audio_forward_errors_total","service_id":"bot-01","service_type":"discord_bot","stream_id":"stream-01","value":1,"attributes":{"stream_live":true}}`,
+		`{"type":"metric","name":"discord.audio_forward_errors_total","service_id":"bot-01","service_type":"discord_bot","stream_id":"stream-01","value":100,"attributes":{"stream_live":true}}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/signals", bytes.NewBufferString(body))
+		req.Header.Set("Authorization", "Bearer service-token")
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		if res.Code != http.StatusAccepted {
+			t.Fatalf("signal status = %d body = %s", res.Code, res.Body.String())
+		}
+	}
+	incidents, err := st.ListIncidents(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents) != 1 || incidents[0].Severity != "error" {
+		t.Fatalf("severity escalation did not converge active incident: %#v", incidents)
+	}
+	if len(notifier.events) != 2 || notifier.events[0] != "incident.opened" || notifier.events[1] != "incident.updated" {
+		t.Fatalf("unexpected severity lifecycle notifications: %#v", notifier.events)
+	}
+}
+
+func TestCumulativeCounterBaselineUnchangedAndResetDoNotCreateIncidents(t *testing.T) {
+	st := store.NewMemoryStore()
+	handler := newTestServer(st)
+	for _, value := range []int{42, 42, 1} {
+		body := fmt.Sprintf(`{"type":"metric","name":"worker.event_send_failures_total","service_id":"worker-01","service_type":"worker","value":%d}`, value)
+		req := httptest.NewRequest(http.MethodPost, "/signals", bytes.NewBufferString(body))
+		req.Header.Set("Authorization", "Bearer service-token")
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		if res.Code != http.StatusAccepted {
+			t.Fatalf("signal status = %d body = %s", res.Code, res.Body.String())
+		}
+	}
+	incidents, err := st.ListIncidents(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents) != 0 {
+		t.Fatalf("baseline, unchanged total, or process reset must not create incidents: %#v", incidents)
+	}
+}
+
+func TestRepeatedManualResolveDoesNotDuplicateNotification(t *testing.T) {
+	st := store.NewMemoryStore()
+	incident, _, err := st.UpsertIncident(t.Context(), store.Incident{Rule: "encoder_process_exited", Severity: "critical", ServiceID: "enc-01", SignalID: "sig-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier := &eventRecordingNotifier{}
+	handler := NewServerWithStoreAuthAndNotifier("observability", st, auth.NewVerifierFromRawTokens("service-token"), notifier)
+	for range 2 {
+		req := httptest.NewRequest(http.MethodPost, "/incidents/"+incident.ID+"/resolve", nil)
+		req.Header.Set("Authorization", "Bearer service-token")
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("resolve status = %d body = %s", res.Code, res.Body.String())
+		}
+	}
+	if len(notifier.events) != 1 || notifier.events[0] != "incident.resolved" {
+		t.Fatalf("idempotent resolve duplicated lifecycle notification: %#v", notifier.events)
+	}
+}
+
+func TestMetricsRangeReturnsPersistedHistory(t *testing.T) {
+	st := store.NewMemoryStore()
+	now := time.Now().UTC()
+	for index, at := range []time.Time{now.Add(-20 * time.Minute), now.Add(-10 * time.Minute), now.Add(-time.Minute)} {
+		value := float64(index + 1)
+		if _, err := st.SaveSignal(t.Context(), store.Signal{Type: "metric", Name: "worker.cpu_percent", ServiceID: "worker-01", ServiceType: "worker", Value: &value, Timestamp: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := newTestServer(st)
+	req := httptest.NewRequest(http.MethodGet, "/metrics?range_sec=900", nil)
+	req.Header.Set("Authorization", "Bearer service-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	var metrics []store.MetricSnapshot
+	if err := json.NewDecoder(res.Body).Decode(&metrics); err != nil {
+		t.Fatal(err)
+	}
+	var workerPoints []store.MetricSnapshot
+	for _, metric := range metrics {
+		if metric.ServiceID == "worker-01" && metric.Name == "worker.cpu_percent" {
+			workerPoints = append(workerPoints, metric)
+		}
+	}
+	if len(workerPoints) != 2 {
+		t.Fatalf("range did not return persisted history: %#v", workerPoints)
 	}
 }
 
@@ -704,12 +848,15 @@ func TestSignalIngestRejectsSecretLikeAttributes(t *testing.T) {
 func TestWorkerEventSendFailuresCreateIncident(t *testing.T) {
 	st := store.NewMemoryStore()
 	handler := NewServerWithStoreAuthAndNotifier("observability", st, auth.NewVerifierFromRawTokens("service-token"), nil)
-	req := httptest.NewRequest(http.MethodPost, "/signals", bytes.NewBufferString(`{"type":"metric","name":"worker.event_send_failures_total","service_id":"worker-01","service_type":"worker","stream_id":"stream-01","value":1}`))
-	req.Header.Set("Authorization", "Bearer service-token")
-	res := httptest.NewRecorder()
-	handler.ServeHTTP(res, req)
-	if res.Code != http.StatusAccepted {
-		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	var res *httptest.ResponseRecorder
+	for _, value := range []int{0, 1} {
+		req := httptest.NewRequest(http.MethodPost, "/signals", bytes.NewBufferString(fmt.Sprintf(`{"type":"metric","name":"worker.event_send_failures_total","service_id":"worker-01","service_type":"worker","stream_id":"stream-01","value":%d}`, value)))
+		req.Header.Set("Authorization", "Bearer service-token")
+		res = httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		if res.Code != http.StatusAccepted {
+			t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+		}
 	}
 	var response IngestResponse
 	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {

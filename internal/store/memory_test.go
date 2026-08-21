@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMemoryStoreDeduplicatesOpenIncidents(t *testing.T) {
@@ -28,6 +29,31 @@ func TestMemoryStoreDeduplicatesOpenIncidents(t *testing.T) {
 	}
 }
 
+func TestMemoryIncidentHistoryUsesStableCursor(t *testing.T) {
+	st := NewMemoryStore()
+	newest := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	st.incidents = map[string]Incident{
+		"inc-c": {ID: "inc-c", Rule: "c", UpdatedAt: newest},
+		"inc-b": {ID: "inc-b", Rule: "b", UpdatedAt: newest},
+		"inc-a": {ID: "inc-a", Rule: "a", UpdatedAt: newest.Add(-time.Second)},
+	}
+
+	first, err := st.ListIncidentHistory(t.Context(), 2, time.Time{}, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 || first[0].ID != "inc-c" || first[1].ID != "inc-b" {
+		t.Fatalf("unexpected first incident page: %#v", first)
+	}
+	second, err := st.ListIncidentHistory(t.Context(), 2, first[1].UpdatedAt, first[1].ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].ID != "inc-a" {
+		t.Fatalf("unexpected second incident page: %#v", second)
+	}
+}
+
 func TestMemoryStoreUpdatesIncidentStatus(t *testing.T) {
 	s := NewMemoryStore()
 	incident, _, err := s.UpsertIncident(t.Context(), Incident{Rule: "encoder_process_exited", Severity: "critical", ServiceID: "enc-01", SignalID: "sig-1"})
@@ -43,6 +69,122 @@ func TestMemoryStoreUpdatesIncidentStatus(t *testing.T) {
 	}
 	if _, err := s.UpdateIncidentStatus(t.Context(), incident.ID, "deleted"); err != ErrInvalidStatus {
 		t.Fatalf("expected invalid status, got %v", err)
+	}
+}
+
+func TestMemoryStorePreservesResolvedIncidentWhenSameProblemRecurs(t *testing.T) {
+	s := NewMemoryStore()
+	first, created, err := s.UpsertIncident(t.Context(), Incident{Rule: "encoder_process_exited", Severity: "critical", ServiceID: "enc-01", StreamID: "stream-01", SignalID: "sig-1"})
+	if err != nil || !created {
+		t.Fatalf("create first incident: created=%v err=%v", created, err)
+	}
+	if _, err := s.UpdateIncidentStatus(t.Context(), first.ID, "resolved"); err != nil {
+		t.Fatal(err)
+	}
+	second, created, err := s.UpsertIncident(t.Context(), Incident{Rule: "encoder_process_exited", Severity: "critical", ServiceID: "enc-01", StreamID: "stream-01", SignalID: "sig-2"})
+	if err != nil || !created {
+		t.Fatalf("create recurring incident: created=%v err=%v", created, err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("recurrence reused terminal incident id %q", first.ID)
+	}
+	incidents, err := s.ListIncidents(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents) != 2 {
+		t.Fatalf("resolved incident history was overwritten: %#v", incidents)
+	}
+}
+
+func TestMemoryStoreRejectsTerminalIncidentRollback(t *testing.T) {
+	s := NewMemoryStore()
+	incident, _, err := s.UpsertIncident(t.Context(), Incident{Rule: "encoder_process_exited", Severity: "critical", ServiceID: "enc-01", SignalID: "sig-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateIncidentStatus(t.Context(), incident.ID, "resolved"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateIncidentStatus(t.Context(), incident.ID, "acknowledged"); err != ErrInvalidTransition {
+		t.Fatalf("terminal incident rollback error = %v, want %v", err, ErrInvalidTransition)
+	}
+}
+
+func TestMemoryStoreAutoResolvesMatchingActiveIncident(t *testing.T) {
+	s := NewMemoryStore()
+	incident, _, err := s.UpsertIncident(t.Context(), Incident{Rule: "discord_audio_forward_failed", Severity: "error", ServiceID: "bot-01", StreamID: "stream-01", SignalID: "sig-failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := s.ResolveActiveIncidents(t.Context(), []string{"discord_audio_forward_failed"}, "bot-01", "stream-01", "sig-recovered", "recent_forward_succeeded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved) != 1 || resolved[0].ID != incident.ID || resolved[0].Status != "resolved" || resolved[0].ResolvedAt == nil {
+		t.Fatalf("unexpected auto-resolved incidents: %#v", resolved)
+	}
+	if resolved[0].ResolvedBySignalID != "sig-recovered" || resolved[0].ResolutionReason != "recent_forward_succeeded" {
+		t.Fatalf("recovery provenance was not retained: %#v", resolved[0])
+	}
+}
+
+func TestMemoryStoreRepeatedTerminalStatusPreservesRecoveryProvenance(t *testing.T) {
+	s := NewMemoryStore()
+	incident, _, err := s.UpsertIncident(t.Context(), Incident{Rule: "discord_audio_forward_failed", Severity: "error", ServiceID: "bot-01", StreamID: "stream-01", SignalID: "sig-failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := s.ResolveActiveIncidents(t.Context(), []string{incident.Rule}, incident.ServiceID, incident.StreamID, "sig-recovered", "recent_forward_succeeded")
+	if err != nil || len(resolved) != 1 {
+		t.Fatalf("auto resolve: resolved=%#v err=%v", resolved, err)
+	}
+	repeated, err := s.UpdateIncidentStatus(t.Context(), incident.ID, "resolved")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated.ResolvedBySignalID != "sig-recovered" || repeated.ResolutionReason != "recent_forward_succeeded" {
+		t.Fatalf("idempotent terminal update overwrote recovery provenance: %#v", repeated)
+	}
+}
+
+func TestMemoryStoreEscalatesActiveIncidentSeverityWithoutReplacingHistory(t *testing.T) {
+	s := NewMemoryStore()
+	first, created, err := s.UpsertIncident(t.Context(), Incident{Rule: "discord_audio_forward_failed", Severity: "warning", ServiceID: "bot-01", StreamID: "stream-01", SignalID: "sig-warning"})
+	if err != nil || !created {
+		t.Fatalf("create warning incident: created=%v err=%v", created, err)
+	}
+	escalated, created, err := s.UpsertIncident(t.Context(), Incident{Rule: first.Rule, Severity: "error", ServiceID: first.ServiceID, StreamID: first.StreamID, SignalID: "sig-error"})
+	if err != nil || created {
+		t.Fatalf("escalate active incident: created=%v err=%v", created, err)
+	}
+	if escalated.ID != first.ID || escalated.Severity != "error" || !escalated.SeverityChanged {
+		t.Fatalf("active incident did not escalate in place: %#v", escalated)
+	}
+	downgraded, created, err := s.UpsertIncident(t.Context(), Incident{Rule: first.Rule, Severity: "warning", ServiceID: first.ServiceID, StreamID: first.StreamID, SignalID: "sig-warning-again"})
+	if err != nil || created {
+		t.Fatalf("repeat lower severity incident: created=%v err=%v", created, err)
+	}
+	if downgraded.Severity != "error" || downgraded.SeverityChanged {
+		t.Fatalf("active incident severity was downgraded or spuriously marked changed: %#v", downgraded)
+	}
+}
+
+func TestMemoryStoreListsMetricHistoryWithinRange(t *testing.T) {
+	s := NewMemoryStore()
+	now := time.Now().UTC()
+	for index, at := range []time.Time{now.Add(-20 * time.Minute), now.Add(-10 * time.Minute), now.Add(-time.Minute)} {
+		value := float64(index + 1)
+		if _, err := s.SaveSignal(t.Context(), Signal{Type: "metric", Name: "worker.cpu_percent", ServiceID: "worker-01", ServiceType: "worker", Value: &value, Timestamp: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metrics, err := s.ListMetricSnapshots(t.Context(), MetricQuery{Since: now.Add(-15 * time.Minute), MaxPointsPerSeries: 360})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metrics) != 2 || metrics[0].UpdatedAt.Before(now.Add(-15*time.Minute)) {
+		t.Fatalf("metric range was not applied: %#v", metrics)
 	}
 }
 

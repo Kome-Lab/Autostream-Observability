@@ -69,7 +69,7 @@ func TestRequiredDetectionRules(t *testing.T) {
 }
 
 func TestDiscordAudioForwardErrorsRecoveredWhenRecentForwardSucceeded(t *testing.T) {
-	incidents := Evaluate(Signal{
+	evaluation := EvaluateSignal(Signal{
 		Name:       "discord.audio_forward_errors_total",
 		Value:      1,
 		StreamLive: true,
@@ -78,8 +78,94 @@ func TestDiscordAudioForwardErrorsRecoveredWhenRecentForwardSucceeded(t *testing
 			"discord.audio_last_forward_age_sec": 1,
 		},
 	})
-	if len(incidents) != 1 || incidents[0].Rule != "discord_audio_forward_recovered" || incidents[0].Severity != "info" {
-		t.Fatalf("unexpected incidents: %#v", incidents)
+	if len(evaluation.Incidents) != 0 {
+		t.Fatalf("recovery must not create another incident: %#v", evaluation.Incidents)
+	}
+	if len(evaluation.Recoveries) == 0 || evaluation.Recoveries[0].Rule != "discord_audio_forward_failed" {
+		t.Fatalf("forward recovery was not expressed as a lifecycle transition: %#v", evaluation.Recoveries)
+	}
+}
+
+func TestEvaluateSignalDeclaresGaugeRecoveries(t *testing.T) {
+	evaluation := EvaluateSignal(Signal{Name: "encoder.process_alive", Value: 1, StreamLive: true})
+	if len(evaluation.Incidents) != 0 || len(evaluation.Recoveries) != 1 || evaluation.Recoveries[0].Rule != "encoder_process_exited" {
+		t.Fatalf("unexpected encoder recovery: %#v", evaluation)
+	}
+}
+
+func TestRecorderFileGrowthAloneDoesNotResolveStoppedWriter(t *testing.T) {
+	evaluation := EvaluateSignal(Signal{Name: "recorder.file_size_bytes", Value: 1024, StreamLive: true})
+	for _, recovery := range evaluation.Recoveries {
+		if recovery.Rule == "recorder_not_writing" {
+			t.Fatalf("stale file size must not prove that recording writes resumed: %#v", evaluation.Recoveries)
+		}
+	}
+
+	evaluation = EvaluateSignal(Signal{Name: "recorder.write_bitrate_kbps", Value: 8000, StreamLive: true})
+	if len(evaluation.Recoveries) != 1 || evaluation.Recoveries[0].Rule != "recorder_not_writing" {
+		t.Fatalf("positive write bitrate must resolve recorder_not_writing: %#v", evaluation.Recoveries)
+	}
+}
+
+func TestCumulativeRulesUseCounterDeltaWhenProvided(t *testing.T) {
+	baseline := EvaluateSignal(Signal{
+		Name:       "worker.event_send_failures_total",
+		Value:      42,
+		Attributes: map[string]any{"observability.counter_delta": 0.0},
+	})
+	if len(baseline.Incidents) != 0 {
+		t.Fatalf("unchanged cumulative total must not reopen an incident: %#v", baseline.Incidents)
+	}
+	if len(baseline.Recoveries) != 1 || baseline.Recoveries[0].Rule != "worker_event_send_failed" {
+		t.Fatalf("unchanged cumulative total must converge the active incident: %#v", baseline.Recoveries)
+	}
+
+	increase := EvaluateSignal(Signal{
+		Name:       "worker.event_send_failures_total",
+		Value:      43,
+		Attributes: map[string]any{"observability.counter_delta": 1.0},
+	})
+	if len(increase.Incidents) != 1 || increase.Incidents[0].Rule != "worker_event_send_failed" {
+		t.Fatalf("new cumulative failures must open an incident: %#v", increase.Incidents)
+	}
+}
+
+func TestEvaluateSignalDeclaresNormalStateRecoveries(t *testing.T) {
+	cases := []struct {
+		name string
+		in   Signal
+		rule string
+	}{
+		{name: "heartbeat current", in: Signal{Name: "heartbeat.age_sec", Value: 5}, rule: "heartbeat_timeout"},
+		{name: "remux normal", in: Signal{Name: "recorder.remux_duration_ms", Value: 1000}, rule: "archive_remux_slow"},
+		{name: "drive retry normal", in: Signal{Name: "gdrive.upload_retry_count", Value: 0}, rule: "gdrive_upload_retry_high"},
+		{name: "rtmps reconnect reset", in: Signal{Name: "encoder.rtmp_reconnect_count", Value: 0, StreamLive: true}, rule: "rtmps_reconnect_loop"},
+		{name: "dropped frames reset", in: Signal{Name: "encoder.dropped_frames_total", Value: 0, StreamLive: true}, rule: "encoder_dropped_frames_high"},
+		{name: "audio clipping reset", in: Signal{Name: "encoder.audio_clipping_total", Value: 0, StreamLive: true}, rule: "audio_clipping"},
+		{name: "discord reconnect reset", in: Signal{Name: "discord.reconnect_count", Value: 0, StreamLive: true}, rule: "discord_reconnect_loop"},
+		{name: "discord voice healthy", in: Signal{Name: "discord.voice_disconnect_count", Value: 0, StreamLive: true}, rule: "discord_voice_disconnected"},
+		{name: "worker delivery healthy", in: Signal{Name: "worker.event_send_failures_total", Value: 0}, rule: "worker_event_send_failed"},
+		{name: "bot delivery healthy", in: Signal{Name: "discord.worker_event_publish_failures_total", Value: 0}, rule: "worker_event_send_failed"},
+		{name: "start duration healthy", in: Signal{Name: "stream.start_duration_ms", Value: 1000}, rule: "stream_start_timeout"},
+		{name: "stop duration healthy", in: Signal{Name: "stream.stop_duration_ms", Value: 1000}, rule: "stream_stop_timeout"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evaluation := EvaluateSignal(tc.in)
+			if len(evaluation.Incidents) != 0 {
+				t.Fatalf("normal signal created an incident: %#v", evaluation.Incidents)
+			}
+			found := false
+			for _, recovery := range evaluation.Recoveries {
+				if recovery.Rule == tc.rule {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("normal signal did not resolve %q: %#v", tc.rule, evaluation.Recoveries)
+			}
+		})
 	}
 }
 
