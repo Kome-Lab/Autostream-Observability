@@ -57,15 +57,15 @@ func TestExecuteBlocksDangerousAction(t *testing.T) {
 	}
 }
 
-func TestExecuteRequiresApproval(t *testing.T) {
+func TestApprovedHostProposalPreservesRecordedNoopCompatibility(t *testing.T) {
 	action := Execute(store.RemediationAction{Action: "restart_encoder_recorder", Mode: ModeManualApproval, RequiresApproval: true, Status: "pending_approval"})
 	if action.Status != "blocked" {
 		t.Fatalf("manual action without approval must be blocked: %#v", action)
 	}
 	action = Approve(store.RemediationAction{Action: "restart_encoder_recorder", Mode: ModeManualApproval, RequiresApproval: true, Status: "pending_approval"})
 	action = Execute(action)
-	if action.Status != "executed" {
-		t.Fatalf("approved manual action should execute as recorded noop: %#v", action)
+	if action.Status != "executed" || action.Result != "recorded_noop" || action.ExecutedAt == nil {
+		t.Fatalf("approved host proposal compatibility changed: %#v", action)
 	}
 }
 
@@ -91,6 +91,33 @@ func TestExecuteDoesNotReexecuteTerminalActions(t *testing.T) {
 	blocked := Execute(store.RemediationAction{Action: "retry_package_remux", Mode: ModeSafeAuto, SafeAuto: true, Status: "blocked"})
 	if blocked.Status != "blocked" || blocked.Result != "remediation action is already terminal" {
 		t.Fatalf("blocked action should remain terminal without execution: %#v", blocked)
+	}
+}
+
+func TestUnknownActionFailsClosedAndIsNotBuilt(t *testing.T) {
+	action := Execute(store.RemediationAction{Action: "run_arbitrary_command", Mode: ModeSafeAuto, Status: "suggested", SafeAuto: true})
+	if action.Status != "blocked" || action.Result != "unsupported remediation action" || action.ExecutedAt != nil {
+		t.Fatalf("unknown action did not fail closed: %#v", action)
+	}
+	actions := BuildActions(store.Incident{ID: "incident-1", Report: diagnostics.Report{
+		SafeAutoCandidates: []string{"run_arbitrary_command", "rerun_diagnostics"},
+		ApprovalRequired:   []string{"unknown_host_action", "restart_worker"},
+	}}, ModeSafeAuto)
+	if len(actions) != 2 || !hasAction(actions, "rerun_diagnostics") || !hasAction(actions, "restart_worker") {
+		t.Fatalf("action builder did not retain only closed known actions: %#v", actions)
+	}
+}
+
+func TestObservabilityLocalSafeActionsAreExactlyEnumerated(t *testing.T) {
+	for _, action := range []string{"refresh_service_status", "rerun_diagnostics", "clear_stale_warning"} {
+		if !IsLocalTransition(action) {
+			t.Fatalf("expected local action %q", action)
+		}
+	}
+	for _, action := range []string{"retry_gdrive_upload", "retry_package_remux", "restart_worker", "host.systemd", "host.docker", "host.self_update"} {
+		if IsLocalTransition(action) {
+			t.Fatalf("non-local action %q entered Observability execution scope", action)
+		}
 	}
 }
 

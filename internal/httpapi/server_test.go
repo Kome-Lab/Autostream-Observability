@@ -21,6 +21,7 @@ import (
 	"github.com/example/autostream-observability/internal/control"
 	"github.com/example/autostream-observability/internal/diagnostics"
 	"github.com/example/autostream-observability/internal/notifications"
+	"github.com/example/autostream-observability/internal/remediation"
 	"github.com/example/autostream-observability/internal/store"
 	"github.com/example/autostream-observability/internal/version"
 )
@@ -883,7 +884,7 @@ func TestWorkerEventSendFailuresCreateIncident(t *testing.T) {
 	}
 }
 
-func TestApproveAndExecuteRemediationAction(t *testing.T) {
+func TestApprovedHostSymptomPreservesRecordedNoopWithoutDispatch(t *testing.T) {
 	st := store.NewMemoryStore()
 	action, err := st.CreateRemediationAction(t.Context(), store.RemediationAction{IncidentID: "inc-1", Action: "restart_encoder_recorder", Mode: "manual_approval", Status: "pending_approval", RequiresApproval: true})
 	if err != nil {
@@ -904,8 +905,8 @@ func TestApproveAndExecuteRemediationAction(t *testing.T) {
 	if execRes.Code != http.StatusOK {
 		t.Fatalf("execute status = %d body = %s", execRes.Code, execRes.Body.String())
 	}
-	if !strings.Contains(execRes.Body.String(), `"status":"executed"`) {
-		t.Fatalf("expected executed action: %s", execRes.Body.String())
+	if !strings.Contains(execRes.Body.String(), `"status":"executed"`) || !strings.Contains(execRes.Body.String(), `"result":"recorded_noop"`) {
+		t.Fatalf("host symptom compatibility changed: %s", execRes.Body.String())
 	}
 }
 
@@ -925,6 +926,38 @@ func TestExecuteBlocksDangerousRemediationAction(t *testing.T) {
 	}
 	if strings.Contains(res.Body.String(), "archive/path") {
 		t.Fatalf("unexpected sensitive content: %s", res.Body.String())
+	}
+}
+
+func TestHostSystemAndUnknownActionsNeverDispatch(t *testing.T) {
+	tests := []struct {
+		action     store.RemediationAction
+		wantStatus int
+	}{
+		{store.RemediationAction{IncidentID: "inc-1", Action: "restart_worker", Mode: "manual_approval", Status: "approved", RequiresApproval: true}, http.StatusOK},
+		{store.RemediationAction{IncidentID: "inc-1", Action: "host.systemd", Mode: "safe_auto", Status: "suggested", SafeAuto: true}, http.StatusForbidden},
+		{store.RemediationAction{IncidentID: "inc-1", Action: "run_arbitrary_command", Mode: "safe_auto", Status: "suggested", SafeAuto: true}, http.StatusForbidden},
+	}
+	for _, test := range tests {
+		t.Run(strings.ReplaceAll(test.action.Action, ".", "_"), func(t *testing.T) {
+			st := store.NewMemoryStore()
+			action, err := st.CreateRemediationAction(t.Context(), test.action)
+			if err != nil {
+				t.Fatal(err)
+			}
+			executor := &fakeControlExecutor{}
+			handler := NewServerWithStoreAuthNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("service-token"), nil, executor)
+			req := httptest.NewRequest(http.MethodPost, "/remediation-actions/"+action.ID+"/execute", nil)
+			req.Header.Set("Authorization", "Bearer service-token")
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
+			if res.Code != test.wantStatus {
+				t.Fatalf("action %q status = %d body = %s", test.action.Action, res.Code, res.Body.String())
+			}
+			if len(executor.calls) != 0 {
+				t.Fatalf("action %q reached Control Panel dispatch: %#v", test.action.Action, executor.calls)
+			}
+		})
 	}
 }
 
@@ -985,11 +1018,61 @@ func TestExecuteArchiveRemediationDispatchesToControlPanel(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
 	}
-	if len(executor.calls) != 1 || executor.calls[0].ActionID != action.ID || executor.calls[0].IncidentID != incident.ID || executor.calls[0].Action != "retry_package_remux" || executor.calls[0].StreamID != "stream-01" {
+	if len(executor.calls) != 1 || executor.calls[0].Proposal.ProposalID != action.ID || executor.calls[0].Proposal.IncidentID != incident.ID || executor.calls[0].Proposal.ActionType != remediation.ProposalRetryPackageRemux || executor.calls[0].StreamID != "stream-01" {
 		t.Fatalf("unexpected executor calls: %#v", executor.calls)
+	}
+	proposal := executor.calls[0].Proposal
+	if !proposal.ControlPanelAuthorizationRequired || proposal.Detector.ServiceType != remediation.ServiceTypeObservability || proposal.Target.ServiceType != remediation.ServiceTypeEncoder || len(proposal.Evidence) != 3 {
+		t.Fatalf("dispatch did not cross the typed proposal boundary: %#v", proposal)
 	}
 	if !strings.Contains(res.Body.String(), "control_panel_dispatch_executed") {
 		t.Fatalf("expected dispatch result: %s", res.Body.String())
+	}
+}
+
+func TestApplicationProposalBindsDetectorAfterStagedIdentityAppears(t *testing.T) {
+	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "1")
+	configPath := filepath.Join(t.TempDir(), "node.yml")
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
+
+	st := store.NewMemoryStore()
+	incident, _, err := st.UpsertIncident(t.Context(), store.Incident{Rule: "archive_package_failed", Severity: "error", Status: "open", SummaryJA: "Package failed.", ServiceID: "enc-01", StreamID: "stream-01", SignalID: "sig-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := st.CreateRemediationAction(t.Context(), store.RemediationAction{IncidentID: incident.ID, Action: "retry_package_remux", Mode: "safe_auto", Status: "suggested", SafeAuto: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &fakeControlExecutor{}
+	handler := NewServerWithStoreAuthNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("service-token"), nil, executor)
+	config := `panel:
+  url: "https://panel.example.jp"
+node:
+  id: "observability-staged-1"
+  name: "Observability Staged"
+  type: "observability"
+api:
+  host: "observability.example.jp"
+  port: 8443
+  ssl_enabled: true
+auth:
+  token_id: "test-token-id"
+  token: "test-runtime-secret"
+`
+	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/remediation-actions/"+action.ID+"/execute", nil)
+	req.Header.Set("Authorization", "Bearer service-token")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", res.Code, res.Body.String())
+	}
+	if len(executor.calls) != 1 || executor.calls[0].Proposal.Detector.ServiceID != "observability-staged-1" {
+		t.Fatalf("proposal did not bind the staged authoritative identity: %#v", executor.calls)
 	}
 }
 
@@ -1177,7 +1260,7 @@ func TestIngestTokenCannotExecuteRemediation(t *testing.T) {
 	if adminRes.Code != http.StatusOK {
 		t.Fatalf("admin execute status = %d body = %s", adminRes.Code, adminRes.Body.String())
 	}
-	if len(executor.calls) != 1 || executor.calls[0].ActionID != action.ID || executor.calls[0].IncidentID != incident.ID || executor.calls[0].StreamID != "victim-stream" {
+	if len(executor.calls) != 1 || executor.calls[0].Proposal.ProposalID != action.ID || executor.calls[0].Proposal.IncidentID != incident.ID || executor.calls[0].StreamID != "victim-stream" {
 		t.Fatalf("expected one admin-dispatched remediation, got %#v", executor.calls)
 	}
 }
@@ -2977,8 +3060,13 @@ func (p partialFailureNotifier) NotifyIncidentOpened(ctx context.Context, incide
 	}, errors.New("partial notification failure")
 }
 
+type remediationProposalCall struct {
+	Proposal remediation.Proposal
+	StreamID string
+}
+
 type fakeControlExecutor struct {
-	calls []control.RemediationRequest
+	calls []remediationProposalCall
 	err   error
 }
 
@@ -3005,14 +3093,14 @@ func (s *diagnosticRaceStore) UpdateIncidentDiagnostic(ctx context.Context, id, 
 	return s.MemoryStore.UpdateIncidentDiagnostic(ctx, id, expectedSignalID, report)
 }
 
-func (f *fakeControlExecutor) ExecuteRemediation(ctx context.Context, req control.RemediationRequest) error {
+func (f *fakeControlExecutor) ExecuteRemediationProposal(ctx context.Context, proposal remediation.Proposal, streamID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if f.err != nil {
 		return f.err
 	}
-	f.calls = append(f.calls, req)
+	f.calls = append(f.calls, remediationProposalCall{Proposal: proposal, StreamID: streamID})
 	return nil
 }
 

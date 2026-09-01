@@ -38,7 +38,8 @@ func BuildActions(incident store.Incident, mode string) []store.RemediationActio
 	seen := map[string]bool{}
 	for _, action := range incident.Report.SafeAutoCandidates {
 		action = strings.TrimSpace(action)
-		if action == "" || IsDangerous(action) || seen[action] {
+		class := ClassifyLegacyAction(action)
+		if action == "" || class == LegacyActionUnknown || class == LegacyActionForbidden || seen[action] {
 			continue
 		}
 		seen[action] = true
@@ -52,7 +53,8 @@ func BuildActions(incident store.Incident, mode string) []store.RemediationActio
 	}
 	for _, action := range incident.Report.ApprovalRequired {
 		action = strings.TrimSpace(action)
-		if action == "" || IsDangerous(action) || seen[action] {
+		class := ClassifyLegacyAction(action)
+		if action == "" || class == LegacyActionUnknown || class == LegacyActionForbidden || seen[action] {
 			continue
 		}
 		seen[action] = true
@@ -98,9 +100,15 @@ func Execute(action store.RemediationAction) store.RemediationAction {
 		action.Result = "manual approval is required"
 		return action
 	}
-	if IsDangerous(action.Action) {
+	class := ClassifyLegacyAction(action.Action)
+	if class == LegacyActionForbidden {
 		action.Status = "blocked"
 		action.Result = "dangerous action is never auto-executed"
+		return action
+	}
+	if class == LegacyActionUnknown {
+		action.Status = "blocked"
+		action.Result = "unsupported remediation action"
 		return action
 	}
 	if action.RequiresApproval && action.Status != "approved" {
@@ -113,8 +121,22 @@ func Execute(action store.RemediationAction) store.RemediationAction {
 		action.Result = "action is not marked safe"
 		return action
 	}
+	if class == LegacyActionHostProposalOnly {
+		// Bundle 5 preparation preserves the v1 response contract for approved
+		// restart/reconnect records. This is only a terminal proposal/no-op
+		// record: requiresControlPanelDispatch excludes it, and no host or
+		// Updater execution authority exists in this service.
+		action.Status = "executed"
+		action.Result = "recorded_noop"
+		action.ExecutedAt = &now
+		return action
+	}
 	action.Status = "executed"
-	action.Result = "recorded_noop"
+	if class == LegacyActionLocalTransition {
+		action.Result = "observability_local_transition_recorded"
+	} else {
+		action.Result = "control_panel_proposal_ready"
+	}
 	action.ExecutedAt = &now
 	return action
 }
@@ -129,6 +151,9 @@ func IsTerminalStatus(status string) bool {
 }
 
 func IsSafeAuto(action string) bool {
+	// This v1 persistence flag is retained for compatibility through Bundle 8.
+	// Only IsLocalTransition describes Observability-local execution; the two
+	// retry values become typed proposals before the legacy Control Panel wire.
 	switch action {
 	case "retry_gdrive_upload", "refresh_service_status", "rerun_diagnostics", "clear_stale_warning", "retry_package_remux":
 		return true

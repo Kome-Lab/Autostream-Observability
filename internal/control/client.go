@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/example/autostream-observability/internal/remediation"
 	"github.com/example/autostream-observability/internal/version"
 )
 
@@ -24,6 +25,15 @@ const (
 	notificationEmailRelayTimeout  = 25 * time.Second
 	maxNotificationEmailTextBytes  = 16 * 1024
 	maxNotificationEmailHTMLBytes  = 64 * 1024
+
+	// The Control Panel typed proposal endpoint is intentionally deferred. This
+	// adapter preserves the two application retry behaviors only until the
+	// declared compatibility removal wave; it never carries proposal evidence.
+	//
+	// removal_wave: Execution Bundle 8
+	// typed_endpoint: pending
+	LegacyRemediationAdapterRemovalWave = "Execution Bundle 8"
+	LegacyRemediationTypedEndpointState = "pending"
 )
 
 type Client struct {
@@ -38,7 +48,7 @@ type Client struct {
 	HTTP             *http.Client
 }
 
-type RemediationRequest struct {
+type legacyRemediationRequest struct {
 	ActionID   string `json:"action_id"`
 	Action     string `json:"action"`
 	IncidentID string `json:"incident_id"`
@@ -116,7 +126,42 @@ func (c Client) Enabled() bool {
 	return strings.TrimSpace(c.ConfigError) == "" && strings.TrimSpace(c.BaseURL) != "" && strings.TrimSpace(c.Token) != ""
 }
 
-func (c Client) ExecuteRemediation(ctx context.Context, req RemediationRequest) error {
+func (c Client) ExecuteRemediationProposal(ctx context.Context, proposal remediation.Proposal, streamID string) error {
+	if strings.TrimSpace(c.ServiceID) != "" && proposal.Detector.ServiceID != strings.TrimSpace(c.ServiceID) {
+		return errors.New("remediation proposal detector identity mismatch")
+	}
+	req, err := adaptProposalToLegacyRemediationRequest(proposal, streamID)
+	if err != nil {
+		return err
+	}
+	return c.executeLegacyRemediation(ctx, req)
+}
+
+// adaptProposalToLegacyRemediationRequest is the explicit Bundle 8 removal
+// boundary. It accepts only the two retained application retries and reduces a
+// validated proposal to the legacy four correlation fields. Evidence,
+// revisions, digests, capabilities, and any future fields cannot cross it.
+func adaptProposalToLegacyRemediationRequest(proposal remediation.Proposal, streamID string) (legacyRemediationRequest, error) {
+	if err := proposal.Validate(); err != nil {
+		return legacyRemediationRequest{}, errors.New("remediation proposal is invalid")
+	}
+	action, ok := remediation.LegacyRetryAction(proposal.ActionType)
+	if !ok {
+		return legacyRemediationRequest{}, errors.New("remediation proposal is not supported by the legacy adapter")
+	}
+	streamID = strings.TrimSpace(streamID)
+	if !remediation.IsBoundedCorrelationID(streamID) {
+		return legacyRemediationRequest{}, errors.New("remediation proposal stream correlation is invalid")
+	}
+	return legacyRemediationRequest{
+		ActionID:   proposal.ProposalID,
+		Action:     action,
+		IncidentID: proposal.IncidentID,
+		StreamID:   streamID,
+	}, nil
+}
+
+func (c Client) executeLegacyRemediation(ctx context.Context, req legacyRemediationRequest) error {
 	if strings.TrimSpace(c.ConfigError) != "" {
 		return errors.New(c.ConfigError)
 	}

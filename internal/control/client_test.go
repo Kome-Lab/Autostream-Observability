@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/example/autostream-observability/internal/remediation"
 	"github.com/example/autostream-observability/internal/version"
 )
 
@@ -127,7 +128,7 @@ func TestSendNotificationEmailExposesRateLimitedCodeFromHTTP429(t *testing.T) {
 func TestExecuteRemediationDispatchesToControlPanel(t *testing.T) {
 	var gotAuth string
 	var gotPath string
-	var gotBody RemediationRequest
+	var gotBody legacyRemediationRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		gotPath = r.URL.Path
@@ -138,7 +139,7 @@ func TestExecuteRemediationDispatchesToControlPanel(t *testing.T) {
 	}))
 	defer server.Close()
 	client := Client{BaseURL: server.URL, Token: "secret-token", HTTP: server.Client()}
-	if err := client.ExecuteRemediation(t.Context(), RemediationRequest{ActionID: "action-1", Action: "retry_package_remux", IncidentID: "inc-1", StreamID: "stream-1"}); err != nil {
+	if err := client.ExecuteRemediationProposal(t.Context(), testRemediationProposal(remediation.ProposalRetryPackageRemux), "stream-1"); err != nil {
 		t.Fatal(err)
 	}
 	if gotPath != "/services/remediation-actions/execute" {
@@ -158,7 +159,7 @@ func TestExecuteRemediationErrorsDoNotLeakToken(t *testing.T) {
 	}))
 	defer server.Close()
 	client := Client{BaseURL: server.URL, Token: "secret-token", HTTP: server.Client()}
-	err := client.ExecuteRemediation(t.Context(), RemediationRequest{ActionID: "action-1", Action: "retry_gdrive_upload", IncidentID: "inc-1", StreamID: "stream-1"})
+	err := client.ExecuteRemediationProposal(t.Context(), testRemediationProposal(remediation.ProposalRetryGDriveUpload), "stream-1")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -169,7 +170,7 @@ func TestExecuteRemediationErrorsDoNotLeakToken(t *testing.T) {
 
 func TestExecuteRemediationRejectsControlPanelURLUserinfo(t *testing.T) {
 	client := Client{BaseURL: "https://user:pass@control.example.com", Token: "secret-token"}
-	err := client.ExecuteRemediation(t.Context(), RemediationRequest{ActionID: "action-1", Action: "retry_gdrive_upload", IncidentID: "inc-1", StreamID: "stream-1"})
+	err := client.ExecuteRemediationProposal(t.Context(), testRemediationProposal(remediation.ProposalRetryGDriveUpload), "stream-1")
 	if err == nil {
 		t.Fatal("expected userinfo URL to be rejected")
 	}
@@ -177,7 +178,7 @@ func TestExecuteRemediationRejectsControlPanelURLUserinfo(t *testing.T) {
 
 func TestExecuteRemediationRejectsRemoteHTTPControlPanelURL(t *testing.T) {
 	client := Client{BaseURL: "http://control.example.com", Token: "secret-token"}
-	err := client.ExecuteRemediation(t.Context(), RemediationRequest{ActionID: "action-1", Action: "retry_gdrive_upload", IncidentID: "inc-1", StreamID: "stream-1"})
+	err := client.ExecuteRemediationProposal(t.Context(), testRemediationProposal(remediation.ProposalRetryGDriveUpload), "stream-1")
 	if err == nil {
 		t.Fatal("expected remote http URL to be rejected")
 	}
@@ -192,7 +193,7 @@ func TestExecuteRemediationAllowsLocalHTTPControlPanelURL(t *testing.T) {
 	}))
 	defer server.Close()
 	client := Client{BaseURL: server.URL, Token: "secret-token", HTTP: server.Client()}
-	if err := client.ExecuteRemediation(t.Context(), RemediationRequest{ActionID: "action-1", Action: "retry_gdrive_upload", IncidentID: "inc-1", StreamID: "stream-1"}); err != nil {
+	if err := client.ExecuteRemediationProposal(t.Context(), testRemediationProposal(remediation.ProposalRetryGDriveUpload), "stream-1"); err != nil {
 		t.Fatalf("expected local http URL to be allowed: %v", err)
 	}
 }
@@ -209,12 +210,74 @@ func TestExecuteRemediationDoesNotFollowRedirectsWithBearerToken(t *testing.T) {
 	}))
 	defer server.Close()
 	client := Client{BaseURL: server.URL, Token: "secret-token"}
-	err := client.ExecuteRemediation(t.Context(), RemediationRequest{ActionID: "action-1", Action: "retry_gdrive_upload", IncidentID: "inc-1", StreamID: "stream-1"})
+	err := client.ExecuteRemediationProposal(t.Context(), testRemediationProposal(remediation.ProposalRetryGDriveUpload), "stream-1")
 	if err == nil {
 		t.Fatal("expected redirect response to fail dispatch")
 	}
 	if redirectedAuth != "" {
 		t.Fatalf("authorization header followed redirect: %q", redirectedAuth)
+	}
+}
+
+func TestLegacyRemediationAdapterDropsTypedEvidenceAndAllowsOnlyApplicationRetries(t *testing.T) {
+	proposal := testRemediationProposal(remediation.ProposalRetryPackageRemux)
+	legacy, err := adaptProposalToLegacyRemediationRequest(proposal, "stream-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(body, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 4 || fields["action"] != "retry_package_remux" {
+		t.Fatalf("legacy adapter must emit exactly four retained fields: %s", body)
+	}
+	for _, forbidden := range []string{"evidence", "digest", "revision", "capability", "correlation", "stdout", "stderr", "token", "path", "environment"} {
+		if strings.Contains(strings.ToLower(string(body)), forbidden) {
+			t.Fatalf("legacy adapter leaked typed or unsafe field %q: %s", forbidden, body)
+		}
+	}
+	if LegacyRemediationAdapterRemovalWave != "Execution Bundle 8" || LegacyRemediationTypedEndpointState != "pending" {
+		t.Fatalf("legacy adapter lifecycle metadata changed")
+	}
+
+	hostProposal := proposal
+	hostProposal.ActionType = remediation.ProposalHostSystemd
+	hostProposal.RequiredCapability = remediation.ProposalHostSystemd
+	hostProposal.Target.ServiceType = remediation.ServiceTypeWorker
+	hostProposal.Target.HostID = "host-1"
+	if _, err := adaptProposalToLegacyRemediationRequest(hostProposal, "stream-1"); err == nil {
+		t.Fatal("host proposal must not enter the legacy application retry endpoint")
+	}
+	if _, err := adaptProposalToLegacyRemediationRequest(proposal, "C:/host/private/stream"); err == nil {
+		t.Fatal("path-shaped stream correlation must be rejected")
+	}
+}
+
+func testRemediationProposal(action remediation.ProposalAction) remediation.Proposal {
+	observedAt := time.Date(2026, time.August, 31, 12, 0, 0, 0, time.UTC)
+	return remediation.Proposal{
+		ProposalID: "action-1",
+		IncidentID: "inc-1",
+		Detector: remediation.ProposalDetectorIdentity{
+			ServiceID:   "observability-1",
+			ServiceType: remediation.ServiceTypeObservability,
+		},
+		Target: remediation.ProposalTargetIdentity{
+			ServiceID:   "encoder-1",
+			ServiceType: remediation.ServiceTypeEncoder,
+		},
+		ActionType:                        action,
+		ProposalRevision:                  1,
+		RequiredCapability:                action,
+		Evidence:                          []remediation.ProposalEvidence{{EvidenceCode: remediation.EvidenceRetryEligible, ObservedAt: observedAt, ObservedRevision: 1, EvidenceDigest: "sha256:" + strings.Repeat("a", 64)}},
+		AuditCorrelationID:                "audit-1",
+		ObservedAt:                        observedAt,
+		ControlPanelAuthorizationRequired: true,
 	}
 }
 

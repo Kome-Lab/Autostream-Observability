@@ -77,13 +77,13 @@ const (
 )
 
 type controlExecutor interface {
-	ExecuteRemediation(ctx context.Context, req control.RemediationRequest) error
+	ExecuteRemediationProposal(ctx context.Context, proposal remediation.Proposal, streamID string) error
 }
 
 type envControlExecutor struct{}
 
-func (envControlExecutor) ExecuteRemediation(ctx context.Context, req control.RemediationRequest) error {
-	return control.FromEnv().ExecuteRemediation(ctx, req)
+func (envControlExecutor) ExecuteRemediationProposal(ctx context.Context, proposal remediation.Proposal, streamID string) error {
+	return control.FromEnv().ExecuteRemediationProposal(ctx, proposal, streamID)
 }
 
 type envEmailRelay struct{}
@@ -1331,11 +1331,7 @@ func (s *Server) executeRemediationAction(w http.ResponseWriter, r *http.Request
 			action.Status = "blocked"
 			action.Result = "stream_id is required for control panel dispatch"
 			action.ExecutedAt = nil
-		} else if s.executor == nil {
-			action.Status = "blocked"
-			action.Result = "control panel dispatch is not configured"
-			action.ExecutedAt = nil
-		} else if err := s.executor.ExecuteRemediation(r.Context(), control.RemediationRequest{ActionID: action.ID, Action: action.Action, IncidentID: action.IncidentID, StreamID: incident.StreamID}); err != nil {
+		} else if err := s.dispatchApplicationRetryProposal(r.Context(), action, incident); err != nil {
 			action.Status = "blocked"
 			action.Result = "control panel dispatch failed"
 			action.ExecutedAt = nil
@@ -1364,13 +1360,23 @@ func (s *Server) executeRemediationAction(w http.ResponseWriter, r *http.Request
 	writeJSON(w, status, action)
 }
 
-func requiresControlPanelDispatch(action string) bool {
-	switch action {
-	case "retry_gdrive_upload", "retry_package_remux":
-		return true
-	default:
-		return false
+func (s *Server) dispatchApplicationRetryProposal(ctx context.Context, action store.RemediationAction, incident store.Incident) error {
+	if s.executor == nil {
+		return errors.New("control panel proposal dispatch is not configured")
 	}
+	identity, err := s.updaterIdentity.ResolveFromEnv()
+	if err != nil {
+		return err
+	}
+	proposal, err := remediation.NewApplicationRetryProposal(action, incident, identity.ServiceID, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	return s.executor.ExecuteRemediationProposal(ctx, proposal, incident.StreamID)
+}
+
+func requiresControlPanelDispatch(action string) bool {
+	return remediation.ClassifyLegacyAction(action) == remediation.LegacyActionApplicationProposal
 }
 
 func (s *Server) evaluateAndStoreIncidents(r *http.Request, signal store.Signal) ([]store.Incident, error) {
