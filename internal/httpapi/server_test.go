@@ -66,6 +66,9 @@ auth:
 	if got := res.Header().Get("Content-Type"); got != "application/json" {
 		t.Fatalf("content type = %q", got)
 	}
+	if got := res.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("cache control = %q", got)
+	}
 	var response map[string]any
 	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
 		t.Fatal(err)
@@ -76,6 +79,19 @@ auth:
 		response["service_type"] != control.ServiceType ||
 		response["config_revision"] != float64(9) {
 		t.Fatalf("unexpected updater identity response: %#v", response)
+	}
+
+	methodReq := httptest.NewRequest(http.MethodPost, "/updater/version", nil)
+	methodRes := httptest.NewRecorder()
+	handler.ServeHTTP(methodRes, methodReq)
+	if methodRes.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("updater version POST status = %d body = %s", methodRes.Code, methodRes.Body.String())
+	}
+	if got := methodRes.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("updater version POST cache control = %q", got)
+	}
+	if got := methodRes.Header().Get("Allow"); !strings.Contains(got, http.MethodGet) {
+		t.Fatalf("updater version POST Allow = %q", got)
 	}
 }
 
