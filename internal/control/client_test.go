@@ -40,6 +40,31 @@ func TestSendNotificationEmailDispatchesAuthenticatedPayload(t *testing.T) {
 	}
 }
 
+func TestGlobalSMTPAuthorityRequiresExactNonSecretReadinessContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/services/notifications/email/readiness" || r.Header.Get("Authorization") != "Bearer runtime-token" {
+			t.Fatalf("unexpected readiness request method=%s path=%s auth=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"))
+		}
+		_, _ = w.Write([]byte(`{"ready":true,"config_owner":"control_panel","config_key":"global_smtp","authority_revision":"2026-09-04T00:00:00Z"}`))
+	}))
+	defer server.Close()
+	authority, err := (Client{BaseURL: server.URL, Token: "runtime-token", HTTP: server.Client()}).GlobalSMTPAuthority(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !authority.Ready || authority.ConfigOwner != "control_panel" || authority.ConfigKey != "global_smtp" || authority.AuthorityRevision != "2026-09-04T00:00:00Z" {
+		t.Fatalf("authority = %#v", authority)
+	}
+
+	invalid := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ready":true,"config_owner":"observability","config_key":"global_smtp","authority_revision":"1"}`))
+	}))
+	defer invalid.Close()
+	if _, err := (Client{BaseURL: invalid.URL, Token: "runtime-token", HTTP: invalid.Client()}).GlobalSMTPAuthority(t.Context()); err == nil {
+		t.Fatal("wrong SMTP authority owner was accepted")
+	}
+}
+
 func TestSendNotificationEmailExtendsShortClientTimeoutWithoutMutatingSharedClient(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(25 * time.Millisecond)

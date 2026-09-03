@@ -42,6 +42,8 @@ type Client struct {
 	ServiceID        string
 	ServiceName      string
 	ServicePublicURL string
+	BindAddress      string
+	ConfigRevision   int64
 	Version          string
 	HeartbeatEvery   time.Duration
 	ConfigError      string
@@ -64,6 +66,13 @@ type NotificationEmailRequest struct {
 
 type NotificationEmailError struct {
 	Code string
+}
+
+type GlobalSMTPAuthority struct {
+	Ready             bool   `json:"ready"`
+	ConfigOwner       string `json:"config_owner"`
+	ConfigKey         string `json:"config_key"`
+	AuthorityRevision string `json:"authority_revision"`
 }
 
 func (e NotificationEmailError) Error() string {
@@ -109,14 +118,9 @@ func FromEnv() Client {
 		}
 	}
 	client := Client{
-		BaseURL:          strings.TrimSpace(os.Getenv("CONTROL_PANEL_URL")),
-		Token:            strings.TrimSpace(os.Getenv("CONTROL_PANEL_TOKEN")),
-		ServiceID:        envDefault("SERVICE_ID", "observability-01"),
-		ServiceName:      envDefault("SERVICE_NAME", "Observability"),
-		ServicePublicURL: strings.TrimSpace(os.Getenv("SERVICE_PUBLIC_URL")),
-		Version:          envDefault("SERVICE_VERSION", version.Current()),
-		HeartbeatEvery:   envDuration("CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC", 30*time.Second),
-		HTTP:             noRedirectClient(timeout),
+		Version:        envDefault("SERVICE_VERSION", version.Current()),
+		HeartbeatEvery: envDuration("CONTROL_PANEL_HEARTBEAT_INTERVAL_SEC", 30*time.Second),
+		HTTP:           noRedirectClient(timeout),
 	}
 	applyNodeConfigFromEnv(&client, ServiceType)
 	return client
@@ -206,6 +210,50 @@ func (c Client) executeLegacyRemediation(ctx context.Context, req legacyRemediat
 
 func (c Client) SendNotificationEmail(ctx context.Context, recipients []string, subject, text string) error {
 	return c.SendNotificationEmailHTML(ctx, recipients, subject, text, "")
+}
+
+func (c Client) GlobalSMTPAuthority(ctx context.Context) (GlobalSMTPAuthority, error) {
+	if strings.TrimSpace(c.ConfigError) != "" {
+		return GlobalSMTPAuthority{}, errors.New(c.ConfigError)
+	}
+	if !c.Enabled() {
+		return GlobalSMTPAuthority{}, errors.New("control panel email relay is not configured")
+	}
+	if err := validateHTTPURL(c.BaseURL, "CONTROL_PANEL_URL"); err != nil {
+		return GlobalSMTPAuthority{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.BaseURL, "/")+"/services/notifications/email/readiness", nil)
+	if err != nil {
+		return GlobalSMTPAuthority{}, errors.New("create global SMTP readiness request")
+	}
+	request.Header.Set("Authorization", "Bearer "+c.Token)
+	httpClient := c.HTTP
+	if httpClient == nil {
+		httpClient = noRedirectClient(5 * time.Second)
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		return GlobalSMTPAuthority{}, errors.New("global SMTP readiness request failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return GlobalSMTPAuthority{}, fmt.Errorf("global SMTP readiness returned HTTP %d", response.StatusCode)
+	}
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 4096))
+	decoder.DisallowUnknownFields()
+	var authority GlobalSMTPAuthority
+	if err := decoder.Decode(&authority); err != nil {
+		return GlobalSMTPAuthority{}, errors.New("global SMTP readiness response is invalid")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return GlobalSMTPAuthority{}, errors.New("global SMTP readiness response has trailing data")
+	}
+	revision := strings.TrimSpace(authority.AuthorityRevision)
+	if !authority.Ready || authority.ConfigOwner != "control_panel" || authority.ConfigKey != "global_smtp" || revision == "" || len(revision) > 128 || strings.ContainsAny(revision, "\r\n\x00") {
+		return GlobalSMTPAuthority{}, errors.New("global SMTP readiness authority is invalid")
+	}
+	authority.AuthorityRevision = revision
+	return authority, nil
 }
 
 func (c Client) SendNotificationEmailHTML(ctx context.Context, recipients []string, subject, text, html string) error {

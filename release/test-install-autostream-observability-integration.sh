@@ -671,12 +671,13 @@ Type=simple
 User=autostream
 Group=autostream
 EnvironmentFile=-/etc/autostream/observability.env
+LoadCredential=node-listener.json:/opt/autostream/local-executor/ports/observability.json
 ExecStart=/usr/local/bin/autostream-observability
 
 [Install]
 WantedBy=multi-user.target
 EOF
-printf '%s\n' 'OBSERVABILITY_BIND_ADDR=127.0.0.1:18082' \
+printf '%s\n' 'AUTOSTREAM_NODE_CONFIG=/etc/autostream-observability/config.yml' \
   > "${EXTRACTED_ROOT}/.env.example"
 printf '%s\n' 'integration fixture' > "${EXTRACTED_ROOT}/README.install.md"
 jq -n \

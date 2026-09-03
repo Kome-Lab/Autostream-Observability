@@ -487,8 +487,10 @@ FROM notification_deliveries ORDER BY created_at DESC LIMIT 200`)
 }
 
 func (s MariaDBStore) ListNotificationChannels(ctx context.Context) ([]NotificationChannel, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, name, channel_type, enabled, webhook_url_ciphertext, webhook_url_nonce, COALESCE(masked_webhook_url, ''), COALESCE(email_recipients, '[]'), COALESCE(smtp_host, ''), COALESCE(smtp_port, 0), smtp_tls, COALESCE(smtp_from, ''), COALESCE(smtp_username, ''), smtp_password_ciphertext, smtp_password_nonce, smtp_password_configured, COALESCE(masked_email_target, ''), severity_filter, event_type_filter, created_at, updated_at
-FROM notification_channels ORDER BY created_at ASC`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT c.id, c.name, c.channel_type, c.enabled, c.webhook_url_ciphertext, c.webhook_url_nonce, COALESCE(c.masked_webhook_url, ''), COALESCE(c.email_recipients, '[]'),
+EXISTS(SELECT 1 FROM notification_channel_v2_config_references r WHERE r.channel_id=c.id AND r.config_owner='control_panel' AND r.config_key='global_smtp'),
+COALESCE(c.masked_email_target, ''), c.severity_filter, c.event_type_filter, c.created_at, c.updated_at
+FROM notification_channels c ORDER BY c.created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -517,16 +519,8 @@ func (s MariaDBStore) CreateNotificationChannel(ctx context.Context, channel Not
 	channel.CreatedAt = now
 	channel.UpdatedAt = now
 	var webhookCiphertext, webhookNonce string
-	var smtpCiphertext, smtpNonce string
 	var err error
-	if channel.Type == "email" {
-		if channel.SMTPPassword != "" {
-			smtpCiphertext, smtpNonce, err = encryptSecret(channel.SMTPPassword, s.SecretKey)
-			if err != nil {
-				return NotificationChannel{}, err
-			}
-		}
-	} else {
+	if channel.Type != "email" {
 		webhookCiphertext, webhookNonce, err = encryptSecret(channel.WebhookURL, s.SecretKey)
 		if err != nil {
 			return NotificationChannel{}, err
@@ -544,18 +538,33 @@ func (s MariaDBStore) CreateNotificationChannel(ctx context.Context, channel Not
 	if err != nil {
 		return NotificationChannel{}, err
 	}
-	if _, err := s.DB.ExecContext(ctx, `INSERT INTO notification_channels
-(id, name, channel_type, enabled, webhook_url_ciphertext, webhook_url_nonce, masked_webhook_url, email_recipients, smtp_host, smtp_port, smtp_tls, smtp_from, smtp_username, smtp_password_ciphertext, smtp_password_nonce, smtp_password_configured, masked_email_target, severity_filter, event_type_filter, created_at, updated_at)
-VALUES (?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, 0), ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, NULLIF(?, ''), ?, ?, ?, ?)`,
-		channel.ID, channel.Name, channel.Type, channel.Enabled, webhookCiphertext, webhookNonce, channel.MaskedWebhookURL, string(recipients), channel.SMTPHost, channel.SMTPPort, channel.SMTPTLS, channel.SMTPFrom, channel.SMTPUsername, smtpCiphertext, smtpNonce, channel.SMTPPasswordConfigured, channel.MaskedEmailTarget, string(severity), string(events), channel.CreatedAt, channel.UpdatedAt); err != nil {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return NotificationChannel{}, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO notification_channels
+(id, name, channel_type, enabled, webhook_url_ciphertext, webhook_url_nonce, masked_webhook_url, email_recipients, masked_email_target, severity_filter, event_type_filter, created_at, updated_at)
+VALUES (?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, NULLIF(?, ''), ?, ?, ?, ?)`,
+		channel.ID, channel.Name, channel.Type, channel.Enabled, webhookCiphertext, webhookNonce, channel.MaskedWebhookURL, string(recipients), channel.MaskedEmailTarget, string(severity), string(events), channel.CreatedAt, channel.UpdatedAt); err != nil {
+		return NotificationChannel{}, err
+	}
+	if channel.Type == "email" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO notification_channel_v2_config_references (channel_id,config_owner,config_key) VALUES (?,'control_panel','global_smtp')`, channel.ID); err != nil {
+			return NotificationChannel{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return NotificationChannel{}, err
 	}
 	return publicChannel(channel), nil
 }
 
 func (s MariaDBStore) GetNotificationChannel(ctx context.Context, id string) (NotificationChannel, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT id, name, channel_type, enabled, webhook_url_ciphertext, webhook_url_nonce, COALESCE(masked_webhook_url, ''), COALESCE(email_recipients, '[]'), COALESCE(smtp_host, ''), COALESCE(smtp_port, 0), smtp_tls, COALESCE(smtp_from, ''), COALESCE(smtp_username, ''), smtp_password_ciphertext, smtp_password_nonce, smtp_password_configured, COALESCE(masked_email_target, ''), severity_filter, event_type_filter, created_at, updated_at
-FROM notification_channels WHERE id = ?`, id)
+	row := s.DB.QueryRowContext(ctx, `SELECT c.id, c.name, c.channel_type, c.enabled, c.webhook_url_ciphertext, c.webhook_url_nonce, COALESCE(c.masked_webhook_url, ''), COALESCE(c.email_recipients, '[]'),
+EXISTS(SELECT 1 FROM notification_channel_v2_config_references r WHERE r.channel_id=c.id AND r.config_owner='control_panel' AND r.config_key='global_smtp'),
+COALESCE(c.masked_email_target, ''), c.severity_filter, c.event_type_filter, c.created_at, c.updated_at
+FROM notification_channels c WHERE c.id = ?`, id)
 	channel, err := s.scanNotificationChannel(row)
 	if err == sql.ErrNoRows {
 		return NotificationChannel{}, ErrNotFound
@@ -581,31 +590,12 @@ func (s MariaDBStore) UpdateNotificationChannel(ctx context.Context, channel Not
 	if channel.UseGlobalSMTPSet {
 		existing.UseGlobalSMTP = channel.UseGlobalSMTP
 		existing.UseGlobalSMTPSet = true
-		if channel.UseGlobalSMTP {
-			clearLegacySMTPConfiguration(&existing)
-		}
 	}
 	if channel.WebhookURL != "" {
 		existing.WebhookURL = channel.WebhookURL
 	}
 	if channel.EmailRecipients != nil {
 		existing.EmailRecipients = append([]string(nil), channel.EmailRecipients...)
-	}
-	if channel.SMTPHost != "" {
-		existing.SMTPHost = channel.SMTPHost
-	}
-	if channel.SMTPPort != 0 {
-		existing.SMTPPort = channel.SMTPPort
-	}
-	existing.SMTPTLS = channel.SMTPTLS
-	if channel.SMTPFrom != "" {
-		existing.SMTPFrom = channel.SMTPFrom
-	}
-	if channel.SMTPUsername != "" {
-		existing.SMTPUsername = channel.SMTPUsername
-	}
-	if channel.SMTPPassword != "" {
-		existing.SMTPPassword = channel.SMTPPassword
 	}
 	if channel.SeverityFilter != nil {
 		existing.SeverityFilter = append([]string(nil), channel.SeverityFilter...)
@@ -616,15 +606,7 @@ func (s MariaDBStore) UpdateNotificationChannel(ctx context.Context, channel Not
 	existing = normalizeNotificationChannelSecrets(existing)
 	existing.UpdatedAt = time.Now().UTC()
 	var webhookCiphertext, webhookNonce string
-	var smtpCiphertext, smtpNonce string
-	if existing.Type == "email" {
-		if existing.SMTPPassword != "" {
-			smtpCiphertext, smtpNonce, err = encryptSecret(existing.SMTPPassword, s.SecretKey)
-			if err != nil {
-				return NotificationChannel{}, err
-			}
-		}
-	} else {
+	if existing.Type != "email" {
 		webhookCiphertext, webhookNonce, err = encryptSecret(existing.WebhookURL, s.SecretKey)
 		if err != nil {
 			return NotificationChannel{}, err
@@ -642,8 +624,13 @@ func (s MariaDBStore) UpdateNotificationChannel(ctx context.Context, channel Not
 	if err != nil {
 		return NotificationChannel{}, err
 	}
-	result, err := s.DB.ExecContext(ctx, `UPDATE notification_channels SET name = ?, channel_type = ?, enabled = ?, webhook_url_ciphertext = NULLIF(?, ''), webhook_url_nonce = NULLIF(?, ''), masked_webhook_url = NULLIF(?, ''), email_recipients = ?, smtp_host = NULLIF(?, ''), smtp_port = NULLIF(?, 0), smtp_tls = ?, smtp_from = NULLIF(?, ''), smtp_username = NULLIF(?, ''), smtp_password_ciphertext = NULLIF(?, ''), smtp_password_nonce = NULLIF(?, ''), smtp_password_configured = ?, masked_email_target = NULLIF(?, ''), severity_filter = ?, event_type_filter = ?, updated_at = ? WHERE id = ?`,
-		existing.Name, existing.Type, existing.Enabled, webhookCiphertext, webhookNonce, existing.MaskedWebhookURL, string(recipients), existing.SMTPHost, existing.SMTPPort, existing.SMTPTLS, existing.SMTPFrom, existing.SMTPUsername, smtpCiphertext, smtpNonce, existing.SMTPPasswordConfigured, existing.MaskedEmailTarget, string(severity), string(events), existing.UpdatedAt, existing.ID)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return NotificationChannel{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE notification_channels SET name = ?, channel_type = ?, enabled = ?, webhook_url_ciphertext = NULLIF(?, ''), webhook_url_nonce = NULLIF(?, ''), masked_webhook_url = NULLIF(?, ''), email_recipients = ?, masked_email_target = NULLIF(?, ''), severity_filter = ?, event_type_filter = ?, updated_at = ? WHERE id = ?`,
+		existing.Name, existing.Type, existing.Enabled, webhookCiphertext, webhookNonce, existing.MaskedWebhookURL, string(recipients), existing.MaskedEmailTarget, string(severity), string(events), existing.UpdatedAt, existing.ID)
 	if err != nil {
 		return NotificationChannel{}, err
 	}
@@ -653,6 +640,16 @@ func (s MariaDBStore) UpdateNotificationChannel(ctx context.Context, channel Not
 	}
 	if affected == 0 {
 		return NotificationChannel{}, ErrNotFound
+	}
+	if existing.Type == "email" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO notification_channel_v2_config_references (channel_id,config_owner,config_key) VALUES (?,'control_panel','global_smtp') ON DUPLICATE KEY UPDATE config_owner='control_panel',config_key='global_smtp'`, existing.ID); err != nil {
+			return NotificationChannel{}, err
+		}
+	} else if _, err := tx.ExecContext(ctx, `DELETE FROM notification_channel_v2_config_references WHERE channel_id=?`, existing.ID); err != nil {
+		return NotificationChannel{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return NotificationChannel{}, err
 	}
 	return publicChannel(existing), nil
 }
@@ -823,10 +820,9 @@ type notificationChannelScanner interface {
 func (s MariaDBStore) scanNotificationChannel(scanner notificationChannelScanner) (NotificationChannel, error) {
 	var channel NotificationChannel
 	var webhookCiphertext, webhookNonce sql.NullString
-	var smtpCiphertext, smtpNonce sql.NullString
 	var severityRaw, eventsRaw []byte
 	var recipientsRaw []byte
-	if err := scanner.Scan(&channel.ID, &channel.Name, &channel.Type, &channel.Enabled, &webhookCiphertext, &webhookNonce, &channel.MaskedWebhookURL, &recipientsRaw, &channel.SMTPHost, &channel.SMTPPort, &channel.SMTPTLS, &channel.SMTPFrom, &channel.SMTPUsername, &smtpCiphertext, &smtpNonce, &channel.SMTPPasswordConfigured, &channel.MaskedEmailTarget, &severityRaw, &eventsRaw, &channel.CreatedAt, &channel.UpdatedAt); err != nil {
+	if err := scanner.Scan(&channel.ID, &channel.Name, &channel.Type, &channel.Enabled, &webhookCiphertext, &webhookNonce, &channel.MaskedWebhookURL, &recipientsRaw, &channel.UseGlobalSMTP, &channel.MaskedEmailTarget, &severityRaw, &eventsRaw, &channel.CreatedAt, &channel.UpdatedAt); err != nil {
 		return NotificationChannel{}, err
 	}
 	if len(recipientsRaw) > 0 {
@@ -845,14 +841,7 @@ func (s MariaDBStore) scanNotificationChannel(scanner notificationChannelScanner
 		}
 		channel.WebhookURL = plaintext
 	}
-	if smtpCiphertext.Valid && smtpCiphertext.String != "" {
-		plaintext, err := decryptSecret(smtpCiphertext.String, smtpNonce.String, s.SecretKey)
-		if err != nil {
-			return NotificationChannel{}, err
-		}
-		channel.SMTPPassword = plaintext
-		channel.SMTPPasswordConfigured = true
-	}
+	channel.UseGlobalSMTPSet = channel.Type == "email"
 	return normalizeNotificationChannelSecrets(channel), nil
 }
 

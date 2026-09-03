@@ -66,57 +66,48 @@ type NotificationDelivery struct {
 }
 
 type NotificationChannel struct {
-	ID                     string    `json:"id"`
-	Name                   string    `json:"name"`
-	Type                   string    `json:"type"`
-	Enabled                bool      `json:"enabled"`
-	UseGlobalSMTP          bool      `json:"uses_global_smtp"`
-	UseGlobalSMTPSet       bool      `json:"-"`
-	WebhookURL             string    `json:"-"`
-	MaskedWebhookURL       string    `json:"masked_webhook_url,omitempty"`
-	EmailRecipients        []string  `json:"email_recipients,omitempty"`
-	SMTPHost               string    `json:"smtp_host,omitempty"`
-	SMTPPort               int       `json:"smtp_port,omitempty"`
-	SMTPTLS                bool      `json:"smtp_tls,omitempty"`
-	SMTPFrom               string    `json:"smtp_from,omitempty"`
-	SMTPUsername           string    `json:"smtp_username,omitempty"`
-	SMTPPassword           string    `json:"-"`
-	SMTPPasswordConfigured bool      `json:"smtp_password_configured,omitempty"`
-	MaskedEmailTarget      string    `json:"masked_email_target,omitempty"`
-	SeverityFilter         []string  `json:"severity_filter,omitempty"`
-	EventTypeFilter        []string  `json:"event_type_filter,omitempty"`
-	CreatedAt              time.Time `json:"created_at"`
-	UpdatedAt              time.Time `json:"updated_at"`
+	ID                string    `json:"id"`
+	Name              string    `json:"name"`
+	Type              string    `json:"type"`
+	Enabled           bool      `json:"enabled"`
+	UseGlobalSMTP     bool      `json:"uses_global_smtp"`
+	UseGlobalSMTPSet  bool      `json:"-"`
+	WebhookURL        string    `json:"-"`
+	MaskedWebhookURL  string    `json:"masked_webhook_url,omitempty"`
+	EmailRecipients   []string  `json:"email_recipients,omitempty"`
+	MaskedEmailTarget string    `json:"masked_email_target,omitempty"`
+	SeverityFilter    []string  `json:"severity_filter,omitempty"`
+	EventTypeFilter   []string  `json:"event_type_filter,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 func (c NotificationChannel) MarshalJSON() ([]byte, error) {
 	type publicNotificationChannel struct {
-		ID                     string    `json:"id"`
-		Name                   string    `json:"name"`
-		Type                   string    `json:"type"`
-		Enabled                bool      `json:"enabled"`
-		UseGlobalSMTP          bool      `json:"uses_global_smtp"`
-		MaskedWebhookURL       string    `json:"masked_webhook_url,omitempty"`
-		SMTPPasswordConfigured bool      `json:"smtp_password_configured,omitempty"`
-		MaskedEmailTarget      string    `json:"masked_email_target,omitempty"`
-		SeverityFilter         []string  `json:"severity_filter,omitempty"`
-		EventTypeFilter        []string  `json:"event_type_filter,omitempty"`
-		CreatedAt              time.Time `json:"created_at"`
-		UpdatedAt              time.Time `json:"updated_at"`
+		ID                string    `json:"id"`
+		Name              string    `json:"name"`
+		Type              string    `json:"type"`
+		Enabled           bool      `json:"enabled"`
+		UseGlobalSMTP     bool      `json:"uses_global_smtp"`
+		MaskedWebhookURL  string    `json:"masked_webhook_url,omitempty"`
+		MaskedEmailTarget string    `json:"masked_email_target,omitempty"`
+		SeverityFilter    []string  `json:"severity_filter,omitempty"`
+		EventTypeFilter   []string  `json:"event_type_filter,omitempty"`
+		CreatedAt         time.Time `json:"created_at"`
+		UpdatedAt         time.Time `json:"updated_at"`
 	}
 	return json.Marshal(publicNotificationChannel{
-		ID:                     c.ID,
-		Name:                   c.Name,
-		Type:                   c.Type,
-		Enabled:                c.Enabled,
-		UseGlobalSMTP:          c.UseGlobalSMTP,
-		MaskedWebhookURL:       c.MaskedWebhookURL,
-		SMTPPasswordConfigured: c.SMTPPasswordConfigured,
-		MaskedEmailTarget:      c.MaskedEmailTarget,
-		SeverityFilter:         c.SeverityFilter,
-		EventTypeFilter:        c.EventTypeFilter,
-		CreatedAt:              c.CreatedAt,
-		UpdatedAt:              c.UpdatedAt,
+		ID:                c.ID,
+		Name:              c.Name,
+		Type:              c.Type,
+		Enabled:           c.Enabled,
+		UseGlobalSMTP:     c.UseGlobalSMTP,
+		MaskedWebhookURL:  c.MaskedWebhookURL,
+		MaskedEmailTarget: c.MaskedEmailTarget,
+		SeverityFilter:    c.SeverityFilter,
+		EventTypeFilter:   c.EventTypeFilter,
+		CreatedAt:         c.CreatedAt,
+		UpdatedAt:         c.UpdatedAt,
 	})
 }
 

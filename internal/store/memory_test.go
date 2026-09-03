@@ -319,20 +319,16 @@ func TestMemoryStoreMasksNotificationChannelWebhookPath(t *testing.T) {
 	}
 }
 
-func TestNotificationChannelJSONOmitsEmailOperationalSecrets(t *testing.T) {
+func TestNotificationChannelJSONOmitsEmailRecipientsAndUsesGlobalSMTPReference(t *testing.T) {
 	s := NewMemoryStore()
 	channel, err := s.CreateNotificationChannel(t.Context(), NotificationChannel{
-		Name:            "email ops",
-		Type:            "email",
-		Enabled:         true,
-		EmailRecipients: []string{"ops@example.com"},
-		SMTPHost:        "smtp.example.com",
-		SMTPPort:        587,
-		SMTPTLS:         true,
-		SMTPFrom:        "autostream@example.com",
-		SMTPUsername:    "autostream-user",
-		SMTPPassword:    "raw-smtp-password",
-		SeverityFilter:  []string{"critical"},
+		Name:             "email ops",
+		Type:             "email",
+		Enabled:          true,
+		UseGlobalSMTP:    true,
+		UseGlobalSMTPSet: true,
+		EmailRecipients:  []string{"ops@example.com"},
+		SeverityFilter:   []string{"critical"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -343,63 +339,38 @@ func TestNotificationChannelJSONOmitsEmailOperationalSecrets(t *testing.T) {
 	}
 	for _, raw := range []string{
 		"ops@example.com",
-		"smtp.example.com",
-		"autostream@example.com",
-		"autostream-user",
-		"raw-smtp-password",
 		`"email_recipients"`,
-		`"smtp_host"`,
-		`"smtp_from"`,
-		`"smtp_username"`,
-		`"smtp_password"`,
 	} {
 		if strings.Contains(string(body), raw) {
 			t.Fatalf("raw email notification channel detail leaked in JSON: %s", body)
 		}
 	}
-	for _, want := range []string{`"smtp_password_configured":true`, `"masked_email_target":"o***s@\u003cEMAIL_DOMAIN\u003e"`} {
+	for _, want := range []string{`"uses_global_smtp":true`, `"masked_email_target":"o***s@\u003cEMAIL_DOMAIN\u003e"`} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("expected public email channel marker %s in JSON: %s", want, body)
 		}
 	}
 }
 
-func TestMemoryStoreInfersGlobalSMTPAndClearsLegacyConfigOnUpdate(t *testing.T) {
+func TestMemoryStorePreservesExplicitGlobalSMTPReferenceOnUpdate(t *testing.T) {
 	s := NewMemoryStore()
 	global, err := s.CreateNotificationChannel(t.Context(), NotificationChannel{
-		Name:            "global email",
-		Type:            "email",
-		Enabled:         true,
-		EmailRecipients: []string{"ops@example.com"},
+		Name:             "global email",
+		Type:             "email",
+		Enabled:          true,
+		UseGlobalSMTP:    true,
+		UseGlobalSMTPSet: true,
+		EmailRecipients:  []string{"ops@example.com"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !global.UseGlobalSMTP || global.SMTPPort != 0 {
-		t.Fatalf("email channel without legacy SMTP must use global settings: %#v", global)
-	}
-
-	legacy, err := s.CreateNotificationChannel(t.Context(), NotificationChannel{
-		Name:            "legacy email",
-		Type:            "email",
-		Enabled:         true,
-		EmailRecipients: []string{"legacy@example.com"},
-		SMTPHost:        "smtp.example.com",
-		SMTPPort:        587,
-		SMTPTLS:         true,
-		SMTPFrom:        "autostream@example.com",
-		SMTPUsername:    "autostream",
-		SMTPPassword:    "raw-smtp-password",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if legacy.UseGlobalSMTP {
-		t.Fatalf("legacy SMTP channel unexpectedly switched to global: %#v", legacy)
+	if !global.UseGlobalSMTP {
+		t.Fatalf("email channel must retain the global SMTP reference: %#v", global)
 	}
 	updated, err := s.UpdateNotificationChannel(t.Context(), NotificationChannel{
-		ID:               legacy.ID,
-		Name:             legacy.Name,
+		ID:               global.ID,
+		Name:             "global email renamed",
 		Type:             "email",
 		Enabled:          true,
 		UseGlobalSMTP:    true,
@@ -408,8 +379,8 @@ func TestMemoryStoreInfersGlobalSMTPAndClearsLegacyConfigOnUpdate(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !updated.UseGlobalSMTP || updated.SMTPHost != "" || updated.SMTPPort != 0 || updated.SMTPFrom != "" || updated.SMTPUsername != "" || updated.SMTPPassword != "" || updated.SMTPPasswordConfigured {
-		t.Fatalf("global SMTP update retained legacy secrets: %#v", updated)
+	if !updated.UseGlobalSMTP || updated.Name != "global email renamed" {
+		t.Fatalf("global SMTP update lost its v2 reference: %#v", updated)
 	}
 }
 

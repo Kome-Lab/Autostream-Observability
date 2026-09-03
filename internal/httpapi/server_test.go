@@ -26,26 +26,68 @@ import (
 	"github.com/example/autostream-observability/internal/version"
 )
 
+func TestMain(m *testing.M) {
+	tempDir, err := os.MkdirTemp("", "autostream-observability-httpapi-")
+	if err != nil {
+		panic(err)
+	}
+	configPath := filepath.Join(tempDir, "node-config.yml")
+	credentialDir := filepath.Join(tempDir, "credentials")
+	if err := os.Mkdir(credentialDir, 0700); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(filepath.Join(credentialDir, "node-listener.json"), []byte(`{"schema_version":2,"service_type":"observability","bind_address":"127.0.0.1:18082","config_revision":1}`), 0600); err != nil {
+		panic(err)
+	}
+	config := []byte("panel:\n  url: https://panel.example.test\nnode:\n  id: observability-test\n  name: Observability Test\n  type: observability\nlistener:\n  credential: node-listener.json\napi:\n  host: observability.example.test\n  port: 8082\n  ssl_enabled: false\nauth:\n  token_id: test-token-id\n  token: runtime-test-token\n")
+	if err := os.WriteFile(configPath, config, 0o600); err != nil {
+		panic(err)
+	}
+	previous, hadPrevious := os.LookupEnv("AUTOSTREAM_NODE_CONFIG")
+	if err := os.Setenv("AUTOSTREAM_NODE_CONFIG", configPath); err != nil {
+		panic(err)
+	}
+	previousCredentials, hadPreviousCredentials := os.LookupEnv("CREDENTIALS_DIRECTORY")
+	if err := os.Setenv("CREDENTIALS_DIRECTORY", credentialDir); err != nil {
+		panic(err)
+	}
+	code := m.Run()
+	if hadPrevious {
+		_ = os.Setenv("AUTOSTREAM_NODE_CONFIG", previous)
+	} else {
+		_ = os.Unsetenv("AUTOSTREAM_NODE_CONFIG")
+	}
+	if hadPreviousCredentials {
+		_ = os.Setenv("CREDENTIALS_DIRECTORY", previousCredentials)
+	} else {
+		_ = os.Unsetenv("CREDENTIALS_DIRECTORY")
+	}
+	_ = os.RemoveAll(tempDir)
+	os.Exit(code)
+}
+
 func TestUpdaterVersionIsUnauthenticatedAndIdentityBound(t *testing.T) {
 	previousVersion := version.Version
 	version.Version = "v1.1.1"
 	t.Setenv("SERVICE_VERSION", "v9.9.9")
 	t.Setenv("SERVICE_ID", "wrong-fallback")
-	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "9")
 	t.Cleanup(func() { version.Version = previousVersion })
 
 	path := filepath.Join(t.TempDir(), "config.yml")
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
+	writeNodeListenerCredentialForVerifierTest(t, path, control.ServiceType, "9")
 	body := `panel:
   url: "https://panel.example.jp"
 node:
   id: "observability-probe-01"
   name: "Observability Probe"
   type: "observability"
+listener:
+  credential: "node-listener.json"
 api:
-  host: "127.0.0.1"
-  port: 8082
-  ssl_enabled: false
+  host: "observability.example.jp"
+  port: 8443
+  ssl_enabled: true
 auth:
   token_id: "token-id"
   token: "runtime-secret"
@@ -95,48 +137,14 @@ auth:
 	}
 }
 
-func TestConfigRevisionFromEnvValidatesPositiveInteger(t *testing.T) {
-	for _, tt := range []struct {
-		name    string
-		value   string
-		want    int64
-		wantErr bool
-	}{
-		{name: "default", value: "", want: 1},
-		{name: "one", value: "1", want: 1},
-		{name: "higher", value: "27", want: 27},
-		{name: "zero", value: "0", wantErr: true},
-		{name: "leading zero", value: "01", wantErr: true},
-		{name: "negative", value: "-1", wantErr: true},
-		{name: "fraction", value: "1.5", wantErr: true},
-		{name: "padded", value: " 1 ", wantErr: true},
-		{name: "text", value: "next", wantErr: true},
-		{name: "overflow", value: "9223372036854775808", wantErr: true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("AUTOSTREAM_CONFIG_REVISION", tt.value)
-			got, err := ConfigRevisionFromEnv()
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("ConfigRevisionFromEnv() accepted %q", tt.value)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != tt.want {
-				t.Fatalf("revision = %d, want %d", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestNewServerFailsClosedOnInvalidConfigRevision(t *testing.T) {
-	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "0")
+func TestNewServerFailsClosedOnInvalidListenerConfigRevision(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	writeNodeConfigForVerifierTest(t, configPath, control.ServiceType)
+	writeNodeListenerCredentialForVerifierTest(t, configPath, control.ServiceType, "0")
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
 	defer func() {
 		if recover() == nil {
-			t.Fatal("NewServer must reject an invalid AUTOSTREAM_CONFIG_REVISION")
+			t.Fatal("NewServer must reject an invalid listener config_revision")
 		}
 	}()
 	_ = NewServerWithStoreAndAuth(control.ServiceType, store.NewMemoryStore(), auth.Verifier{})
@@ -178,12 +186,15 @@ func TestAdminAuthReadsNodeRuntimeTokenAfterStartup(t *testing.T) {
 func TestRootAndStatusUseNodeConfigServiceID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yml")
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
+	writeNodeListenerCredentialForVerifierTest(t, path, control.ServiceType, "7")
 	body := `panel:
   url: "https://panel.example.jp"
 node:
   id: "o11y-lab-web-kagoya-01"
   name: "Kome-Lab Web Observability"
   type: "observability"
+listener:
+  credential: "node-listener.json"
 api:
   host: "ass-o11y.studio-kometubu.jp"
   port: 443
@@ -1047,7 +1058,6 @@ func TestExecuteArchiveRemediationDispatchesToControlPanel(t *testing.T) {
 }
 
 func TestApplicationProposalBindsDetectorAfterStagedIdentityAppears(t *testing.T) {
-	t.Setenv("AUTOSTREAM_CONFIG_REVISION", "1")
 	configPath := filepath.Join(t.TempDir(), "node.yml")
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", configPath)
 
@@ -1062,12 +1072,15 @@ func TestApplicationProposalBindsDetectorAfterStagedIdentityAppears(t *testing.T
 	}
 	executor := &fakeControlExecutor{}
 	handler := NewServerWithStoreAuthNotifierAndExecutor("observability", st, auth.NewVerifierFromRawTokens("service-token"), nil, executor)
+	writeNodeListenerCredentialForVerifierTest(t, configPath, control.ServiceType, "1")
 	config := `panel:
   url: "https://panel.example.jp"
 node:
   id: "observability-staged-1"
   name: "Observability Staged"
   type: "observability"
+listener:
+  credential: "node-listener.json"
 api:
   host: "observability.example.jp"
   port: 8443
@@ -1920,16 +1933,16 @@ func TestSlackNotificationChannelRejectsNonSlackWebhookHost(t *testing.T) {
 	}
 }
 
-func TestEmailNotificationChannelCRUDDoesNotExposeSMTPPassword(t *testing.T) {
+func TestEmailNotificationChannelCRUDUsesGlobalSMTPReferenceAndMasksRecipients(t *testing.T) {
 	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", store.NewMemoryStore(), auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), &fakeNotifier{}, nil)
-	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"email ops","type":"email","enabled":true,"email_recipients":["ops@example.com"],"smtp_host":"smtp.example.com","smtp_port":587,"smtp_tls":true,"smtp_from":"autostream@example.com","smtp_username":"autostream","smtp_password":"raw-smtp-password","severity_filter":["critical"],"event_type_filter":["incident.opened"]}`))
+	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"email ops","type":"email","enabled":true,"uses_global_smtp":true,"email_recipients":["ops@example.com"],"severity_filter":["critical"],"event_type_filter":["incident.opened"]}`))
 	createReq.Header.Set("Authorization", "Bearer admin-token")
 	createRes := httptest.NewRecorder()
 	handler.ServeHTTP(createRes, createReq)
 	if createRes.Code != http.StatusCreated {
 		t.Fatalf("create email channel status=%d body=%s", createRes.Code, createRes.Body.String())
 	}
-	for _, raw := range []string{"raw-smtp-password", "ops@example.com", "smtp.example.com", "autostream@example.com", `"smtp_password"`, `"email_recipients"`, `"smtp_host"`, `"smtp_from"`, `"smtp_username"`} {
+	for _, raw := range []string{"ops@example.com", `"email_recipients"`} {
 		if strings.Contains(createRes.Body.String(), raw) {
 			t.Fatalf("email channel raw detail leaked in create response: %s", createRes.Body.String())
 		}
@@ -1938,7 +1951,7 @@ func TestEmailNotificationChannelCRUDDoesNotExposeSMTPPassword(t *testing.T) {
 	if err := json.NewDecoder(createRes.Body).Decode(&created); err != nil {
 		t.Fatal(err)
 	}
-	if !created.SMTPPasswordConfigured || created.MaskedEmailTarget == "" {
+	if !created.UseGlobalSMTP || created.MaskedEmailTarget == "" {
 		t.Fatalf("email channel status fields missing: %#v", created)
 	}
 	listReq := httptest.NewRequest(http.MethodGet, "/notification-channels", nil)
@@ -1948,7 +1961,7 @@ func TestEmailNotificationChannelCRUDDoesNotExposeSMTPPassword(t *testing.T) {
 	if listRes.Code != http.StatusOK {
 		t.Fatalf("list response status=%d body=%s", listRes.Code, listRes.Body.String())
 	}
-	for _, raw := range []string{"raw-smtp-password", "ops@example.com", "smtp.example.com", "autostream@example.com", `"smtp_password"`, `"email_recipients"`, `"smtp_host"`, `"smtp_from"`, `"smtp_username"`} {
+	for _, raw := range []string{"ops@example.com", `"email_recipients"`} {
 		if strings.Contains(listRes.Body.String(), raw) {
 			t.Fatalf("email channel raw detail leaked in list response: %s", listRes.Body.String())
 		}
@@ -1960,14 +1973,14 @@ func TestEmailNotificationChannelCRUDDoesNotExposeSMTPPassword(t *testing.T) {
 	if getRes.Code != http.StatusOK {
 		t.Fatalf("get response status=%d body=%s", getRes.Code, getRes.Body.String())
 	}
-	for _, raw := range []string{"raw-smtp-password", "ops@example.com", "smtp.example.com", "autostream@example.com", `"smtp_password"`, `"email_recipients"`, `"smtp_host"`, `"smtp_from"`, `"smtp_username"`} {
+	for _, raw := range []string{"ops@example.com", `"email_recipients"`} {
 		if strings.Contains(getRes.Body.String(), raw) {
 			t.Fatalf("email channel raw detail leaked in get response: %s", getRes.Body.String())
 		}
 	}
 }
 
-func TestGlobalSMTPEmailChannelCreateUpdateAndLegacyClear(t *testing.T) {
+func TestGlobalSMTPEmailChannelCreateAndUpdate(t *testing.T) {
 	mem := store.NewMemoryStore()
 	handler := NewServerWithStoreAuthzNotifierExecutorAndEmailRelay("observability", mem, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), &fakeNotifier{}, nil, &fakeEmailRelay{})
 	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"global email","type":"email","enabled":true,"uses_global_smtp":true,"email_recipients":["ops@example.com"],"severity_filter":["critical"]}`))
@@ -1999,28 +2012,6 @@ func TestGlobalSMTPEmailChannelCreateUpdateAndLegacyClear(t *testing.T) {
 	if !stored.UseGlobalSMTP || len(stored.EmailRecipients) != 1 || stored.EmailRecipients[0] != "ops@example.com" {
 		t.Fatalf("update did not preserve omitted recipients: %#v", stored)
 	}
-
-	legacy, err := mem.CreateNotificationChannel(t.Context(), store.NotificationChannel{
-		Name: "legacy", Type: "email", Enabled: true, EmailRecipients: []string{"legacy@example.com"},
-		SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPTLS: true, SMTPFrom: "autostream@example.com", SMTPUsername: "autostream", SMTPPassword: "raw-smtp-password",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	clearReq := httptest.NewRequest(http.MethodPut, "/notification-channels/"+legacy.ID, bytes.NewBufferString(`{"name":"legacy","type":"email","enabled":true,"uses_global_smtp":true}`))
-	clearReq.Header.Set("Authorization", "Bearer admin-token")
-	clearRes := httptest.NewRecorder()
-	handler.ServeHTTP(clearRes, clearReq)
-	if clearRes.Code != http.StatusOK {
-		t.Fatalf("legacy clear update status=%d body=%s", clearRes.Code, clearRes.Body.String())
-	}
-	cleared, err := mem.GetNotificationChannel(t.Context(), legacy.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !cleared.UseGlobalSMTP || cleared.SMTPHost != "" || cleared.SMTPFrom != "" || cleared.SMTPPassword != "" || cleared.SMTPPasswordConfigured {
-		t.Fatalf("legacy SMTP fields were not cleared: %#v", cleared)
-	}
 }
 
 func TestGlobalSMTPEmailChannelRejectsEmptyRecipients(t *testing.T) {
@@ -2042,8 +2033,8 @@ func TestGlobalSMTPEmailChannelRejectsMixedLegacySMTPFields(t *testing.T) {
 	createReq.Header.Set("Authorization", "Bearer admin-token")
 	createRes := httptest.NewRecorder()
 	handler.ServeHTTP(createRes, createReq)
-	if createRes.Code != http.StatusBadRequest || !strings.Contains(createRes.Body.String(), "invalid_notification_channel") {
-		t.Fatalf("global and legacy SMTP fields must not be mixed, status=%d body=%s", createRes.Code, createRes.Body.String())
+	if createRes.Code != http.StatusBadRequest || !strings.Contains(createRes.Body.String(), "bad_request") {
+		t.Fatalf("removed SMTP fields must be rejected as unknown input, status=%d body=%s", createRes.Code, createRes.Body.String())
 	}
 }
 
@@ -2111,23 +2102,18 @@ func TestNotificationChannelRejectsGlobalSMTPForNonEmailTypes(t *testing.T) {
 
 func TestPublicNotificationChannelProjectionOmitsInternalSecrets(t *testing.T) {
 	channel := store.NotificationChannel{
-		ID:                     "chn-secret",
-		Name:                   "ops email",
-		Type:                   "email",
-		Enabled:                true,
-		WebhookURL:             "https://discord.com/api/webhooks/id/raw-webhook-token",
-		MaskedWebhookURL:       "https://<WEBHOOK_HOST>/<WEBHOOK_PATH>",
-		EmailRecipients:        []string{"ops@example.com"},
-		SMTPHost:               "smtp.example.com",
-		SMTPPort:               587,
-		SMTPTLS:                true,
-		SMTPFrom:               "autostream@example.com",
-		SMTPUsername:           "smtp-user",
-		SMTPPassword:           "raw-smtp-password",
-		SMTPPasswordConfigured: true,
-		MaskedEmailTarget:      "o***s@<EMAIL_DOMAIN>",
-		SeverityFilter:         []string{"critical"},
-		EventTypeFilter:        []string{"incident.opened"},
+		ID:                "chn-secret",
+		Name:              "ops email",
+		Type:              "email",
+		Enabled:           true,
+		WebhookURL:        "https://discord.com/api/webhooks/id/raw-webhook-token",
+		MaskedWebhookURL:  "https://<WEBHOOK_HOST>/<WEBHOOK_PATH>",
+		EmailRecipients:   []string{"ops@example.com"},
+		UseGlobalSMTP:     true,
+		UseGlobalSMTPSet:  true,
+		MaskedEmailTarget: "o***s@<EMAIL_DOMAIN>",
+		SeverityFilter:    []string{"critical"},
+		EventTypeFilter:   []string{"incident.opened"},
 	}
 	body, err := json.Marshal(publicNotificationChannel(channel))
 	if err != nil {
@@ -2136,15 +2122,8 @@ func TestPublicNotificationChannelProjectionOmitsInternalSecrets(t *testing.T) {
 	raw := string(body)
 	for _, leaked := range []string{
 		"raw-webhook-token",
-		"raw-smtp-password",
 		"ops@example.com",
-		"smtp.example.com",
-		"autostream@example.com",
-		"smtp-user",
 		"email_recipients",
-		"smtp_host",
-		"smtp_from",
-		"smtp_username",
 	} {
 		if strings.Contains(raw, leaked) {
 			t.Fatalf("public notification channel projection leaked %q: %s", leaked, raw)
@@ -2153,108 +2132,38 @@ func TestPublicNotificationChannelProjectionOmitsInternalSecrets(t *testing.T) {
 	if strings.Contains(raw, `"webhook_url"`) {
 		t.Fatalf("public notification channel projection leaked raw webhook field: %s", raw)
 	}
-	if strings.Contains(raw, `"smtp_password"`) {
-		t.Fatalf("public notification channel projection leaked raw SMTP password field: %s", raw)
-	}
-	for _, want := range []string{`"smtp_password_configured":true`, `"masked_email_target":"o***s@\u003cEMAIL_DOMAIN\u003e"`, `"severity_filter":["critical"]`} {
+	for _, want := range []string{`"uses_global_smtp":true`, `"masked_email_target":"o***s@\u003cEMAIL_DOMAIN\u003e"`, `"severity_filter":["critical"]`} {
 		if !strings.Contains(raw, want) {
 			t.Fatalf("public notification channel projection missing %s: %s", want, raw)
 		}
 	}
 }
 
-func TestEmailNotificationChannelRejectsUnsafeSMTPConfig(t *testing.T) {
+func TestEmailNotificationChannelRejectsRemovedDirectSMTPFields(t *testing.T) {
 	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", store.NewMemoryStore(), auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), &fakeNotifier{}, nil)
-	cases := map[string]struct {
-		body string
-		code string
-	}{
-		"private_host":     {body: `{"name":"email ops","type":"email","enabled":true,"email_recipients":["ops@example.com"],"smtp_host":"127.0.0.1","smtp_port":587,"smtp_tls":true,"smtp_from":"autostream@example.com"}`, code: "invalid_smtp_channel"},
-		"auth_without_tls": {body: `{"name":"email ops","type":"email","enabled":true,"email_recipients":["ops@example.com"],"smtp_host":"smtp.example.com","smtp_port":587,"smtp_tls":false,"smtp_from":"autostream@example.com","smtp_username":"autostream","smtp_password":"raw-smtp-password"}`, code: "invalid_smtp_channel"},
-		"header_injection": {body: `{"name":"email ops","type":"email","enabled":true,"email_recipients":["ops@example.com\r\nBcc: bad@example.com"],"smtp_host":"smtp.example.com","smtp_port":587,"smtp_tls":true,"smtp_from":"autostream@example.com"}`, code: "invalid_notification_channel"},
+	removed := map[string]string{
+		"smtp_host":     `"smtp.example.com"`,
+		"smtp_port":     `587`,
+		"smtp_tls":      `true`,
+		"smtp_from":     `"autostream@example.com"`,
+		"smtp_username": `"autostream"`,
+		"smtp_password": `"raw-smtp-password"`,
 	}
-	for name, tc := range cases {
+	for name, value := range removed {
 		t.Run(name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(tc.body))
+			body := `{"name":"email ops","type":"email","enabled":true,"uses_global_smtp":true,"email_recipients":["ops@example.com"],"` + name + `":` + value + `}`
+
+			req := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(body))
 			req.Header.Set("Authorization", "Bearer admin-token")
 			res := httptest.NewRecorder()
 			handler.ServeHTTP(res, req)
-			if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), tc.code) {
-				t.Fatalf("create status=%d body=%s", res.Code, res.Body.String())
+			if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "bad_request") {
+				t.Fatalf("removed direct SMTP field %q accepted: status=%d body=%s", name, res.Code, res.Body.String())
 			}
-			if strings.Contains(res.Body.String(), "raw-smtp-password") || strings.Contains(res.Body.String(), "127.0.0.1") {
-				t.Fatalf("SMTP secret/target leaked in error response: %s", res.Body.String())
+			if strings.Contains(res.Body.String(), "raw-smtp-password") || strings.Contains(res.Body.String(), "smtp.example.com") {
+				t.Fatalf("removed SMTP detail leaked in error response: %s", res.Body.String())
 			}
 		})
-	}
-}
-
-func TestEmailNotificationChannelUpdateRejectsTLSDowngradeWithExistingCredentials(t *testing.T) {
-	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", store.NewMemoryStore(), auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), &fakeNotifier{}, nil)
-	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"email ops","type":"email","enabled":true,"email_recipients":["ops@example.com"],"smtp_host":"smtp.example.com","smtp_port":587,"smtp_tls":true,"smtp_from":"autostream@example.com","smtp_username":"autostream","smtp_password":"raw-smtp-password"}`))
-	createReq.Header.Set("Authorization", "Bearer admin-token")
-	createRes := httptest.NewRecorder()
-	handler.ServeHTTP(createRes, createReq)
-	if createRes.Code != http.StatusCreated {
-		t.Fatalf("create email channel status=%d body=%s", createRes.Code, createRes.Body.String())
-	}
-	var created store.NotificationChannel
-	if err := json.NewDecoder(createRes.Body).Decode(&created); err != nil {
-		t.Fatal(err)
-	}
-
-	updateReq := httptest.NewRequest(http.MethodPut, "/notification-channels/"+created.ID, bytes.NewBufferString(`{"name":"email ops","type":"email","enabled":true,"email_recipients":["ops@example.com"],"smtp_host":"smtp.example.com","smtp_port":587,"smtp_tls":false,"smtp_from":"autostream@example.com"}`))
-	updateReq.Header.Set("Authorization", "Bearer admin-token")
-	updateRes := httptest.NewRecorder()
-	handler.ServeHTTP(updateRes, updateReq)
-	if updateRes.Code != http.StatusBadRequest || !strings.Contains(updateRes.Body.String(), "invalid_smtp_channel") {
-		t.Fatalf("expected TLS downgrade to be rejected, status=%d body=%s", updateRes.Code, updateRes.Body.String())
-	}
-	if strings.Contains(updateRes.Body.String(), "raw-smtp-password") {
-		t.Fatalf("SMTP password leaked in TLS downgrade response: %s", updateRes.Body.String())
-	}
-}
-
-func TestEmailNotificationChannelUpdateKeepsTLSWhenOmitted(t *testing.T) {
-	mem := store.NewMemoryStore()
-	handler := NewServerWithStoreAuthzNotifierAndExecutor("observability", mem, auth.NewVerifierFromRawTokens("ingest-token"), auth.NewVerifierFromRawTokens("admin-token"), &fakeNotifier{}, nil)
-	createReq := httptest.NewRequest(http.MethodPost, "/notification-channels", bytes.NewBufferString(`{"name":"email ops","type":"email","enabled":true,"email_recipients":["ops@example.com"],"smtp_host":"smtp.example.com","smtp_port":587,"smtp_tls":true,"smtp_from":"autostream@example.com","smtp_username":"autostream","smtp_password":"raw-smtp-password"}`))
-	createReq.Header.Set("Authorization", "Bearer admin-token")
-	createRes := httptest.NewRecorder()
-	handler.ServeHTTP(createRes, createReq)
-	if createRes.Code != http.StatusCreated {
-		t.Fatalf("create email channel status=%d body=%s", createRes.Code, createRes.Body.String())
-	}
-	var created store.NotificationChannel
-	if err := json.NewDecoder(createRes.Body).Decode(&created); err != nil {
-		t.Fatal(err)
-	}
-
-	updateReq := httptest.NewRequest(http.MethodPut, "/notification-channels/"+created.ID, bytes.NewBufferString(`{"name":"email ops renamed","type":"email","enabled":true}`))
-	updateReq.Header.Set("Authorization", "Bearer admin-token")
-	updateRes := httptest.NewRecorder()
-	handler.ServeHTTP(updateRes, updateReq)
-	if updateRes.Code != http.StatusOK {
-		t.Fatalf("update without smtp_tls should preserve TLS, status=%d body=%s", updateRes.Code, updateRes.Body.String())
-	}
-	for _, raw := range []string{"raw-smtp-password", "ops@example.com", "smtp.example.com", "autostream@example.com", `"smtp_password"`, `"email_recipients"`, `"smtp_host"`, `"smtp_from"`, `"smtp_username"`} {
-		if strings.Contains(updateRes.Body.String(), raw) {
-			t.Fatalf("email channel raw detail leaked in update response: %s", updateRes.Body.String())
-		}
-	}
-	var updated store.NotificationChannel
-	if err := json.NewDecoder(updateRes.Body).Decode(&updated); err != nil {
-		t.Fatal(err)
-	}
-	if !updated.SMTPPasswordConfigured || updated.Name != "email ops renamed" {
-		t.Fatalf("email channel public update status missing: %#v", updated)
-	}
-	stored, err := mem.GetNotificationChannel(t.Context(), created.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !stored.SMTPTLS || stored.SMTPPassword == "" || stored.SMTPHost != "smtp.example.com" || stored.SMTPFrom != "autostream@example.com" {
-		t.Fatalf("email channel update did not preserve stored SMTP settings: %#v", stored)
 	}
 }
 
@@ -2290,7 +2199,7 @@ func TestNotificationChannelTestDoesNotExposeWebhookURL(t *testing.T) {
 	}
 }
 
-func TestEmailNotificationChannelTestDoesNotExposeSMTPDetails(t *testing.T) {
+func TestEmailNotificationChannelTestDoesNotExposeRecipientDetails(t *testing.T) {
 	st := store.NewMemoryStore()
 	channel, err := st.CreateNotificationChannel(t.Context(), store.NotificationChannel{
 		Name:              "ops email",
@@ -2311,12 +2220,12 @@ func TestEmailNotificationChannelTestDoesNotExposeSMTPDetails(t *testing.T) {
 		t.Fatalf("test status = %d body = %s", testRes.Code, testRes.Body.String())
 	}
 	body := testRes.Body.String()
-	for _, raw := range []string{"ops@example.com", "smtp.example.com", "raw-smtp-password", `"email_recipients"`, `"smtp_host"`, `"smtp_from"`, `"smtp_username"`, `"smtp_password"`} {
+	for _, raw := range []string{"ops@example.com", `"email_recipients"`} {
 		if strings.Contains(body, raw) {
 			t.Fatalf("email notification test response leaked SMTP detail %q: %s", raw, body)
 		}
 	}
-	if !strings.Contains(body, `o***s@\u003cEMAIL_DOMAIN\u003e`) || !strings.Contains(body, "send_failed") {
+	if !strings.Contains(body, `o***s@\u003cEMAIL_DOMAIN\u003e`) || !strings.Contains(body, "email notification delivery failed") {
 		t.Fatalf("email notification test response should include masked target and sanitized error: %s", body)
 	}
 }
@@ -3122,12 +3031,15 @@ func (f *fakeControlExecutor) ExecuteRemediationProposal(ctx context.Context, pr
 
 func writeNodeConfigForVerifierTest(t *testing.T, path, nodeType string) {
 	t.Helper()
+	writeNodeListenerCredentialForVerifierTest(t, path, nodeType, "7")
 	body := `panel:
   url: "https://panel.example.jp"
 node:
   id: "observability-01"
   name: "Observability 01"
   type: "` + nodeType + `"
+listener:
+  credential: "node-listener.json"
 api:
   host: "observability.example.jp"
   port: 8443
@@ -3137,6 +3049,19 @@ auth:
   token: "runtime-secret"
 `
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeNodeListenerCredentialForVerifierTest(t *testing.T, configPath, serviceType, revision string) {
+	t.Helper()
+	credentialDir := filepath.Join(filepath.Dir(configPath), "credentials")
+	if err := os.MkdirAll(credentialDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", credentialDir)
+	body := `{"schema_version":2,"service_type":"` + serviceType + `","bind_address":"127.0.0.1:18082","config_revision":` + revision + `}`
+	if err := os.WriteFile(filepath.Join(credentialDir, "node-listener.json"), []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
 }

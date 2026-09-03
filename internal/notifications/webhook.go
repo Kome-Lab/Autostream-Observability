@@ -4,19 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
-	"mime"
-	"mime/multipart"
-	"mime/quotedprintable"
 	"net"
 	"net/http"
-	"net/mail"
-	"net/smtp"
-	"net/textproto"
 	"net/url"
 	"os"
 	"strconv"
@@ -82,16 +75,11 @@ type WebhookNotifier struct {
 }
 
 type EmailNotifier struct {
-	Channel        store.NotificationChannel
-	Relay          EmailRelay
-	Timeout        time.Duration
-	RetryMax       int
-	RetryBaseDelay time.Duration
-	Send           func(addr string, auth smtp.Auth, from string, to []string, msg []byte) error
-	Sleep          func(context.Context, time.Duration) error
+	Channel store.NotificationChannel
+	Relay   EmailRelay
+	Timeout time.Duration
 }
 
-var smtpLookupIPAddr = net.DefaultResolver.LookupIPAddr
 var webhookLookupIPAddr = net.DefaultResolver.LookupIPAddr
 
 type ChannelStore interface {
@@ -292,7 +280,7 @@ func NotifierForChannel(channel store.NotificationChannel, timeout time.Duration
 
 func NotifierForChannelWithRelay(channel store.NotificationChannel, timeout time.Duration, retryMax int, retryBaseDelay time.Duration, client *http.Client, allowPrivate bool, emailRelay EmailRelay) IncidentEventNotifier {
 	if channel.Type == "email" {
-		return EmailNotifier{Channel: channel, Relay: emailRelay, Timeout: timeout, RetryMax: retryMax, RetryBaseDelay: retryBaseDelay}
+		return EmailNotifier{Channel: channel, Relay: emailRelay, Timeout: timeout}
 	}
 	if timeout == 0 {
 		timeout = 5 * time.Second
@@ -320,105 +308,34 @@ func (n EmailNotifier) NotifyIncidentEvent(ctx context.Context, eventType string
 		result.Error = "email notification is not configured"
 		return []DeliveryResult{result}, errors.New(result.Error)
 	}
-	usesGlobalSMTP := channel.UseGlobalSMTP || !hasDirectSMTPConfiguration(channel)
-	if usesGlobalSMTP && n.Relay == nil {
+	if !channel.UseGlobalSMTP || n.Relay == nil {
 		result.Status = "failure"
 		result.Error = "email notification delivery failed"
 		return []DeliveryResult{result}, errors.New(result.Error)
 	}
-	if !usesGlobalSMTP && (strings.TrimSpace(channel.SMTPHost) == "" || strings.TrimSpace(channel.SMTPFrom) == "") {
-		result.Status = "failure"
-		result.Error = "email notification is not configured"
-		return []DeliveryResult{result}, errors.New(result.Error)
-	}
-	addr := ""
-	var auth smtp.Auth
-	var msg []byte
-	if !usesGlobalSMTP {
-		port := channel.SMTPPort
-		if port == 0 {
-			port = 587
-		}
-		addr = net.JoinHostPort(channel.SMTPHost, strconv.Itoa(port))
-		if channel.SMTPUsername != "" && channel.SMTPPassword != "" {
-			auth = smtp.PlainAuth("", channel.SMTPUsername, channel.SMTPPassword, channel.SMTPHost)
-		}
-		msg = []byte(formatEmailMessage(eventType, incident, channel.SMTPFrom, channel.EmailRecipients))
-	}
 	if n.Timeout <= 0 {
 		n.Timeout = 5 * time.Second
-	}
-	attempts := n.RetryMax + 1
-	if attempts < 1 {
-		attempts = 1
 	}
 	// The Control Panel relay may have delivered to an earlier recipient before
 	// returning a later-recipient failure. Retrying the whole recipient list here
 	// would therefore duplicate messages that were already accepted.
-	if usesGlobalSMTP {
-		attempts = 1
-	}
+	reqCtx, cancel := context.WithTimeout(ctx, n.Timeout)
+	defer cancel()
+	recipients := append([]string(nil), channel.EmailRecipients...)
+	subject := formatEmailSubject(eventType, incident)
+	text := formatIncidentEmailText(eventType, incident)
 	var lastErr error
-	for attempt := 0; attempt < attempts; attempt++ {
-		if usesGlobalSMTP {
-			reqCtx, cancel := context.WithTimeout(ctx, n.Timeout)
-			recipients := append([]string(nil), channel.EmailRecipients...)
-			subject := formatEmailSubject(eventType, incident)
-			text := formatIncidentEmailText(eventType, incident)
-			if htmlRelay, ok := n.Relay.(HTMLEmailRelay); ok {
-				lastErr = htmlRelay.SendNotificationEmailHTML(reqCtx, recipients, subject, text, formatIncidentHTML(eventType, incident))
-			} else {
-				lastErr = n.Relay.SendNotificationEmail(reqCtx, recipients, subject, text)
-			}
-			cancel()
-			if lastErr == nil {
-				result.Status = "success"
-				return []DeliveryResult{result}, nil
-			}
-		} else if n.Send == nil {
-			reqCtx, cancel := context.WithTimeout(ctx, n.Timeout)
-			lastErr = safeSMTPSendMail(reqCtx, channel, auth, msg, allowPrivateSMTPFromEnv())
-			cancel()
-			if lastErr == nil {
-				result.Status = "success"
-				return []DeliveryResult{result}, nil
-			}
-		} else {
-			errCh := make(chan error, 1)
-			go func() {
-				errCh <- n.Send(addr, auth, channel.SMTPFrom, channel.EmailRecipients, msg)
-			}()
-			timer := time.NewTimer(n.Timeout)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				result.Status = "failure"
-				result.Error = "email notification delivery failed"
-				return []DeliveryResult{result}, ctx.Err()
-			case err := <-errCh:
-				timer.Stop()
-				if err == nil {
-					result.Status = "success"
-					return []DeliveryResult{result}, nil
-				}
-				lastErr = err
-			case <-timer.C:
-				lastErr = context.DeadlineExceeded
-			}
-		}
-		if attempt == attempts-1 {
-			break
-		}
-		if err := sleepWithFunc(ctx, webhookRetryDelay(n.RetryBaseDelay, attempt), n.Sleep); err != nil {
-			lastErr = err
-			break
-		}
+	if htmlRelay, ok := n.Relay.(HTMLEmailRelay); ok {
+		lastErr = htmlRelay.SendNotificationEmailHTML(reqCtx, recipients, subject, text, formatIncidentHTML(eventType, incident))
+	} else {
+		lastErr = n.Relay.SendNotificationEmail(reqCtx, recipients, subject, text)
+	}
+	if lastErr == nil {
+		result.Status = "success"
+		return []DeliveryResult{result}, nil
 	}
 	result.Status = "failure"
-	result.Error = "email notification delivery failed"
-	if usesGlobalSMTP {
-		result.Error = safeEmailRelayError(lastErr)
-	}
+	result.Error = safeEmailRelayError(lastErr)
 	return []DeliveryResult{result}, lastErr
 }
 
@@ -460,168 +377,6 @@ func SanitizeChannelDeliveryError(channel string, err error) string {
 	return SanitizeDeliveryError(err)
 }
 
-func safeSMTPSendMail(ctx context.Context, channel store.NotificationChannel, auth smtp.Auth, msg []byte, allowPrivate bool) error {
-	host := strings.TrimSpace(channel.SMTPHost)
-	port := channel.SMTPPort
-	if port == 0 {
-		port = 587
-	}
-	conn, err := safeSMTPDialContext(ctx, host, port, allowPrivate)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	client, err := smtp.NewClient(conn, host)
-	if err != nil {
-		return err
-	}
-	defer client.Close()
-	if err := client.Hello("localhost"); err != nil {
-		return err
-	}
-	if ok, _ := client.Extension("STARTTLS"); ok {
-		if err := client.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); err != nil {
-			return err
-		}
-	} else if channel.SMTPTLS {
-		return errors.New("notification SMTP STARTTLS unavailable")
-	}
-	if auth != nil {
-		if err := client.Auth(auth); err != nil {
-			return err
-		}
-	}
-	if err := client.Mail(channel.SMTPFrom); err != nil {
-		return err
-	}
-	for _, recipient := range channel.EmailRecipients {
-		if err := client.Rcpt(recipient); err != nil {
-			return err
-		}
-	}
-	writer, err := client.Data()
-	if err != nil {
-		return err
-	}
-	if _, err := writer.Write(msg); err != nil {
-		writer.Close()
-		return err
-	}
-	if err := writer.Close(); err != nil {
-		return err
-	}
-	return client.Quit()
-}
-
-func safeSMTPDialContext(ctx context.Context, host string, port int, allowPrivate bool) (net.Conn, error) {
-	if port <= 0 || port > 65535 {
-		return nil, errors.New("notification SMTP port is invalid")
-	}
-	if allowPrivate {
-		dialer := &net.Dialer{}
-		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
-	}
-	resolved, err := smtpLookupIPAddr(ctx, host)
-	if err != nil {
-		return nil, errors.New("notification SMTP host resolution failed")
-	}
-	dialer := &net.Dialer{}
-	for _, candidate := range resolved {
-		if unsafeWebhookIP(candidate.IP) {
-			continue
-		}
-		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(candidate.IP.String(), strconv.Itoa(port)))
-	}
-	return nil, errors.New("notification SMTP host must not target a private network")
-}
-
-func formatEmailMessage(eventType string, incident store.Incident, from string, to []string) string {
-	subject := formatEmailSubjectHeader(formatEmailSubject(eventType, incident))
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	plainHeader := textproto.MIMEHeader{}
-	plainHeader.Set("Content-Type", `text/plain; charset="UTF-8"`)
-	plainHeader.Set("Content-Transfer-Encoding", "quoted-printable")
-	plainPart, plainErr := writer.CreatePart(plainHeader)
-	if plainErr == nil {
-		plainWriter := quotedprintable.NewWriter(plainPart)
-		_, plainErr = plainWriter.Write([]byte(formatIncidentEmailText(eventType, incident)))
-		if closeErr := plainWriter.Close(); plainErr == nil {
-			plainErr = closeErr
-		}
-	}
-	htmlHeader := textproto.MIMEHeader{}
-	htmlHeader.Set("Content-Type", `text/html; charset="UTF-8"`)
-	htmlHeader.Set("Content-Transfer-Encoding", "quoted-printable")
-	htmlPart, htmlErr := writer.CreatePart(htmlHeader)
-	if htmlErr == nil {
-		htmlWriter := quotedprintable.NewWriter(htmlPart)
-		_, htmlErr = htmlWriter.Write([]byte(formatIncidentHTML(eventType, incident)))
-		if closeErr := htmlWriter.Close(); htmlErr == nil {
-			htmlErr = closeErr
-		}
-	}
-	closeErr := writer.Close()
-	if plainErr != nil || htmlErr != nil || closeErr != nil {
-		return formatPlainEmailMessage(subject, from, to, formatIncidentEmailText(eventType, incident))
-	}
-	headers := []string{
-		"From: " + formatEmailAddressHeader(from),
-		"To: " + formatEmailAddressListHeader(to),
-		"Subject: " + subject,
-		"MIME-Version: 1.0",
-		fmt.Sprintf(`Content-Type: multipart/alternative; boundary=%q`, writer.Boundary()),
-	}
-	return strings.Join(headers, "\r\n") + "\r\n\r\n" + body.String()
-}
-
-func formatPlainEmailMessage(subject, from string, to []string, text string) string {
-	headers := []string{
-		"From: " + formatEmailAddressHeader(from),
-		"To: " + formatEmailAddressListHeader(to),
-		"Subject: " + subject,
-		"MIME-Version: 1.0",
-		"Content-Type: text/plain; charset=UTF-8",
-		"Content-Transfer-Encoding: 8bit",
-	}
-	return strings.Join(headers, "\r\n") + "\r\n\r\n" + text
-}
-
-func formatEmailAddressHeader(value string) string {
-	value = sanitizeEmailHeaderValue(value)
-	if address, err := mail.ParseAddress(value); err == nil && strings.TrimSpace(address.Address) != "" {
-		return address.String()
-	}
-	return value
-}
-
-func formatEmailAddressListHeader(values []string) string {
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		if value = formatEmailAddressHeader(value); value != "" {
-			out = append(out, value)
-		}
-	}
-	return strings.Join(out, ", ")
-}
-
-func sanitizeEmailHeaderValue(value string) string {
-	value = strings.ReplaceAll(value, "\r", "")
-	value = strings.ReplaceAll(value, "\n", "")
-	value = strings.ReplaceAll(value, "\x00", "")
-	return strings.TrimSpace(value)
-}
-
-func formatEmailSubjectHeader(subject string) string {
-	subject = sanitizeEmailHeaderValue(subject)
-	for index, value := range subject {
-		if value > 127 {
-			return subject[:index] + mime.QEncoding.Encode("UTF-8", subject[index:])
-		}
-	}
-	return subject
-}
-
 func formatEmailSubject(eventType string, incident store.Incident) string {
 	severity := strings.ToUpper(strings.TrimSpace(incident.Severity))
 	if severity == "" {
@@ -634,15 +389,6 @@ func formatEmailSubject(eventType string, incident store.Incident) string {
 		subject += " | " + title
 	}
 	return truncateNotificationText(strings.Join(strings.Fields(strings.ReplaceAll(strings.ReplaceAll(subject, "\r", " "), "\n", " ")), " "), 200)
-}
-
-func hasDirectSMTPConfiguration(channel store.NotificationChannel) bool {
-	return strings.TrimSpace(channel.SMTPHost) != "" ||
-		channel.SMTPPort != 0 ||
-		strings.TrimSpace(channel.SMTPFrom) != "" ||
-		strings.TrimSpace(channel.SMTPUsername) != "" ||
-		strings.TrimSpace(channel.SMTPPassword) != "" ||
-		channel.SMTPPasswordConfigured
 }
 
 func (n WebhookNotifier) payload(eventType string, incident store.Incident) map[string]any {
@@ -1583,44 +1329,6 @@ func NormalizeWebhookURLForType(raw, channelType string) (string, error) {
 	return NormalizeWebhookURLForTypeWithPolicy(raw, channelType, allowPrivateWebhooksFromEnv())
 }
 
-func ValidateSMTPChannel(channel store.NotificationChannel) error {
-	return ValidateSMTPChannelWithPolicy(channel, allowPrivateSMTPFromEnv())
-}
-
-func ValidateSMTPChannelWithPolicy(channel store.NotificationChannel, allowPrivate bool) error {
-	if channel.UseGlobalSMTP || !hasDirectSMTPConfiguration(channel) {
-		if len(channel.EmailRecipients) == 0 {
-			return errors.New("notification email recipient is required")
-		}
-		return nil
-	}
-	host := strings.TrimSpace(channel.SMTPHost)
-	if host == "" {
-		return errors.New("notification SMTP host is required")
-	}
-	if strings.ContainsAny(host, `/\@`) {
-		return errors.New("notification SMTP host must be a hostname or IP address")
-	}
-	if !allowPrivate && unsafeWebhookHost(host) {
-		return errors.New("notification SMTP host must not target a private network")
-	}
-	if channel.SMTPPort < 0 || channel.SMTPPort > 65535 {
-		return errors.New("notification SMTP port is invalid")
-	}
-	usernameConfigured := strings.TrimSpace(channel.SMTPUsername) != ""
-	passwordConfigured := strings.TrimSpace(channel.SMTPPassword) != "" || channel.SMTPPasswordConfigured
-	if usernameConfigured != passwordConfigured {
-		return errors.New("notification SMTP credentials are incomplete")
-	}
-	if !allowPrivate && !channel.SMTPTLS {
-		return errors.New("notification SMTP requires TLS for remote targets")
-	}
-	if (channel.SMTPUsername != "" || channel.SMTPPassword != "") && !channel.SMTPTLS {
-		return errors.New("notification SMTP credentials require TLS")
-	}
-	return nil
-}
-
 func ValidateWebhookURLWithPolicy(raw string, allowPrivate bool) error {
 	return ValidateWebhookURLForTypeWithPolicy(raw, "generic", allowPrivate)
 }
@@ -1833,13 +1541,6 @@ func allowPrivateWebhooksFromEnv() bool {
 		return false
 	}
 	return envTruthy("OBSERVABILITY_ALLOW_PRIVATE_WEBHOOKS")
-}
-
-func allowPrivateSMTPFromEnv() bool {
-	if observabilityProductionEnvironment() {
-		return false
-	}
-	return envTruthy("OBSERVABILITY_ALLOW_PRIVATE_SMTP")
 }
 
 func observabilityProductionEnvironment() bool {

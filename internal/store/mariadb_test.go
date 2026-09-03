@@ -12,10 +12,14 @@ import (
 )
 
 var (
-	captureExecMu    sync.Mutex
-	captureExecQuery string
-	captureExecArgs  []driver.NamedValue
+	captureExecMu      sync.Mutex
+	captureExecRecords []captureExecRecord
 )
+
+type captureExecRecord struct {
+	query string
+	args  []driver.NamedValue
+}
 
 func init() {
 	sql.Register("autostream_observability_capture_exec", captureExecDriver{})
@@ -38,14 +42,18 @@ func (captureExecConn) Close() error {
 }
 
 func (captureExecConn) Begin() (driver.Tx, error) {
-	return nil, errors.New("transactions are not implemented by captureExecConn")
+	return captureExecTx{}, nil
 }
+
+type captureExecTx struct{}
+
+func (captureExecTx) Commit() error   { return nil }
+func (captureExecTx) Rollback() error { return nil }
 
 func (captureExecConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	captureExecMu.Lock()
 	defer captureExecMu.Unlock()
-	captureExecQuery = query
-	captureExecArgs = append([]driver.NamedValue(nil), args...)
+	captureExecRecords = append(captureExecRecords, captureExecRecord{query: query, args: append([]driver.NamedValue(nil), args...)})
 	return driver.RowsAffected(1), nil
 }
 
@@ -94,58 +102,7 @@ func TestMariaDBNotificationChannelStoresWebhookURLAsCiphertextAndNonce(t *testi
 	}
 }
 
-func TestMariaDBNotificationChannelStoresSMTPPasswordAsCiphertextAndNonce(t *testing.T) {
-	db, err := sql.Open("autostream_observability_capture_exec", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	rawPassword := "smtp-secret-password"
-	store := MariaDBStore{DB: db, SecretKey: "test-secret-key"}
-	created, err := store.CreateNotificationChannel(t.Context(), NotificationChannel{
-		ID:              "ntc-email",
-		Name:            "ops email",
-		Type:            "email",
-		Enabled:         true,
-		EmailRecipients: []string{"ops@example.com"},
-		SMTPHost:        "smtp.example.com",
-		SMTPPort:        587,
-		SMTPTLS:         true,
-		SMTPFrom:        "alerts@example.com",
-		SMTPUsername:    "alerts@example.com",
-		SMTPPassword:    rawPassword,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	publicJSON, err := json.Marshal(created)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(publicJSON), rawPassword) {
-		t.Fatalf("public channel JSON leaked raw SMTP password: %s", publicJSON)
-	}
-
-	args := capturedExecArgs(t, "notification_channels")
-	smtpCiphertext := namedArgString(t, args, 13)
-	smtpNonce := namedArgString(t, args, 14)
-	if smtpCiphertext == "" || smtpNonce == "" {
-		t.Fatalf("expected SMTP password ciphertext and nonce, args=%#v", args)
-	}
-	if strings.Contains(smtpCiphertext, rawPassword) {
-		t.Fatalf("SMTP password ciphertext leaked raw password: %q", smtpCiphertext)
-	}
-	decrypted, err := decryptSecret(smtpCiphertext, smtpNonce, store.SecretKey)
-	if err != nil {
-		t.Fatalf("stored SMTP password ciphertext could not be decrypted: %v", err)
-	}
-	if decrypted != rawPassword {
-		t.Fatalf("stored SMTP password ciphertext decrypted to %q, want %q", decrypted, rawPassword)
-	}
-}
-
-func TestMariaDBGlobalSMTPChannelDoesNotPersistLegacySMTPFields(t *testing.T) {
+func TestMariaDBEmailChannelPersistsOnlyGlobalSMTPReference(t *testing.T) {
 	db, err := sql.Open("autostream_observability_capture_exec", "")
 	if err != nil {
 		t.Fatal(err)
@@ -154,43 +111,47 @@ func TestMariaDBGlobalSMTPChannelDoesNotPersistLegacySMTPFields(t *testing.T) {
 
 	store := MariaDBStore{DB: db, SecretKey: "test-secret-key"}
 	created, err := store.CreateNotificationChannel(t.Context(), NotificationChannel{
-		ID:                     "ntc-global-email",
-		Name:                   "global email",
-		Type:                   "email",
-		Enabled:                true,
-		UseGlobalSMTP:          true,
-		UseGlobalSMTPSet:       true,
-		EmailRecipients:        []string{"ops@example.com"},
-		SMTPHost:               "smtp.should-be-cleared.example",
-		SMTPPort:               587,
-		SMTPTLS:                true,
-		SMTPFrom:               "legacy@example.com",
-		SMTPUsername:           "legacy-user",
-		SMTPPassword:           "legacy-password",
-		SMTPPasswordConfigured: true,
+		ID:               "ntc-global-email",
+		Name:             "global email",
+		Type:             "email",
+		Enabled:          true,
+		UseGlobalSMTP:    true,
+		UseGlobalSMTPSet: true,
+		EmailRecipients:  []string{"ops@example.com"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !created.UseGlobalSMTP || created.SMTPHost != "" || created.SMTPPasswordConfigured {
-		t.Fatalf("global SMTP create retained legacy settings: %#v", created)
+	if !created.UseGlobalSMTP {
+		t.Fatalf("global SMTP create lost its v2 reference: %#v", created)
 	}
-	args := capturedExecArgs(t, "notification_channels")
-	for _, index := range []int{8, 11, 12, 13, 14} {
-		if value := namedArgString(t, args, index); value != "" {
-			t.Fatalf("legacy SMTP arg %d was persisted: %q", index, value)
+	base := capturedExec(t, "INSERT INTO notification_channels")
+	for _, legacyColumn := range []string{"smtp_host", "smtp_port", "smtp_tls", "smtp_from", "smtp_username", "smtp_password"} {
+		if strings.Contains(strings.ToLower(base.query), legacyColumn) {
+			t.Fatalf("legacy SMTP column %q remains in v2 insert: %s", legacyColumn, base.query)
 		}
+	}
+	reference := capturedExec(t, "notification_channel_v2_config_references")
+	if len(reference.args) != 1 || namedArgString(t, reference.args, 0) != created.ID {
+		t.Fatalf("unexpected global SMTP reference insert: %#v", reference.args)
 	}
 }
 
 func capturedExecArgs(t *testing.T, queryFragment string) []driver.NamedValue {
+	return capturedExec(t, queryFragment).args
+}
+
+func capturedExec(t *testing.T, queryFragment string) captureExecRecord {
 	t.Helper()
 	captureExecMu.Lock()
 	defer captureExecMu.Unlock()
-	if !strings.Contains(captureExecQuery, queryFragment) {
-		t.Fatalf("unexpected captured query: %s", captureExecQuery)
+	for i := len(captureExecRecords) - 1; i >= 0; i-- {
+		if strings.Contains(captureExecRecords[i].query, queryFragment) {
+			return captureExecRecord{query: captureExecRecords[i].query, args: append([]driver.NamedValue(nil), captureExecRecords[i].args...)}
+		}
 	}
-	return append([]driver.NamedValue(nil), captureExecArgs...)
+	t.Fatalf("no captured query contained %q: %#v", queryFragment, captureExecRecords)
+	return captureExecRecord{}
 }
 
 func namedArgString(t *testing.T, args []driver.NamedValue, index int) string {

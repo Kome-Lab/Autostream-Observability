@@ -39,18 +39,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	addr, err := observabilityBindAddrFromEnv()
+	controlClient := control.FromEnv()
+	addr, err := observabilityBindAddr(controlClient.BindAddress)
 	if err != nil {
-		log.Fatalf("invalid OBSERVABILITY_BIND_ADDR: %v", err)
-	}
-	if _, err := httpapi.ConfigRevisionFromEnv(); err != nil {
-		log.Fatalf("invalid AUTOSTREAM_CONFIG_REVISION: %v", err)
+		log.Fatalf("invalid node listener credential bind_address: %v", err)
 	}
 	updaterIdentity := httpapi.NewUpdaterIdentityLatch(control.ServiceType)
 	if _, err := updaterIdentity.ResolveFromEnv(); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
 		log.Fatalf("invalid updater identity: %v", err)
 	}
-	controlClient := control.FromEnv()
 	if err := requireMatchingUpdaterIdentity(updaterIdentity, controlClient.ServiceID); err != nil && !errors.Is(err, httpapi.ErrUpdaterIdentityPending) {
 		log.Fatalf("invalid updater identity: %v", err)
 	}
@@ -67,6 +64,19 @@ func main() {
 	defer db.Close()
 	setupCtx, cancelSetup := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelSetup()
+	authorityRequired, err := database.NotificationChannelV2AuthorityRequired(setupCtx, db)
+	if err != nil {
+		log.Fatalf("inspect global SMTP migration readiness failed: %v", err)
+	}
+	if authorityRequired {
+		authority, readinessErr := controlClient.GlobalSMTPAuthority(setupCtx)
+		if readinessErr != nil {
+			log.Fatalf("Control Panel global SMTP replacement is not ready: %v", readinessErr)
+		}
+		if err := database.RecordNotificationChannelV2Authority(setupCtx, db, authority.AuthorityRevision); err != nil {
+			log.Fatalf("record global SMTP migration authority failed: %v", err)
+		}
+	}
 	if err := database.RunEmbeddedMigrations(setupCtx, db); err != nil {
 		log.Fatalf("run migrations failed: %v", err)
 	}
@@ -99,12 +109,10 @@ func main() {
 	}
 }
 
-func observabilityBindAddrFromEnv() (string, error) {
-	const defaultAddr = "127.0.0.1:8080"
-
-	addr := strings.TrimSpace(os.Getenv("OBSERVABILITY_BIND_ADDR"))
+func observabilityBindAddr(configured string) (string, error) {
+	addr := strings.TrimSpace(configured)
 	if addr == "" {
-		addr = defaultAddr
+		return "", errors.New("node listener credential bind_address is required")
 	}
 	_, portText, err := net.SplitHostPort(addr)
 	if err != nil {

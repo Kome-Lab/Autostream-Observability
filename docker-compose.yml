@@ -4,8 +4,10 @@ services:
     env_file: .env.example
     environment:
       AUTOSTREAM_NODE_CONFIG: /etc/autostream-observability/config.yml
-      AUTOSTREAM_CONFIG_REVISION: ${AUTOSTREAM_CONFIG_REVISION:-1}
-      OBSERVABILITY_BIND_ADDR: 0.0.0.0:${AUTOSTREAM_OBSERVABILITY_CONTAINER_PORT:-8080}
+      CREDENTIALS_DIRECTORY: /run/autostream-credentials
+    configs:
+      - source: node-listener
+        target: /run/autostream-credentials/node-listener.json
     ports:
       - "127.0.0.1:${AUTOSTREAM_OBSERVABILITY_PORT:-8082}:${AUTOSTREAM_OBSERVABILITY_CONTAINER_PORT:-8080}"
     volumes:
@@ -23,3 +25,8 @@ services:
       - mariadb:/var/lib/mysql
 volumes:
   mariadb:
+
+configs:
+  node-listener:
+    content: |
+      {"schema_version":2,"service_type":"observability","bind_address":"0.0.0.0:${AUTOSTREAM_OBSERVABILITY_CONTAINER_PORT:-8080}","config_revision":${AUTOSTREAM_CONFIG_REVISION:?AUTOSTREAM_CONFIG_REVISION is required}}

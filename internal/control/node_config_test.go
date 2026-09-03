@@ -10,7 +10,7 @@ func TestFromEnvUsesNodeConfig(t *testing.T) {
 	path := writeNodeConfigForTest(t, "observability")
 	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
 	client := FromEnv()
-	if client.BaseURL != "https://panel.example.jp" || client.Token != "runtime-secret" || client.ServiceID != "observability-01" || client.ServiceName != "Observability 01" || client.ServicePublicURL != "https://observability.example.jp:8443" {
+	if client.BaseURL != "https://panel.example.jp" || client.Token != "runtime-secret" || client.ServiceID != "observability-01" || client.ServiceName != "Observability 01" || client.ServicePublicURL != "https://observability.example.jp:8443" || client.BindAddress != "127.0.0.1:18083" || client.ConfigRevision != 27 {
 		t.Fatalf("unexpected config from node file: %#v", client)
 	}
 	if !client.Enabled() {
@@ -18,6 +18,31 @@ func TestFromEnvUsesNodeConfig(t *testing.T) {
 	}
 	if got := NodeRuntimeTokenFromEnv(); got != "runtime-secret" {
 		t.Fatalf("runtime token = %q", got)
+	}
+}
+
+func TestFromEnvFailsClosedWithoutListenerCredential(t *testing.T) {
+	path := writeNodeConfigForTest(t, ServiceType)
+	if err := os.Remove(filepath.Join(filepath.Dir(path), "credentials", "node-listener.json")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
+	client := FromEnv()
+	if client.ConfigError == "" || client.BindAddress != "" || client.ConfigRevision != 0 {
+		t.Fatalf("missing listener credential was not rejected: %#v", client)
+	}
+}
+
+func TestFromEnvFailsClosedForInvalidListenerCredential(t *testing.T) {
+	path := writeNodeConfigForTest(t, ServiceType)
+	credentialPath := filepath.Join(filepath.Dir(path), "credentials", "node-listener.json")
+	if err := os.WriteFile(credentialPath, []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AUTOSTREAM_NODE_CONFIG", path)
+	client := FromEnv()
+	if client.ConfigError == "" || client.BindAddress != "" || client.ConfigRevision != 0 {
+		t.Fatalf("invalid listener credential was not rejected: %#v", client)
 	}
 }
 
@@ -58,13 +83,25 @@ func TestFromEnvTreatsMissingNodeConfigAsPending(t *testing.T) {
 
 func writeNodeConfigForTest(t *testing.T, nodeType string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "config.yml")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	credentialDir := filepath.Join(dir, "credentials")
+	if err := os.Mkdir(credentialDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	credential := `{"schema_version":2,"service_type":"` + nodeType + `","bind_address":"127.0.0.1:18083","config_revision":27}`
+	if err := os.WriteFile(filepath.Join(credentialDir, "node-listener.json"), []byte(credential), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", credentialDir)
 	body := `panel:
   url: "https://panel.example.jp"
 node:
   id: "observability-01"
   name: "Observability 01"
   type: "` + nodeType + `"
+listener:
+  credential: "node-listener.json"
 api:
   host: "observability.example.jp"
   port: 8443

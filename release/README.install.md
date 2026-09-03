@@ -138,17 +138,16 @@ a symlink, or a path that is not root-owned or is writable by group/other
 users; a nonzero dump exit aborts the update before stopping Observability.
 
 Edit `/etc/autostream/observability.env` with real environment-specific values.
-`OBSERVABILITY_BIND_ADDR` accepts an arbitrary unprivileged port from `1024`
-through `65535`; the shipped systemd env uses the standard IPv4 loopback value
-`127.0.0.1:8082`. The binary retains the legacy `127.0.0.1:8080` fallback only
-when the variable is absent, so upgrading an older installation does not move
-its port. The systemd unit does not hard-code a port. An invalid address or an
-out-of-range port makes the service fail closed before it connects to MariaDB.
-
-Keep this root-owned file at mode `0640` and include
-`AUTOSTREAM_CONFIG_REVISION=1`. The revision must be a positive integer;
-increment it after applying a new service configuration. Invalid values stop
-Observability before it connects to MariaDB or starts serving HTTP.
+The panel-generated node config must select
+`listener.credential: node-listener.json`. The systemd unit loads the
+root-owned `/opt/autostream/local-executor/ports/observability.json` source as
+that credential. Its exact schema is `schema_version`, `service_type`,
+`bind_address`, and `config_revision`; use schema version `2`, service type `observability`, a
+positive revision, and an unprivileged bind port. The shipped host endpoint is
+`127.0.0.1:8082`. Public `api.host` / `api.port` values are independent and
+never fall back as the local listener. A missing or invalid credential stops
+Observability before MariaDB access. Keep the non-listener environment file
+root-owned at mode `0640`.
 
 For a fresh or currently stopped installation, edit the environment file and
 start the service:
@@ -170,9 +169,8 @@ sudo systemctl restart autostream-observability
 sudo systemctl status --no-pager autostream-observability
 ```
 
-The curl examples use the default IPv4 loopback port. If
-`OBSERVABILITY_BIND_ADDR` uses another port, use that configured port in both
-URLs. For an IPv6 loopback such as `[::1]:18082`, use brackets in the URL:
+The curl examples use the default IPv4 loopback port. If the node config uses
+another port, use it in both URLs. For an IPv6 loopback such as `[::1]:18082`, use brackets in the URL:
 `http://[::1]:18082/health`.
 
 `/updater/version` is the unauthenticated, identity-bound local executor probe.

@@ -4,14 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"mime"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/mail"
-	"net/smtp"
 	"strings"
 	"testing"
 	"time"
@@ -167,14 +162,7 @@ func TestAdminAuditNotificationUsesSpecificStructuredTitleAndContext(t *testing.
 	if subject := formatEmailSubject("admin.audit", incident); subject != "[AutoStream] WARNING secrets.update | シークレットを更新" {
 		t.Fatalf("admin audit email subject = %q", subject)
 	}
-	message := formatEmailMessage("admin.audit", incident, "autostream@example.jp", []string{"ops@example.jp"})
-	if !strings.Contains(message, "Subject: [AutoStream] WARNING secrets.update | =?UTF-8?") {
-		t.Fatalf("admin audit email subject lost its stable ASCII prefix or MIME encoding: %s", message)
-	}
-	if !strings.Contains(message, "Content-Type: multipart/alternative;") {
-		t.Fatalf("admin audit email is not multipart/alternative: %s", message)
-	}
-	text := formatIncidentText("admin.audit", incident)
+	text := formatIncidentEmailText("admin.audit", incident)
 	for _, want := range []string{"シークレットを更新", "重要度: 警告", "結果: 成功", "操作コード: シークレットを更新 (secrets.update)", "対象: secret", "実行者: ops", occurredAt.Format(time.RFC3339)} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("structured admin audit text is missing %q: %s", want, text)
@@ -182,7 +170,7 @@ func TestAdminAuditNotificationUsesSpecificStructuredTitleAndContext(t *testing.
 	}
 }
 
-func TestEmailNotificationMultipartEscapesHTMLAndPreventsHeaderInjection(t *testing.T) {
+func TestEmailNotificationRelayAlternativesEscapeHTML(t *testing.T) {
 	occurredAt := time.Date(2026, 7, 18, 3, 45, 0, 0, time.UTC)
 	incident := store.Incident{
 		Rule:      "secrets.update",
@@ -192,47 +180,10 @@ func TestEmailNotificationMultipartEscapesHTMLAndPreventsHeaderInjection(t *test
 		ServiceID: "control-panel",
 		UpdatedAt: occurredAt,
 	}
-	message := formatEmailMessage(
-		"admin.audit",
-		incident,
-		"autostream@example.jp\r\nBcc: attacker@example.jp",
-		[]string{"ops@example.jp\r\nCc: attacker@example.jp"},
-	)
-	parsed, err := mail.ReadMessage(strings.NewReader(message))
-	if err != nil {
-		t.Fatalf("parse multipart email: %v\n%s", err, message)
-	}
-	if parsed.Header.Get("Bcc") != "" || parsed.Header.Get("Cc") != "" {
-		t.Fatalf("injected mail header survived: %#v", parsed.Header)
-	}
-	mediaType, params, err := mime.ParseMediaType(parsed.Header.Get("Content-Type"))
-	if err != nil || mediaType != "multipart/alternative" || params["boundary"] == "" {
-		t.Fatalf("unexpected multipart content type: %q err=%v", parsed.Header.Get("Content-Type"), err)
-	}
-	reader := multipart.NewReader(parsed.Body, params["boundary"])
-	parts := map[string]string{}
-	for {
-		part, partErr := reader.NextPart()
-		if partErr == io.EOF {
-			break
-		}
-		if partErr != nil {
-			t.Fatalf("read multipart email: %v", partErr)
-		}
-		body, readErr := io.ReadAll(part)
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		partType, _, parseErr := mime.ParseMediaType(part.Header.Get("Content-Type"))
-		if parseErr != nil {
-			t.Fatalf("parse email part type: %v", parseErr)
-		}
-		parts[partType] = string(body)
-	}
-	plain := parts["text/plain"]
-	html := parts["text/html"]
+	plain := formatIncidentEmailText("admin.audit", incident)
+	html := formatIncidentHTML("admin.audit", incident)
 	if plain == "" || html == "" {
-		t.Fatalf("plain or HTML alternative is missing: %#v", parts)
+		t.Fatalf("plain or HTML relay alternative is missing: plain=%q html=%q", plain, html)
 	}
 	for _, want := range []string{"イベント", "操作 / ルール", "対象", "実行者", "結果", "重要度", "日時", "admin.audit", "secrets.update", occurredAt.Format(time.RFC3339)} {
 		if !strings.Contains(html, want) {
@@ -905,109 +856,6 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-func TestValidateSMTPChannelRequiresTLSForRemoteTargets(t *testing.T) {
-	channel := store.NotificationChannel{
-		Type:            "email",
-		EmailRecipients: []string{"ops@example.com"},
-		SMTPHost:        "smtp.example.com",
-		SMTPPort:        587,
-		SMTPFrom:        "autostream@example.com",
-	}
-	if err := ValidateSMTPChannelWithPolicy(channel, false); err == nil {
-		t.Fatal("remote SMTP channel without TLS must be rejected")
-	}
-	if err := ValidateSMTPChannelWithPolicy(channel, true); err != nil {
-		t.Fatalf("explicit private/dev SMTP allowance should preserve non-TLS local testing path: %v", err)
-	}
-	channel.SMTPTLS = true
-	if err := ValidateSMTPChannelWithPolicy(channel, false); err != nil {
-		t.Fatalf("remote SMTP channel with TLS rejected: %v", err)
-	}
-}
-
-func TestValidateSMTPChannelRejectsPartialLegacyCredentials(t *testing.T) {
-	base := store.NotificationChannel{
-		Type:            "email",
-		EmailRecipients: []string{"ops@example.com"},
-		SMTPHost:        "smtp.example.com",
-		SMTPPort:        587,
-		SMTPTLS:         true,
-		SMTPFrom:        "autostream@example.com",
-	}
-	withUsernameOnly := base
-	withUsernameOnly.SMTPUsername = "autostream"
-	if err := ValidateSMTPChannelWithPolicy(withUsernameOnly, false); err == nil {
-		t.Fatal("legacy SMTP username without password must be rejected")
-	}
-	withPasswordOnly := base
-	withPasswordOnly.SMTPPassword = "raw-smtp-password"
-	if err := ValidateSMTPChannelWithPolicy(withPasswordOnly, false); err == nil {
-		t.Fatal("legacy SMTP password without username must be rejected")
-	}
-}
-
-func TestValidateSMTPChannelIgnoresPrivateSMTPAllowanceInProduction(t *testing.T) {
-	channel := store.NotificationChannel{
-		Type:            "email",
-		EmailRecipients: []string{"ops@example.com"},
-		SMTPHost:        "127.0.0.1",
-		SMTPPort:        587,
-		SMTPTLS:         true,
-		SMTPFrom:        "autostream@example.com",
-	}
-
-	t.Run("development explicit allowance", func(t *testing.T) {
-		t.Setenv("OBSERVABILITY_ALLOW_PRIVATE_SMTP", "true")
-		if err := ValidateSMTPChannel(channel); err != nil {
-			t.Fatalf("development private SMTP allowance rejected: %v", err)
-		}
-	})
-
-	t.Run("production ignores explicit allowance", func(t *testing.T) {
-		t.Setenv("OBSERVABILITY_ENV", "production")
-		t.Setenv("OBSERVABILITY_ALLOW_PRIVATE_SMTP", "true")
-		if err := ValidateSMTPChannel(channel); err == nil {
-			t.Fatal("production must reject private SMTP even when OBSERVABILITY_ALLOW_PRIVATE_SMTP=true")
-		}
-	})
-}
-
-func TestEmailNotifierSendsMaskedDelivery(t *testing.T) {
-	var sentAddr, sentFrom string
-	var sentTo []string
-	notifier := EmailNotifier{
-		Channel: store.NotificationChannel{
-			Type:              "email",
-			EmailRecipients:   []string{"ops@example.com"},
-			SMTPHost:          "smtp.example.com",
-			SMTPPort:          2525,
-			SMTPFrom:          "autostream@example.com",
-			SMTPUsername:      "autostream",
-			SMTPPassword:      "raw-smtp-password",
-			MaskedEmailTarget: "o***s@<EMAIL_DOMAIN>",
-		},
-		Send: func(addr string, auth smtp.Auth, from string, to []string, msg []byte) error {
-			sentAddr = addr
-			sentFrom = from
-			sentTo = append([]string(nil), to...)
-			if strings.Contains(string(msg), "raw-smtp-password") {
-				t.Fatalf("SMTP password leaked into email message: %s", string(msg))
-			}
-			return nil
-		},
-	}
-	results, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-01", Rule: "encoder_down", Severity: "critical", Status: "open", SummaryJA: "Encoder process stopped.", ServiceID: "enc-01"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sentAddr != "smtp.example.com:2525" || sentFrom != "autostream@example.com" || len(sentTo) != 1 || sentTo[0] != "ops@example.com" {
-		t.Fatalf("unexpected smtp send args: addr=%q from=%q to=%#v", sentAddr, sentFrom, sentTo)
-	}
-	if len(results) != 1 || results[0].Status != "success" || results[0].Target != "o***s@<EMAIL_DOMAIN>" {
-		t.Fatalf("unexpected result: %#v", results)
-	}
-}
-
 type recordingEmailRelay struct {
 	recipients  []string
 	subject     string
@@ -1090,12 +938,7 @@ func TestEmailNotifierReturnsOnlySafeGlobalSMTPFailureCodeWithoutRetry(t *testin
 					EmailRecipients:   []string{"ops@example.com"},
 					MaskedEmailTarget: "o***s@<EMAIL_DOMAIN>",
 				},
-				Relay:          relay,
-				RetryMax:       3,
-				RetryBaseDelay: time.Millisecond,
-				Sleep: func(context.Context, time.Duration) error {
-					return nil
-				},
+				Relay: relay,
 			}
 			results, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-global-failure", Rule: "encoder_down", Severity: "critical", Status: "open", SummaryJA: "Encoder process stopped.", ServiceID: "enc-01"})
 			if err == nil || relay.attempts != 1 {
@@ -1193,73 +1036,6 @@ func TestSanitizeChannelDeliveryErrorPreservesOnlySafeEmailCodes(t *testing.T) {
 	}
 	if got := SanitizeChannelDeliveryError("email", errors.New("smtp.internal.example raw-secret")); got != "send_failed" {
 		t.Fatalf("unsafe email error was exposed: %q", got)
-	}
-}
-
-func TestEmailNotifierRetriesTransientFailures(t *testing.T) {
-	attempts := 0
-	notifier := EmailNotifier{
-		Channel: store.NotificationChannel{
-			Type:              "email",
-			EmailRecipients:   []string{"ops@example.com"},
-			SMTPHost:          "smtp.example.com",
-			SMTPPort:          587,
-			SMTPFrom:          "autostream@example.com",
-			MaskedEmailTarget: "o***s@<EMAIL_DOMAIN>",
-		},
-		RetryMax:       2,
-		RetryBaseDelay: time.Millisecond,
-		Sleep: func(ctx context.Context, delay time.Duration) error {
-			return nil
-		},
-		Send: func(addr string, auth smtp.Auth, from string, to []string, msg []byte) error {
-			attempts += 1
-			if attempts == 1 {
-				return errors.New("temporary smtp failure")
-			}
-			return nil
-		},
-	}
-	results, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-02", Rule: "gdrive_upload_failed", Severity: "error", Status: "open", SummaryJA: "Google Drive upload failed.", ServiceID: "enc-01"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if attempts != 2 {
-		t.Fatalf("expected retry after first failure, got attempts=%d", attempts)
-	}
-	if len(results) != 1 || results[0].Status != "success" || results[0].Target != "o***s@<EMAIL_DOMAIN>" {
-		t.Fatalf("unexpected result: %#v", results)
-	}
-}
-
-func TestEmailNotifierRejectsSMTPHostResolvingPrivateNetwork(t *testing.T) {
-	original := smtpLookupIPAddr
-	smtpLookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
-		if host != "smtp.public-name.example" {
-			t.Fatalf("unexpected host lookup: %s", host)
-		}
-		return []net.IPAddr{{IP: net.ParseIP("169.254.169.254")}}, nil
-	}
-	defer func() { smtpLookupIPAddr = original }()
-
-	notifier := EmailNotifier{
-		Channel: store.NotificationChannel{
-			Type:              "email",
-			EmailRecipients:   []string{"ops@example.com"},
-			SMTPHost:          "smtp.public-name.example",
-			SMTPPort:          587,
-			SMTPTLS:           true,
-			SMTPFrom:          "autostream@example.com",
-			MaskedEmailTarget: "o***s@<EMAIL_DOMAIN>",
-		},
-		RetryMax: -1,
-	}
-	results, err := notifier.NotifyIncidentOpened(t.Context(), store.Incident{ID: "inc-03", Rule: "smtp_private_target", Severity: "critical", Status: "open", SummaryJA: "SMTP private target.", ServiceID: "obs-01"})
-	if err == nil {
-		t.Fatal("expected SMTP delivery to reject private DNS target")
-	}
-	if len(results) != 1 || results[0].Status != "failure" || results[0].Target != "o***s@<EMAIL_DOMAIN>" || strings.Contains(results[0].Error, "169.254.169.254") {
-		t.Fatalf("unexpected sanitized failure result: %#v", results)
 	}
 }
 
