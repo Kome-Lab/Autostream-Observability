@@ -97,9 +97,15 @@ func runEmbeddedMigrationsThrough(ctx context.Context, db *sql.DB, lastMigration
 		if err != nil {
 			return err
 		}
-		for _, stmt := range splitSQLStatements(string(body)) {
-			if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if id == "008_notification_channel_v2_only.sql" {
+			if err := applyNotificationChannelV2(ctx, db, string(body)); err != nil {
 				return fmt.Errorf("apply %s: %w", id, err)
+			}
+		} else {
+			for _, stmt := range splitSQLStatements(string(body)) {
+				if _, err := db.ExecContext(ctx, stmt); err != nil {
+					return fmt.Errorf("apply %s: %w", id, err)
+				}
 			}
 		}
 		if _, err := db.ExecContext(ctx, "INSERT INTO schema_migrations (id) VALUES (?)", id); err != nil {

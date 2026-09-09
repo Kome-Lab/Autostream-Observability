@@ -5,9 +5,14 @@ on:
     branches: [main, codex/bundle8b-physical-eol-001]
   pull_request:
 
+concurrency:
+  group: observability-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   go:
     runs-on: ubuntu-24.04
+    timeout-minutes: 35
     services:
       mariadb:
         image: mariadb:11.8
@@ -35,6 +40,21 @@ jobs:
           bash -n release/test-install-autostream-observability-integration.sh
       - name: Test managed service installer with root-owned Linux fixtures
         run: sudo bash release/test-install-autostream-observability-integration.sh
+      - name: Test SMTP interruption recovery in a fresh database per parent
+        timeout-minutes: 10
+        shell: bash
+        env:
+          AUTOSTREAM_MARIADB_CI_CONTAINER: ${{ job.services.mariadb.id }}
+          AUTOSTREAM_MARIADB_CI_ROOT_PASSWORD: root_password
+        run: bash scripts/ci/test-notification-v2-resume.sh
+      - name: Upload SMTP recovery evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: notification-v2-resume-${{ github.sha }}
+          path: ${{ runner.temp }}/notification-v2-resume/
+          if-no-files-found: error
+          retention-days: 14
       - name: Rehearse v2 SMTP physical EOL with retained backup
         run: go test ./internal/database -run TestMariaDBNotificationChannelV2PhysicalEOL -count=1
         env:
