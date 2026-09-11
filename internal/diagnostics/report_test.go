@@ -1,9 +1,45 @@
 package diagnostics
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestAssignmentScopedCredentialDiagnosticsV2(t *testing.T) {
+	for _, tc := range []struct {
+		rule     string
+		approval []string
+	}{
+		{"discord_audio_forward_inactive", []string{"restart_discord_bot"}},
+		{"discord_audio_forward_failed", []string{"restart_discord_bot", "restart_encoder_recorder"}},
+		{"worker_event_send_failed", []string{"restart_worker", "restart_encoder_recorder"}},
+	} {
+		t.Run(tc.rule, func(t *testing.T) {
+			evidence := []string{"forward_failures_total=1"}
+			got := JapaneseReport(tc.rule, evidence)
+			guidance := got.LikelyCause + "\n" + strings.Join(got.RecommendedActions, "\n")
+			for _, old := range []string{"ENCODER_AUDIO_TOKEN", "SERVICE_CONTROL_TOKEN_SHA256", "ENCODER_RECORDER_URL", "ENCODER_RECORDER_TOKEN"} {
+				if strings.Contains(guidance, old) {
+					t.Fatalf("retired configuration guidance: %s", old)
+				}
+			}
+			for _, required := range []string{"Control Panel", "assignment", "Encoder", "job/run/generation", "credential", "準備", "期限", "値を表示・コピーしない"} {
+				if !strings.Contains(guidance, required) {
+					t.Fatalf("missing assignment-scoped guidance: %s", required)
+				}
+			}
+			for _, unsafe := range []string{"認証を解除", "token を表示", "hash を表示", "grant を書き換", "journal を書き換"} {
+				if strings.Contains(guidance, unsafe) {
+					t.Fatalf("unsafe credential guidance: %s", unsafe)
+				}
+			}
+			if got.Confidence != 0.78 || !reflect.DeepEqual(got.Evidence, evidence) || !reflect.DeepEqual(got.SafeAutoCandidates, []string{"refresh_service_status", "rerun_diagnostics"}) || !reflect.DeepEqual(got.ApprovalRequired, tc.approval) {
+				t.Fatal("diagnostic evidence or action authority changed")
+			}
+		})
+	}
+}
 
 func TestDiscordAudioDiagnosticsMentionAudioStatus(t *testing.T) {
 	report := JapaneseReport("discord_audio_not_receiving", []string{"discord.audio_receiving=0"})

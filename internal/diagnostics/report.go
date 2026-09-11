@@ -148,22 +148,22 @@ func JapaneseReport(rule string, evidence []string) Report {
 	case "discord_audio_forward_inactive":
 		return report(
 			"Discord 音声 packet の Encoder/Recorder 転送が有効になっていません。",
-			"Discord Bot の ENCODER_AUDIO_TOKEN 未設定、Control Panel からの encoder_audio_url 未伝播、Encoder/Recorder public_url 未設定、または stream assignment 不足が考えられます。",
+			"Control Panel が管理する assignment-scoped 接続について、対象 Encoder/Recorder の割当不足、接続先の未伝播、または現在の job/run/generation に対応する credential の準備不足・期限切れが考えられます。",
 			0.78,
 			evidence,
 			"Bot が voice channel に参加していても Encoder/Recorder に音声が届かず、配信とアーカイブが無音になる可能性があります。",
-			[]string{"Discord Bot の audio_forward_enabled と audio_forward_active を確認する", "ENCODER_AUDIO_TOKEN を設定する", "Control Panel の stream assignment と Encoder/Recorder public_url を確認する"},
+			[]string{"Discord Bot の audio_forward_enabled と audio_forward_active を確認する", "Control Panel の実 assignment、対象 Encoder/Recorder、現在の job/run/generation を確認する", "Control Panel 管理の credential の準備済み状態と期限を確認し、token/hash の値を表示・コピーしない", "割当先 Encoder/Recorder の接続先、network 到達性と service health を確認する"},
 			[]string{"refresh_service_status", "rerun_diagnostics"},
 			[]string{"restart_discord_bot"},
 		)
 	case "discord_audio_forward_failed":
 		return report(
 			"Discord 音声 packet の Encoder/Recorder 転送に失敗しています。",
-			"Encoder/Recorder の public URL、service token、network 到達性、または stream assignment の不一致が考えられます。",
+			"Control Panel が管理する assignment-scoped 接続の対象 Encoder/Recorder と現在の job/run/generation の不一致、credential の準備不足・期限切れ、または network 到達性の問題が考えられます。",
 			0.78,
 			evidence,
 			"Bot は音声を受けていても Encoder/Recorder に届かず、配信音声が無音になる可能性があります。",
-			[]string{"discord.audio_forward_errors_total と discord.audio_last_forward_age_sec を確認する", "ENCODER_AUDIO_TOKEN と SERVICE_CONTROL_TOKEN_SHA256 を確認する", "Encoder/Recorder の /streams/{id}/audio/opus に到達できるか確認する", "retry 後も discord.audio_forwarded_total が増えない場合は Encoder/Recorder と Bot の再起動を検討する"},
+			[]string{"discord.audio_forward_errors_total と discord.audio_last_forward_age_sec を確認する", "Control Panel の実 assignment、対象 Encoder/Recorder、現在の job/run/generation と credential の準備済み状態・期限を確認し、token/hash の値を表示・コピーしない", "割当先 Encoder/Recorder の service health と /streams/{id}/audio/opus への network 到達性を確認する", "retry 後も discord.audio_forwarded_total が増えない場合は Encoder/Recorder と Bot の再起動を検討する"},
 			[]string{"refresh_service_status", "rerun_diagnostics"},
 			[]string{"restart_discord_bot", "restart_encoder_recorder"},
 		)
@@ -236,11 +236,11 @@ func JapaneseReport(rule string, evidence []string) Report {
 	case "worker_event_send_failed":
 		return report(
 			"Worker から Encoder/Recorder への event 送信に失敗しています。",
-			"Encoder/Recorder API 停止、ENCODER_RECORDER_URL または token の誤り、network 到達性、stream assignment の不一致が考えられます。",
+			"Encoder/Recorder API 停止、Control Panel が管理する assignment-scoped 接続と現在の job/run/generation の不一致、credential の準備不足・期限切れ、または network 到達性の問題が考えられます。",
 			0.78,
 			evidence,
 			"caption、telop、participant list、active speaker、overlay の反映が遅延または欠落する可能性があります。",
-			[]string{"Control Panel の Streams 画面で Worker event path と Worker event sidecar を確認する", "Worker と Encoder/Recorder の service health を確認する", "ENCODER_RECORDER_URL と ENCODER_RECORDER_TOKEN を確認する", "Control Panel の stream assignment を確認する"},
+			[]string{"Control Panel の Streams 画面で Worker event path と Worker event sidecar を確認する", "Worker と割当先 Encoder/Recorder の service health、network 到達性と worker.event_send_failures_total を確認する", "Control Panel の実 assignment、対象 Encoder/Recorder、現在の job/run/generation を確認する", "Control Panel 管理の credential の準備済み状態と期限を確認し、token/hash の値を表示・コピーしない"},
 			[]string{"refresh_service_status", "rerun_diagnostics"},
 			[]string{"restart_worker", "restart_encoder_recorder"},
 		)
