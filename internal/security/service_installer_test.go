@@ -251,7 +251,7 @@ func TestObservabilityInstallerRejectsVersionPrefixCollisions(t *testing.T) {
 }
 
 func TestObservabilityInstallerIntegrationFixtureCoversPrivilegedTransitions(t *testing.T) {
-	body, err := os.ReadFile(filepath.Join(
+	body, err := readInstallerScenarioSource(filepath.Join(
 		"..", "..", "release", "test-install-autostream-observability-integration.sh",
 	))
 	if err != nil {
@@ -693,7 +693,7 @@ func TestObservabilityInstallerArmsRollbackBeforeProvisioningAndBindsAccountLock
 		t.Fatal("Observability must acquire the shared host-setup lock before per-target and shared provisioning")
 	}
 
-	fixtureBytes, err := os.ReadFile(filepath.Join("..", "..", "release",
+	fixtureBytes, err := readInstallerScenarioSource(filepath.Join("..", "..", "release",
 		"test-install-autostream-observability-integration.sh"))
 	if err != nil {
 		t.Fatal(err)
@@ -821,7 +821,7 @@ func TestObservabilityRollbackPreservesPreexistingAutostreamGroup(t *testing.T) 
 		}
 	}
 
-	fixtureBody, err := os.ReadFile(filepath.Join("..", "..", "release",
+	fixtureBody, err := readInstallerScenarioSource(filepath.Join("..", "..", "release",
 		"test-install-autostream-observability-integration.sh"))
 	if err != nil {
 		t.Fatal(err)

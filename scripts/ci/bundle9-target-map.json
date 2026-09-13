@@ -1,0 +1,138 @@
+[
+  {
+    "target_id": "B9-M068",
+    "repository": "Kome-Lab/Autostream-Observability",
+    "original_path": "release/install-autostream-observability",
+    "original_sha256": "32b81282ef82d7700c3686b0dd74234be1b9684bbc4dc6ba6532b9344a551c83",
+    "before_physical_lines": 2259,
+    "disposition": "generated-from-bounded-authoring",
+    "responsibility": "preamble/options;validation/identity;locks/journal;staging;account/systemd changes;activation/health;rollback/cleanup;main dispatch",
+    "destinations": [
+      {
+        "path": "authoring/install-autostream-observability/account-rollback.sh.inc",
+        "sha256": "0efa4a6972b20258cb20997006bea309c815c8195362f3a72c6580621305b939",
+        "symbols": [],
+        "physical_lines": 184
+      },
+      {
+        "path": "authoring/install-autostream-observability/activation.sh.inc",
+        "sha256": "7153bd4968690637fec38bab89c598dd933551740e241144ae2b578ff2043dd8",
+        "symbols": [],
+        "physical_lines": 325
+      },
+      {
+        "path": "authoring/install-autostream-observability/artifact-verification.sh.inc",
+        "sha256": "5de8e64d68756b3fdae605928b0b597298a12acc7f25e8b04db18972e1fb61d3",
+        "symbols": [],
+        "physical_lines": 227
+      },
+      {
+        "path": "authoring/install-autostream-observability/cleanup.sh.inc",
+        "sha256": "0d932efe8691a47a04daf686714d226d37e1d70cbb36a58c9d8e39013ce946d9",
+        "symbols": [],
+        "physical_lines": 153
+      },
+      {
+        "path": "authoring/install-autostream-observability/directory-journal.sh.inc",
+        "sha256": "cf0b965b6bd5b9e1ae353f034b93ca638aa33ed8e63532ad2a1dc4e5779202d9",
+        "symbols": [],
+        "physical_lines": 172
+      },
+      {
+        "path": "authoring/install-autostream-observability/directory-rollback.sh.inc",
+        "sha256": "fd01833459acd2d5a04c7e2a242c89e1e5bb39de2796bea96232aa710441fb69",
+        "symbols": [],
+        "physical_lines": 136
+      },
+      {
+        "path": "authoring/install-autostream-observability/installation.sh.inc",
+        "sha256": "8236a53998ab362e8097c9303c2203708ba4522513d9a9cef938bb5e7c4fe58c",
+        "symbols": [],
+        "physical_lines": 331
+      },
+      {
+        "path": "authoring/install-autostream-observability/legacy-backup.sh.inc",
+        "sha256": "98f38527578b651768305ec67ec92caf179dd08ab605c1045107e6daff36de33",
+        "symbols": [],
+        "physical_lines": 134
+      },
+      {
+        "path": "authoring/install-autostream-observability/options-preflight.sh.inc",
+        "sha256": "42052075cb0dd01f53189df7b627ecb221e61767a00da96737655c6ece2a4516",
+        "symbols": [],
+        "physical_lines": 246
+      },
+      {
+        "path": "authoring/install-autostream-observability/service-account.sh.inc",
+        "sha256": "483aca058cf769868df91b0d7ed9699717a387b35dbbbca0180dd4312b59a3ec",
+        "symbols": [],
+        "physical_lines": 161
+      },
+      {
+        "path": "authoring/install-autostream-observability/staging-locks.sh.inc",
+        "sha256": "354d29d7c3d08320c80b8202eb95603ddf04324988f1f5e4b542ce1ad9a39ee0",
+        "symbols": [],
+        "physical_lines": 190
+      },
+      {
+        "path": "release/install-autostream-observability",
+        "sha256": "32b81282ef82d7700c3686b0dd74234be1b9684bbc4dc6ba6532b9344a551c83",
+        "symbols": [],
+        "physical_lines": 2259
+      }
+    ]
+  },
+  {
+    "target_id": "B9-M069",
+    "repository": "Kome-Lab/Autostream-Observability",
+    "original_path": "release/test-install-autostream-observability-integration.sh",
+    "original_sha256": "bfdf7f65b7693c4a6d49c52db0cf3ff187e079bf8d59379555ac13703d961803",
+    "before_physical_lines": 1535,
+    "disposition": "responsibility-split",
+    "responsibility": "fixture setup/stubs;case families;assertions;cleanup;ordered entry",
+    "destinations": [
+      {
+        "path": "release/installer-tests/observability/account-and-staging-rollback-cases.sh",
+        "sha256": "36c93c57aef6df787bcb7029b45d0403931b854dd098d81391416b2bd2f241a8",
+        "symbols": [],
+        "physical_lines": 302
+      },
+      {
+        "path": "release/installer-tests/observability/archive-fixture-and-validation.sh",
+        "sha256": "c208ee9e65176feb5794260e66593965eca906905865fe0ef4dd3dd4507a244c",
+        "symbols": [],
+        "physical_lines": 170
+      },
+      {
+        "path": "release/installer-tests/observability/fixture-ownership-and-runtime.sh",
+        "sha256": "6a538c8e2103af55a9450f54f092a9264a3f8b0f2959e585e9246403ac63783b",
+        "symbols": [],
+        "physical_lines": 493
+      },
+      {
+        "path": "release/installer-tests/observability/fresh-install-and-state-cases.sh",
+        "sha256": "9c0e6e869233b9dda7e522477212d6cd951c9eacfb20b8e13da9725bea980398",
+        "symbols": [],
+        "physical_lines": 119
+      },
+      {
+        "path": "release/installer-tests/observability/legacy-rollback-cases.sh",
+        "sha256": "9eb420336f4263e7c29235640778816389aed7a39e674e342e5b646a64166c30",
+        "symbols": [],
+        "physical_lines": 176
+      },
+      {
+        "path": "release/installer-tests/observability/migration-and-reinstall-cases.sh",
+        "sha256": "772dd5527e1d5f47762c059a5045a4b98006607e25b4db6ddc833629dd194c61",
+        "symbols": [],
+        "physical_lines": 134
+      },
+      {
+        "path": "release/test-install-autostream-observability-integration.sh",
+        "sha256": "f39fc6aef507c2dc1c89d57be8f3ca86fbd442d4065885cfd39f1dbc1071bd05",
+        "symbols": [],
+        "physical_lines": 149
+      }
+    ]
+  }
+]

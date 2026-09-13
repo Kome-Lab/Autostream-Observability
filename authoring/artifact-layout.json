@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "repository": "Autostream-Observability",
+  "artifacts": [
+    {
+      "target_id": "B9-M068",
+      "output": "release/install-autostream-observability",
+      "fragments": [
+        "authoring/install-autostream-observability/options-preflight.sh.inc",
+        "authoring/install-autostream-observability/directory-journal.sh.inc",
+        "authoring/install-autostream-observability/service-account.sh.inc",
+        "authoring/install-autostream-observability/artifact-verification.sh.inc",
+        "authoring/install-autostream-observability/staging-locks.sh.inc",
+        "authoring/install-autostream-observability/legacy-backup.sh.inc",
+        "authoring/install-autostream-observability/directory-rollback.sh.inc",
+        "authoring/install-autostream-observability/account-rollback.sh.inc",
+        "authoring/install-autostream-observability/cleanup.sh.inc",
+        "authoring/install-autostream-observability/installation.sh.inc",
+        "authoring/install-autostream-observability/activation.sh.inc"
+      ]
+    }
+  ]
+}
