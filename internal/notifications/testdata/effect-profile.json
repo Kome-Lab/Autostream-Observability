@@ -1,0 +1,128 @@
+{
+  "Ref": {
+    "ProfileID": "G0-P-EFFECT-OUTCOME",
+    "Revision": 1
+  },
+  "AxisRules": [
+    {
+      "Key": {
+        "Axis": "MEMBERSHIP",
+        "OwnerID": "notification-owner",
+        "Resource": {
+          "Kind": "NOTIFICATION_CHANNEL",
+          "OwnerID": "notification-owner",
+          "ResourceID": "channel-fixture-1"
+        }
+      },
+      "OwnerRole": "C08",
+      "ValueKind": "PRESENT_UINT64",
+      "Required": true,
+      "Comparison": "EXACT"
+    },
+    {
+      "Key": {
+        "Axis": "EFFECT",
+        "OwnerID": "notification-owner",
+        "Resource": {
+          "Kind": "NOTIFICATION_CHANNEL",
+          "OwnerID": "notification-owner",
+          "ResourceID": "channel-fixture-1"
+        }
+      },
+      "OwnerRole": "C08",
+      "ValueKind": "PRESENT_UINT64",
+      "Required": true,
+      "Comparison": "EXACT"
+    },
+    {
+      "Key": {
+        "Axis": "POLICY",
+        "OwnerID": "notification-owner",
+        "Resource": {
+          "Kind": "NOTIFICATION_CHANNEL",
+          "OwnerID": "notification-owner",
+          "ResourceID": "channel-fixture-1"
+        }
+      },
+      "OwnerRole": "C08",
+      "ValueKind": "PRESENT_LITERAL",
+      "Required": true,
+      "Comparison": "EXACT"
+    },
+    {
+      "Key": {
+        "Axis": "TRUST",
+        "OwnerID": "notification-owner",
+        "Resource": {
+          "Kind": "NOTIFICATION_CHANNEL",
+          "OwnerID": "notification-owner",
+          "ResourceID": "channel-fixture-1"
+        }
+      },
+      "OwnerRole": "C08",
+      "ValueKind": "PRESENT_LITERAL",
+      "Required": true,
+      "Comparison": "EXACT"
+    }
+  ],
+  "ResourceKinds": [
+    "NOTIFICATION_CHANNEL"
+  ],
+  "Purposes": [
+    "EFFECT_OUTCOME"
+  ],
+  "RequiredBoundaries": [
+    {
+      "Kind": "LOCAL_PERSISTENCE",
+      "OwnerID": "notification-owner",
+      "Resource": {
+        "Kind": "NOTIFICATION_CHANNEL",
+        "OwnerID": "notification-owner",
+        "ResourceID": "channel-fixture-1"
+      },
+      "SubBoundary": "INTENT"
+    },
+    {
+      "Kind": "LOCAL_PERSISTENCE",
+      "OwnerID": "notification-owner",
+      "Resource": {
+        "Kind": "NOTIFICATION_CHANNEL",
+        "OwnerID": "notification-owner",
+        "ResourceID": "channel-fixture-1"
+      },
+      "SubBoundary": "DISPATCH_POSSIBLE"
+    },
+    {
+      "Kind": "PROVIDER",
+      "OwnerID": "notification-owner",
+      "Resource": {
+        "Kind": "NOTIFICATION_CHANNEL",
+        "OwnerID": "notification-owner",
+        "ResourceID": "channel-fixture-1"
+      },
+      "SubBoundary": "REMOTE_ACCEPT"
+    },
+    {
+      "Kind": "LOCAL_PERSISTENCE",
+      "OwnerID": "notification-owner",
+      "Resource": {
+        "Kind": "NOTIFICATION_CHANNEL",
+        "OwnerID": "notification-owner",
+        "ResourceID": "channel-fixture-1"
+      },
+      "SubBoundary": "LOCAL_RESULT_RECORD"
+    }
+  ],
+  "TerminalPolicyRef": "notification-fixture-no-resend",
+  "LimitsRef": "notification-fixture-limits-1",
+  "Limits": {
+    "MaxIDBytes": 128,
+    "MaxMembers": 16,
+    "MaxAxes": 16,
+    "MaxRefs": 64,
+    "MaxObligations": 16,
+    "MaxPartitions": 8,
+    "MaxRanges": 16,
+    "MaxDepth": 16
+  }
+}

@@ -12,17 +12,18 @@ import (
 )
 
 type Server struct {
-	serviceType        string
-	updaterIdentity    *UpdaterIdentityLatch
-	store              store.Store
-	ingestAuth         auth.Verifier
-	adminAuth          auth.Verifier
-	notifier           notifications.Notifier
-	emailRelay         notifications.EmailRelay
-	executor           controlExecutor
-	rateLimiter        *rateLimiter
-	logger             *log.Logger
-	notificationDedupe notificationDeduper
+	serviceType         string
+	updaterIdentity     *UpdaterIdentityLatch
+	store               store.Store
+	ingestAuth          auth.Verifier
+	adminAuth           auth.Verifier
+	notifier            notifications.Notifier
+	notificationEffects *notifications.EffectDispatcher
+	emailRelay          notifications.EmailRelay
+	executor            controlExecutor
+	rateLimiter         *rateLimiter
+	logger              *log.Logger
+	notificationDedupe  notificationDeduper
 }
 
 const (
@@ -77,6 +78,16 @@ func NewServerWithStoreAuthzNotifierExecutorAndEmailRelay(serviceType string, st
 }
 
 func NewServerWithStoreAuthzNotifierExecutorEmailRelayAndUpdaterIdentity(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor, emailRelay notifications.EmailRelay, updaterIdentity *UpdaterIdentityLatch) http.Handler {
+	return newServerWithNotificationEffects(serviceType, st, ingestVerifier, adminVerifier, notifier, executor, emailRelay, updaterIdentity, nil)
+}
+
+// NewServerWithFixtureNotificationEffects explicitly injects the synthetic WS5
+// adapter. Normal startup and every existing constructor keep it disconnected.
+func NewServerWithFixtureNotificationEffects(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, effects *notifications.EffectDispatcher) http.Handler {
+	return newServerWithNotificationEffects(serviceType, st, ingestVerifier, adminVerifier, notifier, envControlExecutor{}, envEmailRelay{}, NewUpdaterIdentityLatch(serviceType), effects)
+}
+
+func newServerWithNotificationEffects(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor, emailRelay notifications.EmailRelay, updaterIdentity *UpdaterIdentityLatch, effects *notifications.EffectDispatcher) http.Handler {
 	if st == nil {
 		st = store.NewMemoryStore()
 	}
@@ -97,7 +108,7 @@ func NewServerWithStoreAuthzNotifierExecutorEmailRelayAndUpdaterIdentity(service
 			configured.EmailRelay = emailRelay
 		}
 	}
-	s := &Server{serviceType: serviceType, updaterIdentity: updaterIdentity, store: st, ingestAuth: ingestVerifier, adminAuth: adminVerifier, notifier: notifier, emailRelay: emailRelay, executor: executor, rateLimiter: rateLimiterFromEnv(st), logger: log.Default()}
+	s := &Server{serviceType: serviceType, updaterIdentity: updaterIdentity, store: st, ingestAuth: ingestVerifier, adminAuth: adminVerifier, notifier: notifier, notificationEffects: effects, emailRelay: emailRelay, executor: executor, rateLimiter: rateLimiterFromEnv(st), logger: log.Default()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.root)
 	mux.HandleFunc("GET /health", s.health)
@@ -121,6 +132,7 @@ func NewServerWithStoreAuthzNotifierExecutorEmailRelayAndUpdaterIdentity(service
 	mux.HandleFunc("DELETE /notification-channels/{id}", s.deleteNotificationChannel)
 	mux.HandleFunc("POST /notification-channels/{id}/test", s.testNotificationChannel)
 	mux.HandleFunc("POST /notification-events", s.createNotificationEvent)
+	mux.HandleFunc("GET /v3/notification-effects/{effect}/{attempt}", s.inspectNotificationEffect)
 	mux.HandleFunc("GET /remediation-actions", s.listRemediationActions)
 	mux.HandleFunc("GET /remediation-actions/{id}/dispatch-context", s.getRemediationDispatchContext)
 	mux.HandleFunc("POST /remediation-actions/{id}/approve", s.approveRemediationAction)

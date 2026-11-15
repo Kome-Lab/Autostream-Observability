@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "baseline": "c2daf86c3ae621372dfde1c5afc3bfb54164ed62",
+  "new": {
+    ".github/workflows/v3-notification-effects.yml": "737618cf59bea381b79507b1f66256ed700c64d2ead6eba5d4cdf3e5bf216756",
+    "docs/v3/notification-effects.md": "6e48fd9da4f52ae224080d1fb06dd17e57b05b5e0f04c0ea4798ba5ad042ee0e",
+    "internal/httpapi/notification_lifecycle.go": "469e4e33e2f4d6b1babba02370b539ef3f7bf160dddd2f90b8ca1beb6b06d55a",
+    "internal/httpapi/notification_lifecycle_http_test.go": "a0cb6827eba8689922f03c9f82db9b330e0c238a5bad029448b107e976294aeb",
+    "internal/notifications/effect_fixture_journal.go": "12ced596cc8cd6d1274c76cf20c1d00b4d43976cd102f96b598ea95d653847cb",
+    "internal/notifications/effect_participation.go": "5dbec339ce5b37f1f7448abd75c2ee3addca585c1a84631f9f817c857d227797",
+    "internal/notifications/effect_participation_test.go": "2c4a4e914d61307b3706619bb30bb26f83263720283f3016e8a6f8da246e6175",
+    "internal/notifications/effect_result.go": "09359fa35903060f70c2e87de29bc6cc339a17c30b3acdc403de726b75e0edd2",
+    "internal/notifications/testdata/effect-profile.json": "3d12f484edd949083e1d3f9211ee3e337de6b57c02639046fa54ae54a99f6f69",
+    "internal/notifications/testdata/effect-request.json": "7f1e4b06ae5ec993612465f199bc76d70a48ad4e33163e05b05a20792b1d3e43",
+    "internal/notifications/testdata/provider-accepted-local-known.json": "14b5132de78b2775c852480d62ce456e829a8c1ffb3ab6ee74c77f3a0f392e60",
+    "internal/notifications/testdata/provider-accepted-local-unknown.json": "dc28faa6d5ac07e5e0031ab210690332bcc938301afdf087897cfe02acd78755",
+    "internal/notifications/testdata/provider-ack-unknown.json": "f73b0deba3c4462894602e38b0dcdda9b37f5606596ee1ff69e2b64404ebc211",
+    "scripts/ci/verify_ws5_boundary.py": "f8ee8d21b006f83c47cf65b72717fd7decf805b30ba95156c88f6e282bbc18fc",
+    "scripts/ci/verify_ws5_events.py": "aadbf7ee8d673c2588e7bb9af9cc7842023998e36315f2774d7a84b26b480fe9",
+    "scripts/ci/verify_ws5_exact_delta.py": "c3371f57fdbb0c57be425024358c01d8d9dabedab25e9d90f61f5aa4c1b8f66c",
+    "scripts/ci/ws5-required-tests.txt": "de466b790171ccadf1b179dc96b5e382bfeb191fa668140faecc68bec5b81290"
+  },
+  "patches": {
+    "go.mod": {
+      "before_sha256": "b754c6e37535bb197da294bc8c4914404b5d4a4225d1807ca15b3a4b854e6cff",
+      "after_sha256": "3045f79376a1048b0a0f2c51d49f3f1d4fa387e1c61513d4d6783b67a8dd44cb",
+      "edits": [
+        {
+          "old": "\ngo 1.26.5\n\nrequire (\n\tgithub.com/example/autostream-contracts v0.0.0\n\tgithub.com/go-sql-driver/mysql v1.10.0\n)\n\n",
+          "new": "\ngo 1.26.5\n\nrequire (\n\tgithub.com/Kome-Lab/Autostream-Contracts/v3lifecycle v0.0.0-20261115145906-d32ea3514b1c\n\tgithub.com/example/autostream-contracts v0.0.0\n\tgithub.com/go-sql-driver/mysql v1.10.0\n)\n\n"
+        }
+      ]
+    },
+    "go.sum": {
+      "before_sha256": "70abaf154b7e37a4046450aac4b8af7c553596de77d1bd95bf541c2ee0e376b2",
+      "after_sha256": "de79771bd6d8d5b52b728a2942ed235d90846119472af41b5bc898e9d220787c",
+      "edits": [
+        {
+          "old": "github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 h1:1EYB5IzjZawrrnELUi78f9fPu57HuXjmddZPjrls/28=\ngithub.com/santhosh-tekuri/jsonschema/v6 v6.0.3/go.mod h1:JXeL+ps8p7/KNMjDQk3TCwPpBy0wYklyWTfbkIzdIFU=\ngolang.org/x/text v0.41.0 h1:vz/seA0lnX87Othu2f/0L24RcgrXD9/YFTSuGjj3rH8=\ngolang.org/x/text v0.41.0/go.mod h1:jvf1O8ajNzZqhSrQBPbutR/EB83Cc0CFrezNQIwbb5M=\n",
+          "new": "github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 h1:1EYB5IzjZawrrnELUi78f9fPu57HuXjmddZPjrls/28=\ngithub.com/santhosh-tekuri/jsonschema/v6 v6.0.3/go.mod h1:JXeL+ps8p7/KNMjDQk3TCwPpBy0wYklyWTfbkIzdIFU=\ngolang.org/x/text v0.41.0 h1:vz/seA0lnX87Othu2f/0L24RcgrXD9/YFTSuGjj3rH8=\ngolang.org/x/text v0.41.0/go.mod h1:jvf1O8ajNzZqhSrQBPbutR/EB83Cc0CFrezNQIwbb5M=\ngithub.com/Kome-Lab/Autostream-Contracts/v3lifecycle v0.0.0-20261115145906-d32ea3514b1c h1:HfswOPIR7VcFoko8a5LL0YqtRP1UGc6wfuFyggBOIXo=\ngithub.com/Kome-Lab/Autostream-Contracts/v3lifecycle v0.0.0-20261115145906-d32ea3514b1c/go.mod h1:4mdtG844J5jWEQgB78LBHQEjzbhK+qc0ACLS7+Vlmzw=\n"
+        }
+      ]
+    },
+    "internal/httpapi/notification_events.go": {
+      "before_sha256": "9a3629b12537843827654e8f41ca685be8786370e7abd0ea28c3787f3643fb24",
+      "after_sha256": "f46060f135121dacec81fdfca5fa6e136ddb192826ac945c3aa01be004f45fc6",
+      "edits": [
+        {
+          "old": "}\n\nfunc (s *Server) createNotificationEvent(w http.ResponseWriter, r *http.Request) {\n\tif !s.authorizeAdmin(w, r, adminScopeNotificationsManage) {\n\t\treturn\n\t}\n\tvar body notificationEventRequest\n\tif err := decodeJSONBody(w, r, &body); err != nil {\n",
+          "new": "}\n\nfunc (s *Server) createNotificationEvent(w http.ResponseWriter, r *http.Request) {\n\tif !s.authorizeAdmin(w, r, adminScopeNotificationsManage) {\n\t\treturn\n\t}\n\tif len(r.Header.Values(notificationLifecycleHeader)) > 0 {\n\t\ts.dispatchNotificationEffect(w, r)\n\t\treturn\n\t}\n\tvar body notificationEventRequest\n\tif err := decodeJSONBody(w, r, &body); err != nil {\n"
+        }
+      ]
+    },
+    "internal/httpapi/server.go": {
+      "before_sha256": "8139e9652f2c17a20e7b6f51cbea0bbaf4c932f54b0b6e0a1c0b0eb34086568d",
+      "after_sha256": "accb2a5af0e4657914de4864e3d8355418267292b6e66aadc303ea77a74166aa",
+      "edits": [
+        {
+          "old": "\t\"github.com/example/autostream-observability/internal/store\"\n)\n\ntype Server struct {\n\tserviceType        string\n\tupdaterIdentity    *UpdaterIdentityLatch\n\tstore              store.Store\n\tingestAuth         auth.Verifier\n\tadminAuth          auth.Verifier\n\tnotifier           notifications.Notifier\n\temailRelay         notifications.EmailRelay\n\texecutor           controlExecutor\n\trateLimiter        *rateLimiter\n\tlogger             *log.Logger\n\tnotificationDedupe notificationDeduper\n}\n\nconst (\n\tadminScopeRead                = \"observability.read\"\n",
+          "new": "\t\"github.com/example/autostream-observability/internal/store\"\n)\n\ntype Server struct {\n\tserviceType         string\n\tupdaterIdentity     *UpdaterIdentityLatch\n\tstore               store.Store\n\tingestAuth          auth.Verifier\n\tadminAuth           auth.Verifier\n\tnotifier            notifications.Notifier\n\tnotificationEffects *notifications.EffectDispatcher\n\temailRelay          notifications.EmailRelay\n\texecutor            controlExecutor\n\trateLimiter         *rateLimiter\n\tlogger              *log.Logger\n\tnotificationDedupe  notificationDeduper\n}\n\nconst (\n\tadminScopeRead                = \"observability.read\"\n"
+        },
+        {
+          "old": "\treturn NewServerWithStoreAuthzNotifierExecutorEmailRelayAndUpdaterIdentity(serviceType, st, ingestVerifier, adminVerifier, notifier, executor, emailRelay, NewUpdaterIdentityLatch(serviceType))\n}\n\nfunc NewServerWithStoreAuthzNotifierExecutorEmailRelayAndUpdaterIdentity(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor, emailRelay notifications.EmailRelay, updaterIdentity *UpdaterIdentityLatch) http.Handler {\n\tif st == nil {\n\t\tst = store.NewMemoryStore()\n\t}\n\tif updaterIdentity == nil {\n",
+          "new": "\treturn NewServerWithStoreAuthzNotifierExecutorEmailRelayAndUpdaterIdentity(serviceType, st, ingestVerifier, adminVerifier, notifier, executor, emailRelay, NewUpdaterIdentityLatch(serviceType))\n}\n\nfunc NewServerWithStoreAuthzNotifierExecutorEmailRelayAndUpdaterIdentity(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor, emailRelay notifications.EmailRelay, updaterIdentity *UpdaterIdentityLatch) http.Handler {\n\treturn newServerWithNotificationEffects(serviceType, st, ingestVerifier, adminVerifier, notifier, executor, emailRelay, updaterIdentity, nil)\n}\n\n// NewServerWithFixtureNotificationEffects explicitly injects the synthetic WS5\n// adapter. Normal startup and every existing constructor keep it disconnected.\nfunc NewServerWithFixtureNotificationEffects(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, effects *notifications.EffectDispatcher) http.Handler {\n\treturn newServerWithNotificationEffects(serviceType, st, ingestVerifier, adminVerifier, notifier, envControlExecutor{}, envEmailRelay{}, NewUpdaterIdentityLatch(serviceType), effects)\n}\n\nfunc newServerWithNotificationEffects(serviceType string, st store.Store, ingestVerifier, adminVerifier auth.Verifier, notifier notifications.Notifier, executor controlExecutor, emailRelay notifications.EmailRelay, updaterIdentity *UpdaterIdentityLatch, effects *notifications.EffectDispatcher) http.Handler {\n\tif st == nil {\n\t\tst = store.NewMemoryStore()\n\t}\n\tif updaterIdentity == nil {\n"
+        },
+        {
+          "old": "\t\tif configured != nil && configured.EmailRelay == nil {\n\t\t\tconfigured.EmailRelay = emailRelay\n\t\t}\n\t}\n\ts := &Server{serviceType: serviceType, updaterIdentity: updaterIdentity, store: st, ingestAuth: ingestVerifier, adminAuth: adminVerifier, notifier: notifier, emailRelay: emailRelay, executor: executor, rateLimiter: rateLimiterFromEnv(st), logger: log.Default()}\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"GET /{$}\", s.root)\n\tmux.HandleFunc(\"GET /health\", s.health)\n\tmux.HandleFunc(\"GET /status\", s.status)\n",
+          "new": "\t\tif configured != nil && configured.EmailRelay == nil {\n\t\t\tconfigured.EmailRelay = emailRelay\n\t\t}\n\t}\n\ts := &Server{serviceType: serviceType, updaterIdentity: updaterIdentity, store: st, ingestAuth: ingestVerifier, adminAuth: adminVerifier, notifier: notifier, notificationEffects: effects, emailRelay: emailRelay, executor: executor, rateLimiter: rateLimiterFromEnv(st), logger: log.Default()}\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"GET /{$}\", s.root)\n\tmux.HandleFunc(\"GET /health\", s.health)\n\tmux.HandleFunc(\"GET /status\", s.status)\n"
+        },
+        {
+          "old": "\tmux.HandleFunc(\"PUT /notification-channels/{id}\", s.updateNotificationChannel)\n\tmux.HandleFunc(\"DELETE /notification-channels/{id}\", s.deleteNotificationChannel)\n\tmux.HandleFunc(\"POST /notification-channels/{id}/test\", s.testNotificationChannel)\n\tmux.HandleFunc(\"POST /notification-events\", s.createNotificationEvent)\n\tmux.HandleFunc(\"GET /remediation-actions\", s.listRemediationActions)\n\tmux.HandleFunc(\"GET /remediation-actions/{id}/dispatch-context\", s.getRemediationDispatchContext)\n\tmux.HandleFunc(\"POST /remediation-actions/{id}/approve\", s.approveRemediationAction)\n\tmux.HandleFunc(\"POST /remediation-actions/{id}/execute\", s.executeRemediationAction)\n",
+          "new": "\tmux.HandleFunc(\"PUT /notification-channels/{id}\", s.updateNotificationChannel)\n\tmux.HandleFunc(\"DELETE /notification-channels/{id}\", s.deleteNotificationChannel)\n\tmux.HandleFunc(\"POST /notification-channels/{id}/test\", s.testNotificationChannel)\n\tmux.HandleFunc(\"POST /notification-events\", s.createNotificationEvent)\n\tmux.HandleFunc(\"GET /v3/notification-effects/{effect}/{attempt}\", s.inspectNotificationEffect)\n\tmux.HandleFunc(\"GET /remediation-actions\", s.listRemediationActions)\n\tmux.HandleFunc(\"GET /remediation-actions/{id}/dispatch-context\", s.getRemediationDispatchContext)\n\tmux.HandleFunc(\"POST /remediation-actions/{id}/approve\", s.approveRemediationAction)\n\tmux.HandleFunc(\"POST /remediation-actions/{id}/execute\", s.executeRemediationAction)\n"
+        }
+      ]
+    }
+  }
+}

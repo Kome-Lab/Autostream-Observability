@@ -33,6 +33,10 @@ func (s *Server) createNotificationEvent(w http.ResponseWriter, r *http.Request)
 	if !s.authorizeAdmin(w, r, adminScopeNotificationsManage) {
 		return
 	}
+	if len(r.Header.Values(notificationLifecycleHeader)) > 0 {
+		s.dispatchNotificationEffect(w, r)
+		return
+	}
 	var body notificationEventRequest
 	if err := decodeJSONBody(w, r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"code": "bad_request"})

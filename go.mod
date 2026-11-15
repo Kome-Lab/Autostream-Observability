@@ -3,6 +3,7 @@ module github.com/example/autostream-observability
 go 1.26.5
 
 require (
+	github.com/Kome-Lab/Autostream-Contracts/v3lifecycle v0.0.0-20261115145906-d32ea3514b1c
 	github.com/example/autostream-contracts v0.0.0
 	github.com/go-sql-driver/mysql v1.10.0
 )

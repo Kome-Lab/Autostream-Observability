@@ -1,0 +1,16 @@
+# SC-OPS-006 / SC-CC-07 / SC-CC-08: product Effect participant, fault and process boundaries
+internal/notifications TestWS5EffectBoundaries
+internal/notifications TestWS5EffectRefusal
+internal/notifications TestWS5IntentRevocationBarrier
+internal/notifications TestWS5EffectACKAndJournalUnknown
+internal/notifications TestWS5EffectRestartNoRedispatch
+internal/notifications TestWS5EffectConcurrentClaim
+internal/notifications TestWS5EffectSecretIsolation
+internal/notifications TestWS5EffectInspectPure
+internal/notifications TestWS5FixedConsumerVectors
+internal/notifications TestWS5EffectIndependentProcessRestart
+# SC-OPS-006 / SC-CC-08: real Server/HTTP entry and original tuple lookup
+internal/httpapi TestWS5ExplicitUnconfiguredDoesNotFallback
+internal/httpapi TestWS5NotificationHTTPBoundaries
+internal/httpapi TestWS5NotificationHTTPCorrelation
+internal/httpapi TestWS5NotificationHTTPAuth

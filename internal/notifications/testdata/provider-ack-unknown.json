@@ -1,0 +1,201 @@
+{
+  "Header": {
+    "ContractRef": {
+      "ContractID": "CC08",
+      "LogicalRevision": 1,
+      "SpecRef": "G0-LOGICAL-20261115-R1",
+      "ModuleCommitRef": "d32ea3514b1c1010391caae0348b0ff9e751f447"
+    },
+    "RecordKey": {
+      "ContractRef": {
+        "ContractID": "CC08",
+        "LogicalRevision": 1,
+        "SpecRef": "G0-LOGICAL-20261115-R1",
+        "ModuleCommitRef": "d32ea3514b1c1010391caae0348b0ff9e751f447"
+      },
+      "OwnerID": "notification-owner",
+      "RecordID": "effect-record-fixture-1.inspection"
+    },
+    "Correlation": {
+      "RequestID": "request-fixture-1",
+      "OperationID": "operation-fixture-1",
+      "AttemptID": "attempt-fixture-1",
+      "StepID": "step-fixture-1",
+      "ExecutionKey": "execution-fixture-1"
+    },
+    "DomainRef": {
+      "DeploymentID": "deployment-fixture",
+      "Realm": "realm-fixture",
+      "DomainID": "notification-domain",
+      "MembershipRevision": 1,
+      "SnapshotRef": "membership-fixture-1",
+      "Resources": [
+        {
+          "Kind": "NOTIFICATION_CHANNEL",
+          "OwnerID": "notification-owner",
+          "ResourceID": "channel-fixture-1"
+        }
+      ]
+    },
+    "ProducerRef": {
+      "ComponentID": "C08",
+      "ServiceID": "observability-fixture",
+      "HostID": "host-fixture",
+      "BootID": "boot-fixture",
+      "ProcessIncarnation": "process-fixture",
+      "WriterID": "notification-fixture"
+    },
+    "RecordRevision": 4,
+    "ProfileRef": {
+      "ProfileID": "G0-P-EFFECT-OUTCOME",
+      "Revision": 1
+    }
+  },
+  "Inspection": {
+    "Target": {
+      "Correlation": {
+        "RequestID": "request-fixture-1",
+        "OperationID": "operation-fixture-1",
+        "AttemptID": "attempt-fixture-1",
+        "StepID": "step-fixture-1",
+        "ExecutionKey": "execution-fixture-1"
+      },
+      "BindingRef": "effect-record-fixture-1",
+      "ExecutionKey": "execution-fixture-1",
+      "TargetRecordRef": "effect-record-fixture-1",
+      "Scope": "notification-domain",
+      "Purpose": "STOP_LOOKUP"
+    },
+    "Observations": {
+      "Observations": [
+        {
+          "Address": {
+            "Kind": "LOCAL_PERSISTENCE",
+            "OwnerID": "notification-owner",
+            "Resource": {
+              "Kind": "NOTIFICATION_CHANNEL",
+              "OwnerID": "notification-owner",
+              "ResourceID": "channel-fixture-1"
+            },
+            "SubBoundary": "INTENT"
+          },
+          "Knowledge": "KNOWN",
+          "Presence": "PRESENT",
+          "Outcome": {
+            "State": "OBSERVED",
+            "Value": "SUCCESS_AT_BOUNDARY",
+            "Observation": {
+              "OwnerID": "notification-owner",
+              "FrameRef": "owner-frame-4",
+              "Scope": "notification-domain",
+              "SourceRevision": 4
+            }
+          }
+        },
+        {
+          "Address": {
+            "Kind": "LOCAL_PERSISTENCE",
+            "OwnerID": "notification-owner",
+            "Resource": {
+              "Kind": "NOTIFICATION_CHANNEL",
+              "OwnerID": "notification-owner",
+              "ResourceID": "channel-fixture-1"
+            },
+            "SubBoundary": "DISPATCH_POSSIBLE"
+          },
+          "Knowledge": "KNOWN",
+          "Presence": "PRESENT",
+          "Outcome": {
+            "State": "OBSERVED",
+            "Value": "SUCCESS_AT_BOUNDARY",
+            "Observation": {
+              "OwnerID": "notification-owner",
+              "FrameRef": "owner-frame-4",
+              "Scope": "notification-domain",
+              "SourceRevision": 4
+            }
+          }
+        },
+        {
+          "Address": {
+            "Kind": "PROVIDER",
+            "OwnerID": "notification-owner",
+            "Resource": {
+              "Kind": "NOTIFICATION_CHANNEL",
+              "OwnerID": "notification-owner",
+              "ResourceID": "channel-fixture-1"
+            },
+            "SubBoundary": "REMOTE_ACCEPT"
+          },
+          "Knowledge": "UNKNOWN",
+          "Presence": "NOT_OBSERVED",
+          "Outcome": {
+            "State": "UNAVAILABLE",
+            "Unavailable": {
+              "Code": "PROVIDER_ACK_UNKNOWN"
+            }
+          }
+        },
+        {
+          "Address": {
+            "Kind": "LOCAL_PERSISTENCE",
+            "OwnerID": "notification-owner",
+            "Resource": {
+              "Kind": "NOTIFICATION_CHANNEL",
+              "OwnerID": "notification-owner",
+              "ResourceID": "channel-fixture-1"
+            },
+            "SubBoundary": "LOCAL_RESULT_RECORD"
+          },
+          "Knowledge": "KNOWN",
+          "Presence": "PRESENT",
+          "Outcome": {
+            "State": "OBSERVED",
+            "Value": "SUCCESS_AT_BOUNDARY",
+            "Observation": {
+              "OwnerID": "notification-owner",
+              "FrameRef": "owner-frame-4",
+              "Scope": "notification-domain",
+              "SourceRevision": 4
+            }
+          }
+        }
+      ],
+      "RemainingObligations": [
+        "user-delivery-not-proved",
+        "production-provider-store-not-qualified"
+      ],
+      "Gate": "NOT_QUALIFIED"
+    },
+    "ObservedScopes": [
+      "notification-domain"
+    ],
+    "SourceFrames": [
+      {
+        "FrameRef": "owner-frame-4",
+        "OwnerID": "notification-owner",
+        "Scope": "notification-domain",
+        "SourceRevision": 4
+      },
+      {
+        "FrameRef": "provider-frame-fixture-1",
+        "OwnerID": "notification-owner",
+        "Scope": "notification-domain",
+        "SourceRevision": 1
+      }
+    ],
+    "Coverage": {
+      "State": "OBSERVED",
+      "Value": "inspection-coverage-record",
+      "Observation": {
+        "OwnerID": "notification-owner",
+        "FrameRef": "owner-frame-4",
+        "Scope": "notification-domain",
+        "SourceRevision": 4
+      }
+    },
+    "HistoricalRefs": [
+      "effect-record-fixture-1"
+    ]
+  }
+}
