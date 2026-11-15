@@ -1,0 +1,156 @@
+{
+  "Header": {
+    "ContractRef": {
+      "ContractID": "CC07",
+      "LogicalRevision": 1,
+      "SpecRef": "G0-LOGICAL-20261115-R1",
+      "ModuleCommitRef": "d32ea3514b1c1010391caae0348b0ff9e751f447"
+    },
+    "RecordKey": {
+      "ContractRef": {
+        "ContractID": "CC07",
+        "LogicalRevision": 1,
+        "SpecRef": "G0-LOGICAL-20261115-R1",
+        "ModuleCommitRef": "d32ea3514b1c1010391caae0348b0ff9e751f447"
+      },
+      "OwnerID": "notification-owner",
+      "RecordID": "effect-record-fixture-1"
+    },
+    "Correlation": {
+      "RequestID": "request-fixture-1",
+      "OperationID": "operation-fixture-1",
+      "AttemptID": "attempt-fixture-1",
+      "StepID": "step-fixture-1",
+      "ExecutionKey": "execution-fixture-1"
+    },
+    "DomainRef": {
+      "DeploymentID": "deployment-fixture",
+      "Realm": "realm-fixture",
+      "DomainID": "notification-domain",
+      "MembershipRevision": 1,
+      "SnapshotRef": "membership-fixture-1",
+      "Resources": [
+        {
+          "Kind": "NOTIFICATION_CHANNEL",
+          "OwnerID": "notification-owner",
+          "ResourceID": "channel-fixture-1"
+        }
+      ]
+    },
+    "ProducerRef": {
+      "ComponentID": "C08",
+      "ServiceID": "observability-fixture",
+      "HostID": "host-fixture",
+      "BootID": "boot-fixture",
+      "ProcessIncarnation": "process-fixture",
+      "WriterID": "notification-fixture"
+    },
+    "RecordRevision": 1,
+    "ProfileRef": {
+      "ProfileID": "G0-P-EFFECT-OUTCOME",
+      "Revision": 1
+    }
+  },
+  "Effect": {
+    "EffectID": "notification-effect-fixture-1",
+    "ParentEffect": {
+      "State": "ABSENT",
+      "AbsenceFactRef": "no-parent-fixture-1",
+      "Observation": {
+        "OwnerID": "notification-owner",
+        "FrameRef": "origin-frame-1",
+        "Scope": "notification-domain",
+        "SourceRevision": 1
+      }
+    },
+    "Target": {
+      "Kind": "NOTIFICATION_CHANNEL",
+      "OwnerID": "notification-owner",
+      "ResourceID": "channel-fixture-1"
+    },
+    "Purpose": "EFFECT_OUTCOME",
+    "ContentRef": {
+      "Kind": "NONSECRET_METADATA_REF",
+      "Ref": "notification-content-fixture-1"
+    },
+    "SourceVector": [
+      {
+        "Key": {
+          "Axis": "MEMBERSHIP",
+          "OwnerID": "notification-owner",
+          "Resource": {
+            "Kind": "NOTIFICATION_CHANNEL",
+            "OwnerID": "notification-owner",
+            "ResourceID": "channel-fixture-1"
+          }
+        },
+        "Incarnation": "source-incarnation-fixture",
+        "Value": {
+          "Kind": "PRESENT_UINT64",
+          "Uint64": 1
+        },
+        "SourceFrameRef": "origin-frame-1"
+      },
+      {
+        "Key": {
+          "Axis": "EFFECT",
+          "OwnerID": "notification-owner",
+          "Resource": {
+            "Kind": "NOTIFICATION_CHANNEL",
+            "OwnerID": "notification-owner",
+            "ResourceID": "channel-fixture-1"
+          }
+        },
+        "Incarnation": "source-incarnation-fixture",
+        "Value": {
+          "Kind": "PRESENT_UINT64",
+          "Uint64": 1
+        },
+        "SourceFrameRef": "origin-frame-1"
+      },
+      {
+        "Key": {
+          "Axis": "POLICY",
+          "OwnerID": "notification-owner",
+          "Resource": {
+            "Kind": "NOTIFICATION_CHANNEL",
+            "OwnerID": "notification-owner",
+            "ResourceID": "channel-fixture-1"
+          }
+        },
+        "Incarnation": "source-incarnation-fixture",
+        "Value": {
+          "Kind": "PRESENT_LITERAL",
+          "Literal": "policy-fixture-1"
+        },
+        "SourceFrameRef": "origin-frame-1"
+      },
+      {
+        "Key": {
+          "Axis": "TRUST",
+          "OwnerID": "notification-owner",
+          "Resource": {
+            "Kind": "NOTIFICATION_CHANNEL",
+            "OwnerID": "notification-owner",
+            "ResourceID": "channel-fixture-1"
+          }
+        },
+        "Incarnation": "source-incarnation-fixture",
+        "Value": {
+          "Kind": "PRESENT_LITERAL",
+          "Literal": "trust-fixture-1"
+        },
+        "SourceFrameRef": "origin-frame-1"
+      }
+    ],
+    "IntentRevision": 1,
+    "SinkRefs": [
+      {
+        "Kind": "NOTIFICATION_CHANNEL",
+        "OwnerID": "notification-owner",
+        "ResourceID": "channel-fixture-1"
+      }
+    ],
+    "ProjectionRefs": []
+  }
+}

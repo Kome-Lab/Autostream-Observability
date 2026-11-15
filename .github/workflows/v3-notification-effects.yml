@@ -1,0 +1,89 @@
+name: v3 Notification Effects
+
+on:
+  pull_request:
+    branches: [v3-dev]
+  push:
+    branches: [v3-dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v3-notification-effects-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  v3-notification-effect-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GOWORK: 'off'
+      GOTOOLCHAIN: local
+      GOTELEMETRY: 'off'
+      GOFLAGS: -mod=readonly
+      GOMAXPROCS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Module pin and SourceBoundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/verify_ws5_exact_delta.py
+          python3 scripts/ci/verify_ws5_boundary.py
+          go mod verify
+          test "$(go list -m -f '{{.Version}}' github.com/Kome-Lab/Autostream-Contracts/v3lifecycle)" = 'v0.0.0-20261115145906-d32ea3514b1c'
+          git diff --exit-code -- go.mod go.sum
+      - name: gofmt, all native tests, vet and build
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l internal/notifications/effect_*.go internal/httpapi/notification_lifecycle*.go internal/httpapi/server.go internal/httpapi/notification_events.go)"
+          go test -json ./... -count=1 | tee "$RUNNER_TEMP/ws5-all-native.json"
+          go vet ./...
+          go build ./...
+      - name: Required product Caller and Effect roots
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -json ./internal/httpapi ./internal/notifications -run '^TestWS5' -count=1 | tee "$RUNNER_TEMP/ws5-required-native.json"
+          python3 scripts/ci/verify_ws5_events.py "$RUNNER_TEMP/ws5-required-native.json"
+      - name: Required Race roots
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race -json ./internal/httpapi ./internal/notifications -run '^TestWS5' -count=1 | tee "$RUNNER_TEMP/ws5-required-race.json"
+          python3 scripts/ci/verify_ws5_events.py "$RUNNER_TEMP/ws5-required-race.json"
+      - name: CGO-free tests and required inventory
+        env:
+          CGO_ENABLED: '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -json ./... -count=1 | tee "$RUNNER_TEMP/ws5-all-cgo-free.json"
+          go test -json ./internal/httpapi ./internal/notifications -run '^TestWS5' -count=1 | tee "$RUNNER_TEMP/ws5-required-cgo-free.json"
+          python3 scripts/ci/verify_ws5_events.py "$RUNNER_TEMP/ws5-required-cgo-free.json"
+      - name: Linux amd64 and arm64 cross-builds
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOARCH=amd64 go build ./...
+          GOARCH=arm64 go build ./...
+      - name: Upload synthetic verification events
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ws5-notification-events-${{ github.sha }}
+          path: ${{ runner.temp }}/ws5-*.json
+          if-no-files-found: error
+          retention-days: 14
